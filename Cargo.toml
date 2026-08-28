@@ -1,0 +1,10 @@
+[package]
+name = "fwos-fwd-setup"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Host program oneshot: create empty fwd and mgmt netns"
+
+[[bin]]
+name = "fwos-fwd-setup"
+path = "src/main.rs"

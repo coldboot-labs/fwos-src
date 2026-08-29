@@ -10,6 +10,13 @@ use serde::{Deserialize, Serialize};
 
 const SOCK: &str = "/var/lib/fwos/netd.sock";
 const DESIRED: &str = "/var/lib/fwos/desired.toml";
+const HOST_NS: &str = "/run/host-netns";
+const MGMT_NS: &str = "/run/netns/mgmt";
+const HOST_VETH: &str = "h0mgmt";
+const MGMT_VETH: &str = "m0mgmt";
+const HOST_VETH_ADDR: &str = "169.254.127.1/30";
+const MGMT_VETH_ADDR: &str = "169.254.127.2/30";
+const HOST_VETH_GW: &str = "169.254.127.2";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct DesiredState {
@@ -47,9 +54,10 @@ fn run() -> Result<(), String> {
     chown(path, Some(0), Some(gid)).map_err(|e| format!("chown {SOCK}: {e}"))?;
     if Path::new(DESIRED).exists() {
         let raw = fs::read_to_string(DESIRED).map_err(|e| format!("read {DESIRED}: {e}"))?;
-        let state: DesiredState =
+        let mut state: DesiredState =
             toml::from_str(&raw).map_err(|e| format!("parse {DESIRED}: {e}"))?;
-        apply(&state)?;
+        apply(&mut state)?;
+        persist(&state)?;
     }
     loop {
         let (stream, _) = listener
@@ -67,10 +75,13 @@ fn handle_client(mut stream: UnixStream) -> Result<(), String> {
         .read_to_end(&mut buf)
         .map_err(|e| format!("read socket: {e}"))?;
     let reply = match serde_json::from_slice::<DesiredState>(&buf) {
-        Ok(state) => match apply(&state) {
+        Ok(mut state) => match apply(&mut state) {
             Ok(()) => {
-                persist(&state)?;
-                serde_json::json!({"ok": true}).to_string()
+                if let Err(err) = persist(&state) {
+                    serde_json::json!({"ok": false, "error": err}).to_string()
+                } else {
+                    serde_json::json!({"ok": true}).to_string()
+                }
             }
             Err(err) => serde_json::json!({"ok": false, "error": err}).to_string(),
         },
@@ -88,17 +99,87 @@ fn persist(state: &DesiredState) -> Result<(), String> {
     fs::write(DESIRED, raw).map_err(|e| format!("write {DESIRED}: {e}"))
 }
 
-fn apply(state: &DesiredState) -> Result<(), String> {
+fn apply(state: &mut DesiredState) -> Result<(), String> {
+    // Capture Management NIC addresses while they still live in the Host netns,
+    // before the veth replaces the host default route. `ip -n` / `ip netns exec`
+    // hang in this container's mount ns (named-netns bind), so all mgmt work
+    // uses setns instead. Persist whatever we captured so reboot does not
+    // depend on DHCP racing netd.
+    let mut mgmt_saved: Vec<(String, Vec<String>, Option<String>)> = Vec::new();
+    for iface in &mut state.interfaces {
+        if iface.placement == "mgmt" {
+            let (mut addrs, gw) = capture_host_ipv4(&iface.name)?;
+            if addrs.is_empty() {
+                addrs = iface.addresses.clone();
+            } else if iface.addresses.is_empty() {
+                iface.addresses = addrs.clone();
+            }
+            mgmt_saved.push((iface.name.clone(), addrs, gw));
+        }
+    }
+    if has_mgmt(state) {
+        ensure_host_mgmt_veth()?;
+    }
     for iface in &state.interfaces {
         if iface.placement == "fwd" {
-            ensure_in_fwd(&iface.name)?;
+            ensure_in_ns(&iface.name, "fwd")?;
             run_ip(&["link", "set", &iface.name, "up"])?;
             for addr in &iface.addresses {
                 add_addr(&iface.name, addr)?;
             }
         }
     }
+    for iface in &state.interfaces {
+        if iface.placement == "mgmt" {
+            let (addrs, gw) = mgmt_saved
+                .iter()
+                .find(|(n, _, _)| n == &iface.name)
+                .map(|(_, a, g)| (a.clone(), g.clone()))
+                .unwrap_or_default();
+            ensure_in_ns(&iface.name, "mgmt")?;
+            with_mgmt_net(|| {
+                run_ip(&["link", "set", &iface.name, "up"])?;
+                for addr in addrs.iter().chain(iface.addresses.iter()) {
+                    add_addr(&iface.name, addr)?;
+                }
+                if let Some(gw) = gw {
+                    let _ = run_ip(&[
+                        "route",
+                        "replace",
+                        "default",
+                        "via",
+                        &gw,
+                        "dev",
+                        &iface.name,
+                    ]);
+                }
+                Ok(())
+            })?;
+        }
+    }
+    if has_mgmt(state) {
+        host_default_via_mgmt()?;
+        write_sshd_stamp()?;
+    }
+    persist(state)?;
     program_nft(state)
+}
+
+fn has_mgmt(state: &DesiredState) -> bool {
+    state.interfaces.iter().any(|i| i.placement == "mgmt")
+}
+
+fn ensure_in_ns(name: &str, ns: &str) -> Result<(), String> {
+    if ns_has_link(ns, name)? {
+        return Ok(());
+    }
+    if ns == "fwd" {
+        return ensure_in_fwd(name);
+    }
+    with_host_net(|| {
+        let _ = run_ip(&["link", "set", name, "down"]);
+        run_ip(&["link", "set", name, "netns", &format!("/run/netns/{ns}")])
+    })
 }
 
 fn ensure_in_fwd(name: &str) -> Result<(), String> {
@@ -106,7 +187,7 @@ fn ensure_in_fwd(name: &str) -> Result<(), String> {
         return Ok(());
     }
     let fwd = File::open("/proc/self/ns/net").map_err(|e| format!("open fwd netns: {e}"))?;
-    let host = File::open("/run/host-netns").map_err(|e| format!("open host netns: {e}"))?;
+    let host = File::open(HOST_NS).map_err(|e| format!("open host netns: {e}"))?;
     setns_net(host.as_raw_fd()).map_err(|e| format!("setns host: {e}"))?;
     let ns_path = format!("/proc/{}/fd/{}", process::id(), fwd.as_raw_fd());
     let moved = run_ip(&["link", "set", name, "netns", &ns_path]);
@@ -114,6 +195,102 @@ fn ensure_in_fwd(name: &str) -> Result<(), String> {
     moved?;
     back.map_err(|e| format!("setns fwd: {e}"))?;
     Ok(())
+}
+
+fn ns_has_link(ns: &str, name: &str) -> Result<bool, String> {
+    match ns {
+        "fwd" => link_exists(name),
+        "mgmt" => with_mgmt_net(|| link_exists(name)),
+        _ => Err(format!("unknown netns {ns}")),
+    }
+}
+
+fn with_netns<T>(ns_path: &str, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    let cur = File::open("/proc/self/ns/net").map_err(|e| format!("open current netns: {e}"))?;
+    let ns = File::open(ns_path).map_err(|e| format!("open {ns_path}: {e}"))?;
+    setns_net(ns.as_raw_fd()).map_err(|e| format!("setns {ns_path}: {e}"))?;
+    let r = f();
+    let back = setns_net(cur.as_raw_fd()).map_err(|e| format!("setns back: {e}"));
+    match (r, back) {
+        (Ok(v), Ok(())) => Ok(v),
+        (Err(e), _) => Err(e),
+        (Ok(_), Err(e)) => Err(e),
+    }
+}
+
+fn with_host_net<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    with_netns(HOST_NS, f)
+}
+
+fn with_mgmt_net<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    with_netns(MGMT_NS, f)
+}
+
+fn capture_host_ipv4(name: &str) -> Result<(Vec<String>, Option<String>), String> {
+    with_host_net(|| {
+        let addr_out = ip_cmd()
+            .args(["-o", "addr", "show", "dev", name])
+            .output()
+            .map_err(|e| format!("ip addr show {name}: {e}"))?;
+        let mut addrs = Vec::new();
+        for word in String::from_utf8_lossy(&addr_out.stdout).split_whitespace() {
+            if word.contains('/') && word.contains('.') {
+                addrs.push(word.to_string());
+            }
+        }
+        let route_out = ip_cmd()
+            .args(["-o", "route", "show", "default"])
+            .output()
+            .map_err(|e| format!("ip route: {e}"))?;
+        let route = String::from_utf8_lossy(&route_out.stdout);
+        let gw = if route.contains(name) {
+            route
+                .split_whitespace()
+                .skip_while(|w| *w != "via")
+                .nth(1)
+                .map(str::to_string)
+        } else {
+            None
+        };
+        Ok((addrs, gw))
+    })
+}
+
+fn ensure_host_mgmt_veth() -> Result<(), String> {
+    with_host_net(|| {
+        let status = ip_cmd()
+            .args(["link", "show", "dev", HOST_VETH])
+            .status()
+            .map_err(|e| format!("ip link show {HOST_VETH}: {e}"))?;
+        if status.success() {
+            return Ok(());
+        }
+        run_ip(&[
+            "link", "add", HOST_VETH, "type", "veth", "peer", "name", MGMT_VETH,
+        ])?;
+        run_ip(&["link", "set", MGMT_VETH, "netns", MGMT_NS])?;
+        Ok(())
+    })?;
+    with_host_net(|| {
+        add_addr(HOST_VETH, HOST_VETH_ADDR)?;
+        run_ip(&["link", "set", HOST_VETH, "up"])?;
+        Ok(())
+    })?;
+    with_mgmt_net(|| {
+        add_addr(MGMT_VETH, MGMT_VETH_ADDR)?;
+        run_ip(&["link", "set", MGMT_VETH, "up"])?;
+        Ok(())
+    })?;
+    Ok(())
+}
+
+fn host_default_via_mgmt() -> Result<(), String> {
+    with_host_net(|| run_ip(&["route", "replace", "default", "via", HOST_VETH_GW]))
+}
+
+fn write_sshd_stamp() -> Result<(), String> {
+    fs::write("/var/lib/fwos/sshd-mgmt", "mgmt\n")
+        .map_err(|e| format!("write sshd-mgmt stamp: {e}"))
 }
 
 fn link_exists(name: &str) -> Result<bool, String> {

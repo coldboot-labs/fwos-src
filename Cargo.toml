@@ -5,6 +5,12 @@ edition = "2021"
 license = "MIT"
 description = "Host program oneshot: create empty fwd and mgmt netns"
 
+[dependencies]
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
 [[bin]]
 name = "fwos-fwd-setup"
 path = "src/main.rs"

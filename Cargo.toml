@@ -8,3 +8,7 @@ description = "Host program oneshot: create empty fwd and mgmt netns"
 [[bin]]
 name = "fwos-fwd-setup"
 path = "src/main.rs"
+
+[[bin]]
+name = "netd"
+path = "src/netd.rs"

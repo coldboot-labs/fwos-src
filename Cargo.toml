@@ -18,3 +18,7 @@ path = "src/main.rs"
 [[bin]]
 name = "netd"
 path = "src/netd.rs"
+
+[[bin]]
+name = "fwos"
+path = "src/cli.rs"

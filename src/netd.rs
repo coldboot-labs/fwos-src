@@ -22,6 +22,14 @@ const HOST_VETH_GW: &str = "169.254.127.2";
 struct DesiredState {
     #[serde(default)]
     interfaces: Vec<Iface>,
+    #[serde(default)]
+    wireguard: Vec<Wg>,
+    #[serde(default)]
+    routes: Vec<StaticRoute>,
+    #[serde(default)]
+    nft_extra: Vec<String>,
+    #[serde(default)]
+    qdiscs: Vec<Qdisc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,6 +40,30 @@ struct Iface {
     role: Option<String>,
     #[serde(default)]
     addresses: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Wg {
+    name: String,
+    private_key: String,
+    #[serde(default)]
+    listen_port: Option<u16>,
+    #[serde(default)]
+    addresses: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StaticRoute {
+    to: String,
+    via: String,
+    #[serde(default)]
+    dev: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Qdisc {
+    dev: String,
+    kind: String,
 }
 
 fn main() {
@@ -161,6 +193,9 @@ fn apply(state: &mut DesiredState) -> Result<(), String> {
         host_default_via_mgmt()?;
         write_sshd_stamp()?;
     }
+    program_wg(state)?;
+    program_routes(state)?;
+    program_qdiscs(state)?;
     persist(state)?;
     program_nft(state)
 }
@@ -337,6 +372,9 @@ fn program_nft(state: &DesiredState) -> Result<(), String> {
     rules.push_str("  chain input {\n");
     rules.push_str("    type filter hook input priority filter; policy accept;\n");
     rules.push_str("    iifname \"lo\" accept\n");
+    for extra in &state.nft_extra {
+        rules.push_str(&format!("    {extra}\n"));
+    }
     for wan in &wans {
         rules.push_str(&format!(
             "    iifname \"{wan}\" ct state established,related accept\n"
@@ -379,6 +417,73 @@ fn program_nft(state: &DesiredState) -> Result<(), String> {
     } else {
         Err(format!("nft -f failed ({status})"))
     }
+}
+
+fn program_wg(state: &DesiredState) -> Result<(), String> {
+    for wg in &state.wireguard {
+        if !link_exists(&wg.name)? {
+            run_ip(&["link", "add", &wg.name, "type", "wireguard"])?;
+        }
+        let mut args = vec!["set".to_string(), wg.name.clone()];
+        args.push("private-key".into());
+        args.push("/dev/stdin".into());
+        if let Some(port) = wg.listen_port {
+            args.push("listen-port".into());
+            args.push(port.to_string());
+        }
+        let mut child = Command::new("wg")
+            .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+            .args(&args)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("wg: {e}"))?;
+        child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| "wg stdin".to_string())?
+            .write_all(wg.private_key.as_bytes())
+            .map_err(|e| format!("wg write: {e}"))?;
+        let status = child.wait().map_err(|e| format!("wg wait: {e}"))?;
+        if !status.success() {
+            return Err(format!("wg set {} failed ({status})", wg.name));
+        }
+        run_ip(&["link", "set", &wg.name, "up"])?;
+        for addr in &wg.addresses {
+            add_addr(&wg.name, addr)?;
+        }
+    }
+    Ok(())
+}
+
+fn program_routes(state: &DesiredState) -> Result<(), String> {
+    for route in &state.routes {
+        let mut args = vec!["route", "replace", &route.to, "via", &route.via];
+        if let Some(dev) = route.dev.as_deref() {
+            args.push("dev");
+            args.push(dev);
+        }
+        run_ip(&args)?;
+    }
+    Ok(())
+}
+
+fn program_qdiscs(state: &DesiredState) -> Result<(), String> {
+    for q in &state.qdiscs {
+        let output = Command::new("tc")
+            .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+            .args(["qdisc", "replace", "dev", &q.dev, "root", &q.kind])
+            .output()
+            .map_err(|e| format!("tc qdisc: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "tc qdisc replace dev {} root {} failed: {}",
+                q.dev,
+                q.kind,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn run_ip(args: &[&str]) -> Result<(), String> {

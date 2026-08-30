@@ -204,6 +204,7 @@ fn apply(state: &mut DesiredState) -> Result<(), String> {
     program_wg(state)?;
     program_routes(state)?;
     program_qdiscs(state)?;
+    program_lan_services(state)?;
     persist(state)?;
     program_nft(state)
 }
@@ -361,6 +362,135 @@ fn add_addr(dev: &str, cidr: &str) -> Result<(), String> {
             err.trim()
         ))
     }
+}
+
+fn program_lan_services(state: &DesiredState) -> Result<(), String> {
+    let Some(pool) = state.dhcp_pool.as_deref() else {
+        return Ok(());
+    };
+    let prefix = state
+        .lan_prefix
+        .clone()
+        .or_else(|| prefix_from_pool(pool))
+        .ok_or_else(|| "lan_prefix or a parseable dhcp_pool is required".to_string())?;
+    let lan_v4 = first_v4_host(&prefix).ok_or_else(|| "lan_prefix has no v4 host".to_string())?;
+    ensure_lan_dev(
+        "lan0",
+        &format!("{lan_v4}/{}", prefix.split('/').nth(1).unwrap_or("24")),
+    )?;
+    if let Some(pd) = state.wan_pd.as_deref() {
+        if let Some(v6) = pd_lan_addr(pd) {
+            add_addr("lan0", &v6)?;
+        }
+    }
+    fs::create_dir_all("/var/lib/fwos/kea").map_err(|e| format!("mkdir kea: {e}"))?;
+    fs::create_dir_all("/var/lib/fwos/unbound").map_err(|e| format!("mkdir unbound: {e}"))?;
+    let (p1, p2) = split_pool(pool);
+    let kea4 = format!(
+        r#"{{
+  "Dhcp4": {{
+    "interfaces-config": {{ "interfaces": [ "lan0" ], "re-detect": true }},
+    "lease-database": {{ "type": "memfile", "persist": false, "name": "/tmp/dhcp4.leases" }},
+    "valid-lifetime": 3600,
+    "subnet4": [ {{
+      "id": 1,
+      "subnet": "{prefix}",
+      "interface": "lan0",
+      "pools": [ {{ "pool": "{p1} - {p2}" }} ],
+      "option-data": [
+        {{ "name": "routers", "data": "{lan_v4}" }},
+        {{ "name": "domain-name-servers", "data": "{lan_v4}" }}
+      ]
+    }} ],
+    "loggers": [ {{ "name": "kea-dhcp4", "severity": "INFO", "output-options": [ {{ "output": "stdout" }} ] }} ]
+  }}
+}}
+"#
+    );
+    fs::write("/var/lib/fwos/kea/kea-dhcp4.conf", kea4)
+        .map_err(|e| format!("write kea-dhcp4: {e}"))?;
+    if let Some(pd) = state.wan_pd.as_deref() {
+        if let (Some(v6_sub), Some((v6p1, v6p2))) = (pd_subnet64(pd), pd_pool(pd)) {
+            let kea6 = format!(
+                r#"{{
+  "Dhcp6": {{
+    "interfaces-config": {{ "interfaces": [ "lan0" ], "re-detect": true }},
+    "lease-database": {{ "type": "memfile", "persist": false, "name": "/tmp/dhcp6.leases" }},
+    "server-id": {{ "type": "LLT", "persist": false }},
+    "subnet6": [ {{
+      "id": 1,
+      "subnet": "{v6_sub}",
+      "interface": "lan0",
+      "pools": [ {{ "pool": "{v6p1} - {v6p2}" }} ]
+    }} ],
+    "loggers": [ {{ "name": "kea-dhcp6", "severity": "INFO", "output-options": [ {{ "output": "stdout" }} ] }} ]
+  }}
+}}
+"#
+            );
+            fs::write("/var/lib/fwos/kea/kea-dhcp6.conf", kea6)
+                .map_err(|e| format!("write kea-dhcp6: {e}"))?;
+        }
+    }
+    let unbound = format!(
+        "server:\n  interface: {lan_v4}\n  port: 53\n  access-control: {prefix} allow\n  access-control: 127.0.0.0/8 allow\n  do-daemonize: no\n  username: \"\"\n  chroot: \"\"\n  directory: \"/tmp\"\n  pidfile: \"/tmp/unbound.pid\"\n  use-syslog: no\n  logfile: /dev/null\n"
+    );
+    fs::write("/var/lib/fwos/unbound/unbound.conf", unbound)
+        .map_err(|e| format!("write unbound: {e}"))?;
+    Ok(())
+}
+
+fn ensure_lan_dev(name: &str, cidr: &str) -> Result<(), String> {
+    if !link_exists(name)? {
+        run_ip(&["link", "add", name, "type", "dummy"])?;
+    }
+    run_ip(&["link", "set", name, "up"])?;
+    add_addr(name, cidr)
+}
+
+fn split_pool(pool: &str) -> (String, String) {
+    let p = pool.replace(' ', "");
+    match p.split_once('-') {
+        Some((a, b)) => (a.to_string(), b.to_string()),
+        None => (p.clone(), p),
+    }
+}
+
+fn prefix_from_pool(pool: &str) -> Option<String> {
+    let (start, _) = split_pool(pool);
+    let mut o: Vec<u8> = start.split('.').filter_map(|s| s.parse().ok()).collect();
+    if o.len() != 4 {
+        return None;
+    }
+    o[3] = 0;
+    Some(format!("{}.{}.{}.{}/24", o[0], o[1], o[2], o[3]))
+}
+
+fn first_v4_host(cidr: &str) -> Option<String> {
+    let ip = cidr.split('/').next()?;
+    let mut o: Vec<u8> = ip.split('.').filter_map(|s| s.parse().ok()).collect();
+    if o.len() != 4 {
+        return None;
+    }
+    if o[3] == 0 {
+        o[3] = 1;
+    }
+    Some(format!("{}.{}.{}.{}", o[0], o[1], o[2], o[3]))
+}
+
+fn pd_lan_addr(pd: &str) -> Option<String> {
+    let base = pd.split('/').next()?.trim_end_matches(':');
+    Some(format!("{base}::1/64"))
+}
+
+fn pd_subnet64(pd: &str) -> Option<String> {
+    let base = pd.split('/').next()?.trim_end_matches(':');
+    Some(format!("{base}::/64"))
+}
+
+fn pd_pool(pd: &str) -> Option<(String, String)> {
+    let base = pd.split('/').next()?.trim_end_matches(':');
+    Some((format!("{base}::100"), format!("{base}::1ff")))
 }
 
 fn program_nft(state: &DesiredState) -> Result<(), String> {

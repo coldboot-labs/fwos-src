@@ -17,6 +17,12 @@ const MGMT_VETH: &str = "m0mgmt";
 const HOST_VETH_ADDR: &str = "169.254.127.1/30";
 const MGMT_VETH_ADDR: &str = "169.254.127.2/30";
 const HOST_VETH_GW: &str = "169.254.127.2";
+const FWD_MGMT_VETH: &str = "f0mgmt";
+const MGMT_FWD_VETH: &str = "m1mgmt";
+const FWD_MGMT_ADDR: &str = "169.254.127.5/30";
+const MGMT_FWD_ADDR: &str = "169.254.127.6/30";
+const FWD_MGMT_GW: &str = "169.254.127.5";
+const MGMT_FWD_IP: &str = "169.254.127.6";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct DesiredState {
@@ -48,6 +54,10 @@ struct Iface {
     role: Option<String>,
     #[serde(default)]
     addresses: Vec<String>,
+    #[serde(default)]
+    vlan: Option<u16>,
+    #[serde(default)]
+    parent: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -147,7 +157,7 @@ fn apply(state: &mut DesiredState) -> Result<(), String> {
     // depend on DHCP racing netd.
     let mut mgmt_saved: Vec<(String, Vec<String>, Option<String>)> = Vec::new();
     for iface in &mut state.interfaces {
-        if iface.placement == "mgmt" {
+        if iface.placement == "mgmt" || iface.role.as_deref() == Some("stick") {
             let (mut addrs, gw) = capture_host_ipv4(&iface.name)?;
             if addrs.is_empty() {
                 addrs = iface.addresses.clone();
@@ -157,18 +167,34 @@ fn apply(state: &mut DesiredState) -> Result<(), String> {
             mgmt_saved.push((iface.name.clone(), addrs, gw));
         }
     }
-    if has_mgmt(state) {
+    if has_mgmt_path(state) {
         ensure_host_mgmt_veth()?;
     }
+    if is_stick(state) {
+        ensure_fwd_mgmt_veth()?;
+        with_mgmt_net(|| {
+            let _ = run_ip(&["route", "replace", "default", "via", FWD_MGMT_GW]);
+            Ok(())
+        })?;
+        persist(state)?;
+        program_nft(state)?;
+        write_sshd_stamp()?;
+    }
     for iface in &state.interfaces {
-        if iface.placement == "fwd" {
+        if iface.placement == "fwd" && iface.vlan.is_none() {
             ensure_in_ns(&iface.name, "fwd")?;
             run_ip(&["link", "set", &iface.name, "up"])?;
-            for addr in &iface.addresses {
+            let extra = mgmt_saved
+                .iter()
+                .find(|(n, _, _)| n == &iface.name)
+                .map(|(_, a, _)| a.clone())
+                .unwrap_or_default();
+            for addr in extra.iter().chain(iface.addresses.iter()) {
                 add_addr(&iface.name, addr)?;
             }
         }
     }
+    program_vlans(state)?;
     for iface in &state.interfaces {
         if iface.placement == "mgmt" {
             let (addrs, gw) = mgmt_saved
@@ -197,7 +223,7 @@ fn apply(state: &mut DesiredState) -> Result<(), String> {
             })?;
         }
     }
-    if has_mgmt(state) {
+    if has_mgmt_path(state) {
         host_default_via_mgmt()?;
         write_sshd_stamp()?;
     }
@@ -211,6 +237,24 @@ fn apply(state: &mut DesiredState) -> Result<(), String> {
 
 fn has_mgmt(state: &DesiredState) -> bool {
     state.interfaces.iter().any(|i| i.placement == "mgmt")
+}
+
+fn is_stick(state: &DesiredState) -> bool {
+    state
+        .interfaces
+        .iter()
+        .any(|i| i.role.as_deref() == Some("stick"))
+}
+
+fn has_mgmt_path(state: &DesiredState) -> bool {
+    has_mgmt(state) || is_stick(state)
+}
+
+fn stick_parent(state: &DesiredState) -> Option<&Iface> {
+    state
+        .interfaces
+        .iter()
+        .find(|i| i.role.as_deref() == Some("stick"))
 }
 
 fn ensure_in_ns(name: &str, ns: &str) -> Result<(), String> {
@@ -330,6 +374,64 @@ fn ensure_host_mgmt_veth() -> Result<(), String> {
 
 fn host_default_via_mgmt() -> Result<(), String> {
     with_host_net(|| run_ip(&["route", "replace", "default", "via", HOST_VETH_GW]))
+}
+
+fn ensure_fwd_mgmt_veth() -> Result<(), String> {
+    if !link_exists(FWD_MGMT_VETH)? {
+        run_ip(&[
+            "link",
+            "add",
+            FWD_MGMT_VETH,
+            "type",
+            "veth",
+            "peer",
+            "name",
+            MGMT_FWD_VETH,
+        ])?;
+        run_ip(&["link", "set", MGMT_FWD_VETH, "netns", MGMT_NS])?;
+    }
+    add_addr(FWD_MGMT_VETH, FWD_MGMT_ADDR)?;
+    run_ip(&["link", "set", FWD_MGMT_VETH, "up"])?;
+    with_mgmt_net(|| {
+        add_addr(MGMT_FWD_VETH, MGMT_FWD_ADDR)?;
+        run_ip(&["link", "set", MGMT_FWD_VETH, "up"])?;
+        Ok(())
+    })?;
+    Ok(())
+}
+
+fn program_vlans(state: &DesiredState) -> Result<(), String> {
+    for iface in &state.interfaces {
+        let Some(vid) = iface.vlan else {
+            continue;
+        };
+        let parent = iface.parent.clone().unwrap_or_else(|| {
+            iface
+                .name
+                .rsplit_once('.')
+                .map(|(p, _)| p.to_string())
+                .unwrap_or_else(|| iface.name.clone())
+        });
+        if !link_exists(&iface.name)? {
+            run_ip(&[
+                "link",
+                "add",
+                "link",
+                &parent,
+                "name",
+                &iface.name,
+                "type",
+                "vlan",
+                "id",
+                &vid.to_string(),
+            ])?;
+        }
+        run_ip(&["link", "set", &iface.name, "up"])?;
+        for addr in &iface.addresses {
+            add_addr(&iface.name, addr)?;
+        }
+    }
+    Ok(())
 }
 
 fn write_sshd_stamp() -> Result<(), String> {
@@ -505,6 +607,14 @@ fn program_nft(state: &DesiredState) -> Result<(), String> {
             && i.role.as_deref() == Some("wan")
             && i.addresses.iter().any(|a| a.contains('.'))
     });
+    let stick = stick_parent(state);
+    let stick_ip = stick.and_then(|s| {
+        s.addresses
+            .iter()
+            .find(|a| a.contains('.'))
+            .and_then(|a| a.split('/').next())
+            .map(str::to_string)
+    });
     let mut rules = String::from("flush ruleset\n");
     rules.push_str("table inet fwos {\n");
     rules.push_str("  chain input {\n");
@@ -523,10 +633,29 @@ fn program_nft(state: &DesiredState) -> Result<(), String> {
     rules.push_str("  chain forward {\n");
     rules.push_str("    type filter hook forward priority filter; policy drop;\n");
     rules.push_str("    ct state established,related accept\n");
+    if let Some(parent) = stick {
+        rules.push_str(&format!(
+            "    iifname \"{}\" oifname \"{FWD_MGMT_VETH}\" tcp dport {{ 22, 443 }} accept\n",
+            parent.name
+        ));
+    }
     for wan in &wans {
         rules.push_str(&format!("    oifname \"{wan}\" accept\n"));
     }
     rules.push_str("  }\n");
+    if stick.is_some() {
+        rules.push_str("  chain prerouting {\n");
+        rules.push_str("    type nat hook prerouting priority dstnat; policy accept;\n");
+        match stick_ip.as_deref() {
+            Some(ip) => rules.push_str(&format!(
+                "    ip daddr {ip} tcp dport {{ 22, 443 }} dnat ip to {MGMT_FWD_IP}\n"
+            )),
+            None => rules.push_str(&format!(
+                "    tcp dport {{ 22, 443 }} dnat ip to {MGMT_FWD_IP}\n"
+            )),
+        }
+        rules.push_str("  }\n");
+    }
     if v4_wan {
         rules.push_str("  chain postrouting {\n");
         rules.push_str("    type nat hook postrouting priority srcnat; policy accept;\n");

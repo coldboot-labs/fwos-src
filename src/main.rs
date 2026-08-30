@@ -12,6 +12,7 @@ fn run() -> Result<(), String> {
     for name in ["fwd", "mgmt"] {
         ensure_netns(name)?;
         up_lo(name)?;
+        enable_v4_forward(name)?;
     }
     Ok(())
 }
@@ -41,5 +42,24 @@ fn up_lo(name: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("ip link set lo up in {name} failed ({status})"))
+    }
+}
+
+fn enable_v4_forward(name: &str) -> Result<(), String> {
+    let status = Command::new("ip")
+        .args([
+            "netns",
+            "exec",
+            name,
+            "sh",
+            "-c",
+            "echo 1 > /proc/sys/net/ipv4/ip_forward",
+        ])
+        .status()
+        .map_err(|e| format!("ip_forward in {name}: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("enable ip_forward in {name} failed ({status})"))
     }
 }

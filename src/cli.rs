@@ -1,3 +1,5 @@
+mod console;
+
 use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -15,9 +17,13 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let mut args = env::args().skip(1);
-    let cmd = args
-        .next()
-        .ok_or_else(|| "usage: fwos apply [file]".to_string())?;
+    let cmd = match args.next() {
+        None => return console::run(),
+        Some(cmd) => cmd,
+    };
+    if cmd == "console" {
+        return console::run();
+    }
     if cmd != "apply" {
         return Err(format!("unknown command {cmd}; usage: fwos apply [file]"));
     }

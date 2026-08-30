@@ -30,6 +30,14 @@ struct DesiredState {
     nft_extra: Vec<String>,
     #[serde(default)]
     qdiscs: Vec<Qdisc>,
+    #[serde(default)]
+    hostname: Option<String>,
+    #[serde(default)]
+    lan_prefix: Option<String>,
+    #[serde(default)]
+    dhcp_pool: Option<String>,
+    #[serde(default)]
+    wan_pd: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

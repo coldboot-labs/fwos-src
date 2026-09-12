@@ -167,6 +167,10 @@ fn bind_allowed(ip: IpAddr) -> bool {
             if oct[0] == CGNAT.octets()[0] && oct[1] >= 64 && oct[1] <= 127 {
                 return false;
             }
+            // Host↔mgmt and fwd↔mgmt veths are not operator reachability.
+            if oct[0] == 169 && oct[1] == 254 && oct[2] == 127 {
+                return false;
+            }
             v4.is_private() || v4.is_link_local()
         }
         IpAddr::V6(v6) => {
@@ -769,6 +773,14 @@ fn ip_output(args: &[&str]) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ui_does_not_bind_internal_veth() {
+        assert!(!bind_allowed("169.254.127.2".parse().unwrap()));
+        assert!(!bind_allowed("169.254.127.6".parse().unwrap()));
+        assert!(bind_allowed("10.0.2.15".parse().unwrap()));
+        assert!(bind_allowed("169.254.1.1".parse().unwrap()));
+    }
 
     #[test]
     fn ui_has_no_host_update_route() {

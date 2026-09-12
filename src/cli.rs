@@ -47,6 +47,10 @@ fn run() -> Result<(), String> {
             print!("{}", update_client(&image)?);
             Ok(())
         }
+        "reboot" => {
+            print!("{}", reboot_client()?);
+            Ok(())
+        }
         _ => Err(format!("unknown command {cmd}; usage: fwos apply [file]")),
     }
 }
@@ -66,6 +70,16 @@ fn update_client(image: &str) -> Result<String, String> {
     }
     let body = serde_json::json!({"op": "stage", "image": image}).to_string();
     socket_roundtrip_for(UPDATE_SOCK, body.as_bytes(), UPDATE_TIMEOUT)
+}
+
+fn update_status() -> Result<String, String> {
+    let body = serde_json::json!({"op": "status"}).to_string();
+    socket_roundtrip(UPDATE_SOCK, body.as_bytes())
+}
+
+fn reboot_client() -> Result<String, String> {
+    let body = serde_json::json!({"op": "reboot"}).to_string();
+    socket_roundtrip(UPDATE_SOCK, body.as_bytes())
 }
 
 fn apply_source(rest: &str) -> Result<String, String> {

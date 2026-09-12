@@ -2,6 +2,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::fd::AsRawFd;
+use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Mutex;
@@ -237,6 +238,10 @@ fn admin_handle(out: &mut impl Write, line: &str) -> Result<AdminAct, String> {
             write_cmd(out, super::update_client(rest))?;
             Ok(AdminAct::Continue)
         }
+        "reboot" => {
+            write_cmd(out, super::reboot_client())?;
+            Ok(AdminAct::Continue)
+        }
         _ => {
             writeln!(out, "unknown command").map_err(|e| e.to_string())?;
             out.flush().map_err(|e| e.to_string())?;
@@ -261,7 +266,7 @@ fn write_cmd(out: &mut impl Write, result: Result<String, String>) -> Result<(),
 fn print_admin_help(out: &mut impl Write) -> Result<(), String> {
     writeln!(
         out,
-        "status\nshow\napply <json|toml|path>\nupdate <image>\nhelp\nlogout"
+        "status\nshow\napply <json|toml|path>\nupdate <image>\nreboot\nhelp\nlogout"
     )
     .map_err(|e| e.to_string())?;
     out.flush().map_err(|e| e.to_string())
@@ -310,7 +315,46 @@ fn print_admin_status(out: &mut impl Write) -> Result<(), String> {
             }
         }
     }
+    writeln!(
+        out,
+        "fwd: {}",
+        if netns_exists("fwd") { "yes" } else { "no" }
+    )
+    .map_err(|e| e.to_string())?;
+    writeln!(
+        out,
+        "mgmt: {}",
+        if netns_exists("mgmt") { "yes" } else { "no" }
+    )
+    .map_err(|e| e.to_string())?;
+    writeln!(
+        out,
+        "netd: {}",
+        if netd_running() { "running" } else { "down" }
+    )
+    .map_err(|e| e.to_string())?;
+    if let Ok(raw) = super::update_status() {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+            for key in ["booted", "staged", "rollback"] {
+                if let Some(s) = v
+                    .get(key)
+                    .and_then(|x| x.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    writeln!(out, "{key}: {s}").map_err(|e| e.to_string())?;
+                }
+            }
+        }
+    }
     out.flush().map_err(|e| e.to_string())
+}
+
+fn netns_exists(name: &str) -> bool {
+    Path::new("/run/netns").join(name).exists()
+}
+
+fn netd_running() -> bool {
+    UnixStream::connect("/var/lib/fwos/netd.sock").is_ok()
 }
 
 fn verify_admin(name: &str, password: &str) -> bool {
@@ -681,6 +725,29 @@ mod tests {
         assert!(s.contains("apply"));
         assert!(s.contains("show"));
         assert!(s.contains("update <image>"));
+        assert!(s.contains("reboot"));
+    }
+
+    #[test]
+    fn admin_status_reports_fwd_mgmt_netd() {
+        let mut out = Vec::new();
+        print_admin_status(&mut out).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("fwd:"));
+        assert!(s.contains("mgmt:"));
+        assert!(s.contains("netd:"));
+    }
+
+    #[test]
+    fn admin_reboot_is_a_host_update_socket_client() {
+        let mut out = Vec::new();
+        assert_eq!(
+            admin_handle(&mut out, "reboot").unwrap(),
+            AdminAct::Continue
+        );
+        let s = String::from_utf8(out).unwrap();
+        assert!(!s.contains("unknown command"));
+        assert!(s.contains("update.sock"));
     }
 
     #[test]

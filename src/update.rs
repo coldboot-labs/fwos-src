@@ -53,36 +53,84 @@ fn handle_client(mut stream: UnixStream) -> Result<(), String> {
     stream
         .read_to_end(&mut buf)
         .map_err(|e| format!("read socket: {e}"))?;
-    let reply = match serde_json::from_slice::<Request>(&buf) {
-        Ok(req) => handle_request(req),
-        Err(err) => json!({"ok": false, "error": err.to_string()}).to_string(),
+    let (reply, reboot) = match serde_json::from_slice::<Request>(&buf) {
+        Ok(req) => {
+            let reboot = req.op == "reboot";
+            (handle_request(req), reboot)
+        }
+        Err(err) => (
+            json!({"ok": false, "error": err.to_string()}).to_string(),
+            false,
+        ),
     };
     stream
         .write_all(reply.as_bytes())
         .and_then(|_| stream.write_all(b"\n"))
         .map_err(|e| format!("write socket: {e}"))?;
+    if reboot && reply_ok(&reply) {
+        request_reboot();
+    }
     Ok(())
 }
 
+fn reply_ok(reply: &str) -> bool {
+    serde_json::from_str::<Value>(reply)
+        .ok()
+        .and_then(|v| v.get("ok").and_then(Value::as_bool))
+        == Some(true)
+}
+
+fn request_reboot() {
+    // Reply is already on the socket. Reboot is the operator step, not staging.
+    let _ = Command::new("systemctl")
+        .args(["reboot", "--no-block"])
+        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+        .stdin(Stdio::null())
+        .status();
+}
+
 fn handle_request(req: Request) -> String {
-    if req.op != "stage" {
-        return json!({"ok": false, "error": format!("unknown op {}", req.op)}).to_string();
+    match req.op.as_str() {
+        "status" => {
+            let (booted, staged, rollback) = bootc_images();
+            json!({
+                "ok": true,
+                "reboot_required": !staged.is_empty(),
+                "booted": booted,
+                "staged": staged,
+                "rollback": rollback,
+            })
+            .to_string()
+        }
+        "reboot" => {
+            if !admin_exists() {
+                return json!({"ok": false, "error": "Host update refused until an admin exists"})
+                    .to_string();
+            }
+            json!({"ok": true, "rebooting": true}).to_string()
+        }
+        "stage" => stage_request(&req.image),
+        other => json!({"ok": false, "error": format!("unknown op {other}")}).to_string(),
     }
+}
+
+fn stage_request(image: &str) -> String {
     if !admin_exists() {
         return json!({"ok": false, "error": "Host update refused until an admin exists"})
             .to_string();
     }
-    if req.image.is_empty() {
+    if image.is_empty() {
         return json!({"ok": false, "error": "Host image required"}).to_string();
     }
-    match bootc_switch(&req.image) {
+    match bootc_switch(image) {
         Ok(()) => {
-            let (booted, staged) = bootc_images();
+            let (booted, staged, rollback) = bootc_images();
             json!({
                 "ok": true,
                 "reboot_required": true,
                 "booted": booted,
                 "staged": staged,
+                "rollback": rollback,
             })
             .to_string()
         }
@@ -140,16 +188,20 @@ fn local_registry_host(image: &str) -> Option<String> {
     }
 }
 
-fn bootc_images() -> (String, String) {
+fn bootc_images() -> (String, String, String) {
     let output = Command::new("bootc")
         .args(["status", "--format", "json"])
         .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
         .output();
     let Ok(output) = output else {
-        return (String::new(), String::new());
+        return (String::new(), String::new(), String::new());
     };
     let v: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
-    (image_ref(&v, "booted"), image_ref(&v, "staged"))
+    (
+        image_ref(&v, "booted"),
+        image_ref(&v, "staged"),
+        image_ref(&v, "rollback"),
+    )
 }
 
 fn image_ref(status: &Value, which: &str) -> String {
@@ -201,5 +253,30 @@ mod tests {
             Some("localhost:5000")
         );
         assert_eq!(local_registry_host("quay.io/fwos:next"), None);
+    }
+
+    #[test]
+    fn status_op_reports_bootc_deployments() {
+        let s = handle_request(Request {
+            op: "status".into(),
+            image: String::new(),
+        });
+        assert!(s.contains("\"ok\":true") || s.contains("\"ok\": true"));
+        assert!(s.contains("booted"));
+        assert!(s.contains("staged"));
+        assert!(s.contains("rollback"));
+        assert!(!s.contains("unknown op"));
+    }
+
+    #[test]
+    fn reboot_op_without_admin_is_refused() {
+        let s = handle_request(Request {
+            op: "reboot".into(),
+            image: String::new(),
+        });
+        assert!(!s.contains("unknown op"));
+        let l = s.to_ascii_lowercase();
+        assert!(l.contains("admin") || l.contains("refus"));
+        assert!(!s.contains("\"ok\":true") && !s.contains("\"ok\": true"));
     }
 }

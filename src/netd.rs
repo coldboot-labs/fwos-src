@@ -58,6 +58,8 @@ struct Iface {
     vlan: Option<u16>,
     #[serde(default)]
     parent: Option<String>,
+    #[serde(default)]
+    dhcp: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

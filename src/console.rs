@@ -197,18 +197,42 @@ enum AdminAct {
 }
 
 fn admin_handle(out: &mut impl Write, line: &str) -> Result<AdminAct, String> {
-    let mut parts = line.split_whitespace();
-    match parts.next() {
-        None | Some("status") => {
+    let line = line.trim();
+    let (cmd, rest) = match line.split_once(char::is_whitespace) {
+        Some((cmd, rest)) => (cmd, rest.trim()),
+        None => (line, ""),
+    };
+    match cmd {
+        "" | "status" => {
             print_admin_status(out)?;
             Ok(AdminAct::Continue)
         }
-        Some("help") => {
+        "help" => {
             print_admin_help(out)?;
             Ok(AdminAct::Continue)
         }
-        Some("logout") => Ok(AdminAct::Logout),
-        Some(_) => {
+        "logout" => Ok(AdminAct::Logout),
+        "show" => {
+            write_cmd(out, super::show_desired())?;
+            Ok(AdminAct::Continue)
+        }
+        "apply" => {
+            if rest.is_empty() {
+                writeln!(out, "usage: apply <json|toml|path>").map_err(|e| e.to_string())?;
+                out.flush().map_err(|e| e.to_string())?;
+                return Ok(AdminAct::Continue);
+            }
+            write_cmd(
+                out,
+                super::apply_source(rest).and_then(|raw| super::apply_desired(&raw)),
+            )?;
+            Ok(AdminAct::Continue)
+        }
+        "update" => {
+            write_cmd(out, super::update_client())?;
+            Ok(AdminAct::Continue)
+        }
+        _ => {
             writeln!(out, "unknown command").map_err(|e| e.to_string())?;
             out.flush().map_err(|e| e.to_string())?;
             Ok(AdminAct::Continue)
@@ -216,8 +240,25 @@ fn admin_handle(out: &mut impl Write, line: &str) -> Result<AdminAct, String> {
     }
 }
 
+fn write_cmd(out: &mut impl Write, result: Result<String, String>) -> Result<(), String> {
+    match result {
+        Ok(reply) => {
+            write!(out, "{reply}").map_err(|e| e.to_string())?;
+            if !reply.ends_with('\n') {
+                writeln!(out).map_err(|e| e.to_string())?;
+            }
+        }
+        Err(err) => writeln!(out, "{err}").map_err(|e| e.to_string())?,
+    }
+    out.flush().map_err(|e| e.to_string())
+}
+
 fn print_admin_help(out: &mut impl Write) -> Result<(), String> {
-    writeln!(out, "status\nhelp\nlogout").map_err(|e| e.to_string())?;
+    writeln!(
+        out,
+        "status\nshow\napply <json|toml|path>\nupdate\nhelp\nlogout"
+    )
+    .map_err(|e| e.to_string())?;
     out.flush().map_err(|e| e.to_string())
 }
 
@@ -625,6 +666,49 @@ mod tests {
     fn admin_logout_leaves_session() {
         let mut out = Vec::new();
         assert_eq!(admin_handle(&mut out, "logout").unwrap(), AdminAct::Logout);
+    }
+
+    #[test]
+    fn admin_help_lists_apply_show_update() {
+        let mut out = Vec::new();
+        print_admin_help(&mut out).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("apply"));
+        assert!(s.contains("show"));
+        assert!(s.contains("update"));
+    }
+
+    #[test]
+    fn admin_apply_is_a_netd_client() {
+        let mut out = Vec::new();
+        assert_eq!(
+            admin_handle(&mut out, r#"apply {"wireguard":[]}"#).unwrap(),
+            AdminAct::Continue
+        );
+        let s = String::from_utf8(out).unwrap();
+        assert!(!s.contains("unknown command"));
+        assert!(s.contains("netd.sock"));
+    }
+
+    #[test]
+    fn admin_show_round_trips_toml_on_var() {
+        let mut out = Vec::new();
+        assert_eq!(admin_handle(&mut out, "show").unwrap(), AdminAct::Continue);
+        let s = String::from_utf8(out).unwrap();
+        assert!(!s.contains("unknown command"));
+        assert!(s.contains("/var/lib/fwos/desired.toml"));
+    }
+
+    #[test]
+    fn admin_update_is_a_host_update_socket_client() {
+        let mut out = Vec::new();
+        assert_eq!(
+            admin_handle(&mut out, "update").unwrap(),
+            AdminAct::Continue
+        );
+        let s = String::from_utf8(out).unwrap();
+        assert!(!s.contains("unknown command"));
+        assert!(s.contains("update.sock"));
     }
 
     #[test]

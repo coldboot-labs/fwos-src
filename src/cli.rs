@@ -4,9 +4,13 @@ use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::process;
+use std::time::Duration;
 
 const SOCK: &str = "/var/lib/fwos/netd.sock";
+const UPDATE_SOCK: &str = "/var/lib/fwos/update.sock";
+const DESIRED: &str = "/var/lib/fwos/desired.toml";
 
 fn main() {
     if let Err(err) = run() {
@@ -21,26 +25,59 @@ fn run() -> Result<(), String> {
         None => return console::run(),
         Some(cmd) => cmd,
     };
-    if cmd == "console" {
-        return console::run();
-    }
-    if cmd != "apply" {
-        return Err(format!("unknown command {cmd}; usage: fwos apply [file]"));
-    }
-    let raw = match args.next().as_deref() {
-        None | Some("-") => {
-            let mut buf = String::new();
-            io::stdin()
-                .read_to_string(&mut buf)
-                .map_err(|e| format!("read stdin: {e}"))?;
-            buf
+    match cmd.as_str() {
+        "console" => console::run(),
+        "apply" => {
+            let raw = match args.next().as_deref() {
+                None | Some("-") => {
+                    let mut buf = String::new();
+                    io::stdin()
+                        .read_to_string(&mut buf)
+                        .map_err(|e| format!("read stdin: {e}"))?;
+                    buf
+                }
+                Some(path) => fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?,
+            };
+            print!("{}", apply_desired(&raw)?);
+            Ok(())
         }
-        Some(path) => fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?,
-    };
-    let json = to_json(&raw)?;
-    let mut stream = UnixStream::connect(SOCK).map_err(|e| format!("connect {SOCK}: {e}"))?;
+        "update" => {
+            print!("{}", update_client()?);
+            Ok(())
+        }
+        _ => Err(format!("unknown command {cmd}; usage: fwos apply [file]")),
+    }
+}
+
+fn apply_desired(raw: &str) -> Result<String, String> {
+    let json = to_json(raw)?;
+    socket_roundtrip(SOCK, json.as_bytes())
+}
+
+fn show_desired() -> Result<String, String> {
+    fs::read_to_string(DESIRED).map_err(|e| format!("read {DESIRED}: {e}"))
+}
+
+fn update_client() -> Result<String, String> {
+    UnixStream::connect(UPDATE_SOCK)
+        .map(|_| String::new())
+        .map_err(|e| format!("connect {UPDATE_SOCK}: {e}"))
+}
+
+fn apply_source(rest: &str) -> Result<String, String> {
+    if rest.starts_with('/') || Path::new(rest).is_file() {
+        fs::read_to_string(rest).map_err(|e| format!("read {rest}: {e}"))
+    } else {
+        Ok(rest.to_string())
+    }
+}
+
+fn socket_roundtrip(sock: &str, body: &[u8]) -> Result<String, String> {
+    let mut stream = UnixStream::connect(sock).map_err(|e| format!("connect {sock}: {e}"))?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(60)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(60)));
     stream
-        .write_all(json.as_bytes())
+        .write_all(body)
         .map_err(|e| format!("write socket: {e}"))?;
     stream
         .shutdown(std::net::Shutdown::Write)
@@ -49,8 +86,7 @@ fn run() -> Result<(), String> {
     stream
         .read_to_string(&mut reply)
         .map_err(|e| format!("read socket: {e}"))?;
-    print!("{reply}");
-    Ok(())
+    Ok(reply)
 }
 
 fn to_json(raw: &str) -> Result<String, String> {

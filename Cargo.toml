@@ -29,3 +29,7 @@ path = "src/cli.rs"
 [[bin]]
 name = "fwos-ui"
 path = "src/ui.rs"
+
+[[bin]]
+name = "fwos-update"
+path = "src/update.rs"

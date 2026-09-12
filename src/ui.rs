@@ -765,3 +765,22 @@ fn ip_output(args: &[&str]) -> Result<String, String> {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ui_has_no_host_update_route() {
+        let req = HttpRequest {
+            method: "POST".into(),
+            path: "/api/update".into(),
+            body: b"{\"image\":\"10.0.2.2:5000/fwos:next\"}".to_vec(),
+        };
+        let resp = dispatch(&req);
+        assert_eq!(resp.status, 404);
+        let body = String::from_utf8_lossy(&resp.body);
+        assert!(!body.contains("update.sock"));
+        assert!(!body.contains("bootc"));
+    }
+}

@@ -227,6 +227,7 @@ fn apply(state: &mut DesiredState) -> Result<(), String> {
     }
     if has_mgmt_path(state) {
         host_default_via_mgmt()?;
+        program_host_pull_nat()?;
         write_sshd_stamp()?;
     }
     program_wg(state)?;
@@ -376,6 +377,15 @@ fn ensure_host_mgmt_veth() -> Result<(), String> {
 
 fn host_default_via_mgmt() -> Result<(), String> {
     with_host_net(|| run_ip(&["route", "replace", "default", "via", HOST_VETH_GW]))
+}
+
+fn program_host_pull_nat() -> Result<(), String> {
+    // Host-netns pulls (bootc) leave via the mgmt veth; masquerade so they
+    // can reach a Workstation-local registry on the Management NIC.
+    let rules = format!(
+        "destroy table ip fwos-host-pull\ntable ip fwos-host-pull {{\n  chain postrouting {{\n    type nat hook postrouting priority srcnat; policy accept;\n    ip saddr {HOST_VETH_ADDR} masquerade\n  }}\n}}\n"
+    );
+    with_mgmt_net(|| nft_apply(&rules))
 }
 
 fn ensure_fwd_mgmt_veth() -> Result<(), String> {
@@ -667,6 +677,10 @@ fn program_nft(state: &DesiredState) -> Result<(), String> {
         rules.push_str("  }\n");
     }
     rules.push_str("}\n");
+    nft_apply(&rules)
+}
+
+fn nft_apply(rules: &str) -> Result<(), String> {
     let mut child = Command::new("nft")
         .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
         .arg("-f")

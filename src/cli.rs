@@ -11,6 +11,7 @@ use std::time::Duration;
 const SOCK: &str = "/var/lib/fwos/netd.sock";
 const UPDATE_SOCK: &str = "/var/lib/fwos/update.sock";
 const DESIRED: &str = "/var/lib/fwos/desired.toml";
+const UPDATE_TIMEOUT: Duration = Duration::from_secs(1200);
 
 fn main() {
     if let Err(err) = run() {
@@ -42,7 +43,8 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         "update" => {
-            print!("{}", update_client()?);
+            let image = args.next().unwrap_or_default();
+            print!("{}", update_client(&image)?);
             Ok(())
         }
         _ => Err(format!("unknown command {cmd}; usage: fwos apply [file]")),
@@ -58,10 +60,12 @@ fn show_desired() -> Result<String, String> {
     fs::read_to_string(DESIRED).map_err(|e| format!("read {DESIRED}: {e}"))
 }
 
-fn update_client() -> Result<String, String> {
-    UnixStream::connect(UPDATE_SOCK)
-        .map(|_| String::new())
-        .map_err(|e| format!("connect {UPDATE_SOCK}: {e}"))
+fn update_client(image: &str) -> Result<String, String> {
+    if image.is_empty() {
+        return Err("usage: update <image>".into());
+    }
+    let body = serde_json::json!({"op": "stage", "image": image}).to_string();
+    socket_roundtrip_for(UPDATE_SOCK, body.as_bytes(), UPDATE_TIMEOUT)
 }
 
 fn apply_source(rest: &str) -> Result<String, String> {
@@ -73,9 +77,13 @@ fn apply_source(rest: &str) -> Result<String, String> {
 }
 
 fn socket_roundtrip(sock: &str, body: &[u8]) -> Result<String, String> {
+    socket_roundtrip_for(sock, body, Duration::from_secs(60))
+}
+
+fn socket_roundtrip_for(sock: &str, body: &[u8], timeout: Duration) -> Result<String, String> {
     let mut stream = UnixStream::connect(sock).map_err(|e| format!("connect {sock}: {e}"))?;
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(60)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(60)));
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
     stream
         .write_all(body)
         .map_err(|e| format!("write socket: {e}"))?;

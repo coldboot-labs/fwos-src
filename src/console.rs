@@ -86,6 +86,11 @@ fn handle(out: &mut impl Write, line: &str) -> Result<(), String> {
         Some("apply") => {
             Err("Bootstrap console sets ephemeral addressing, not Desired state".into())
         }
+        Some("update") => {
+            let image = parts.next().unwrap_or("");
+            write_cmd(out, super::update_client(image))?;
+            Ok(())
+        }
         Some(_) => {
             writeln!(out, "unknown command").map_err(|e| e.to_string())?;
             out.flush().map_err(|e| e.to_string())?;
@@ -97,7 +102,7 @@ fn handle(out: &mut impl Write, line: &str) -> Result<(), String> {
 fn print_help(out: &mut impl Write) -> Result<(), String> {
     writeln!(
         out,
-        "static <nic> <cidr>  ephemeral IPv4/IPv6\ndhcp <nic>            ephemeral DHCPv4\nslaac <nic>           ephemeral IPv6 RA\nstatus"
+        "static <nic> <cidr>  ephemeral IPv4/IPv6\ndhcp <nic>            ephemeral DHCPv4\nslaac <nic>           ephemeral IPv6 RA\nupdate <image>\nstatus"
     )
     .map_err(|e| e.to_string())?;
     out.flush().map_err(|e| e.to_string())
@@ -229,7 +234,7 @@ fn admin_handle(out: &mut impl Write, line: &str) -> Result<AdminAct, String> {
             Ok(AdminAct::Continue)
         }
         "update" => {
-            write_cmd(out, super::update_client())?;
+            write_cmd(out, super::update_client(rest))?;
             Ok(AdminAct::Continue)
         }
         _ => {
@@ -256,7 +261,7 @@ fn write_cmd(out: &mut impl Write, result: Result<String, String>) -> Result<(),
 fn print_admin_help(out: &mut impl Write) -> Result<(), String> {
     writeln!(
         out,
-        "status\nshow\napply <json|toml|path>\nupdate\nhelp\nlogout"
+        "status\nshow\napply <json|toml|path>\nupdate <image>\nhelp\nlogout"
     )
     .map_err(|e| e.to_string())?;
     out.flush().map_err(|e| e.to_string())
@@ -675,7 +680,19 @@ mod tests {
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains("apply"));
         assert!(s.contains("show"));
-        assert!(s.contains("update"));
+        assert!(s.contains("update <image>"));
+    }
+
+    #[test]
+    fn admin_update_without_image_prints_usage() {
+        let mut out = Vec::new();
+        assert_eq!(
+            admin_handle(&mut out, "update").unwrap(),
+            AdminAct::Continue
+        );
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("usage: update <image>"));
+        assert!(!s.contains("update.sock"));
     }
 
     #[test]
@@ -703,9 +720,18 @@ mod tests {
     fn admin_update_is_a_host_update_socket_client() {
         let mut out = Vec::new();
         assert_eq!(
-            admin_handle(&mut out, "update").unwrap(),
+            admin_handle(&mut out, "update 10.0.2.2:5000/fwos:next").unwrap(),
             AdminAct::Continue
         );
+        let s = String::from_utf8(out).unwrap();
+        assert!(!s.contains("unknown command"));
+        assert!(s.contains("update.sock"));
+    }
+
+    #[test]
+    fn bootstrap_update_hits_the_host_update_socket() {
+        let mut out = Vec::new();
+        handle(&mut out, "update 10.0.2.2:5000/fwos:next").unwrap();
         let s = String::from_utf8(out).unwrap();
         assert!(!s.contains("unknown command"));
         assert!(s.contains("update.sock"));

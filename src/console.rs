@@ -242,6 +242,10 @@ fn admin_handle(out: &mut impl Write, line: &str) -> Result<AdminAct, String> {
             write_cmd(out, super::reboot_client())?;
             Ok(AdminAct::Continue)
         }
+        "rollback" => {
+            write_cmd(out, super::rollback_client())?;
+            Ok(AdminAct::Continue)
+        }
         _ => {
             writeln!(out, "unknown command").map_err(|e| e.to_string())?;
             out.flush().map_err(|e| e.to_string())?;
@@ -266,7 +270,7 @@ fn write_cmd(out: &mut impl Write, result: Result<String, String>) -> Result<(),
 fn print_admin_help(out: &mut impl Write) -> Result<(), String> {
     writeln!(
         out,
-        "status\nshow\napply <json|toml|path>\nupdate <image>\nreboot\nhelp\nlogout"
+        "status\nshow\napply <json|toml|path>\nupdate <image>\nreboot\nrollback\nhelp\nlogout"
     )
     .map_err(|e| e.to_string())?;
     out.flush().map_err(|e| e.to_string())
@@ -726,6 +730,7 @@ mod tests {
         assert!(s.contains("show"));
         assert!(s.contains("update <image>"));
         assert!(s.contains("reboot"));
+        assert!(s.contains("rollback"));
     }
 
     #[test]
@@ -743,6 +748,18 @@ mod tests {
         let mut out = Vec::new();
         assert_eq!(
             admin_handle(&mut out, "reboot").unwrap(),
+            AdminAct::Continue
+        );
+        let s = String::from_utf8(out).unwrap();
+        assert!(!s.contains("unknown command"));
+        assert!(s.contains("update.sock"));
+    }
+
+    #[test]
+    fn admin_rollback_is_a_host_update_socket_client() {
+        let mut out = Vec::new();
+        assert_eq!(
+            admin_handle(&mut out, "rollback").unwrap(),
             AdminAct::Continue
         );
         let s = String::from_utf8(out).unwrap();

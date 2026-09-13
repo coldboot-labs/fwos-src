@@ -51,6 +51,10 @@ fn run() -> Result<(), String> {
             print!("{}", reboot_client()?);
             Ok(())
         }
+        "rollback" => {
+            print!("{}", rollback_client()?);
+            Ok(())
+        }
         _ => Err(format!("unknown command {cmd}; usage: fwos apply [file]")),
     }
 }
@@ -79,6 +83,11 @@ fn update_status() -> Result<String, String> {
 
 fn reboot_client() -> Result<String, String> {
     let body = serde_json::json!({"op": "reboot"}).to_string();
+    socket_roundtrip(UPDATE_SOCK, body.as_bytes())
+}
+
+fn rollback_client() -> Result<String, String> {
+    let body = serde_json::json!({"op": "rollback"}).to_string();
     socket_roundtrip(UPDATE_SOCK, body.as_bytes())
 }
 

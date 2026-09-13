@@ -1,3 +1,4 @@
+use std::env;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::IpAddr;
@@ -5,13 +6,18 @@ use std::os::unix::fs::{chown, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::process::{self, Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 const SOCK: &str = "/var/lib/fwos/update.sock";
 const BOOTSTRAPPED: &str = "/var/lib/fwos/bootstrapped";
+const PENDING: &str = "/var/lib/fwos/health-pending";
+const NETD_SOCK: &str = "/var/lib/fwos/netd.sock";
 const REGISTRIES_DROPIN: &str = "/etc/containers/registries.conf.d/fwos-update.conf";
+const HEALTH_TIMEOUT: Duration = Duration::from_secs(180);
 
 #[derive(Debug, Deserialize)]
 struct Request {
@@ -21,9 +27,23 @@ struct Request {
 }
 
 fn main() {
-    if let Err(err) = run() {
-        eprintln!("fwos-update: {err}");
-        process::exit(1);
+    match env::args().nth(1).as_deref() {
+        Some("health") => {
+            if let Err(err) = run_health() {
+                eprintln!("fwos-update: {err}");
+                process::exit(1);
+            }
+        }
+        Some(other) => {
+            eprintln!("fwos-update: unknown command {other}");
+            process::exit(1);
+        }
+        None => {
+            if let Err(err) = run() {
+                eprintln!("fwos-update: {err}");
+                process::exit(1);
+            }
+        }
     }
 }
 
@@ -109,21 +129,20 @@ fn handle_request(req: Request) -> String {
             }
             json!({"ok": true, "rebooting": true}).to_string()
         }
+        "rollback" => rollback_request(),
         "stage" => stage_request(&req.image),
         other => json!({"ok": false, "error": format!("unknown op {other}")}).to_string(),
     }
 }
 
-fn stage_request(image: &str) -> String {
+fn rollback_request() -> String {
     if !admin_exists() {
         return json!({"ok": false, "error": "Host update refused until an admin exists"})
             .to_string();
     }
-    if image.is_empty() {
-        return json!({"ok": false, "error": "Host image required"}).to_string();
-    }
-    match bootc_switch(image) {
+    match bootc_rollback() {
         Ok(()) => {
+            clear_pending();
             let (booted, staged, rollback) = bootc_images();
             json!({
                 "ok": true,
@@ -135,6 +154,39 @@ fn stage_request(image: &str) -> String {
             .to_string()
         }
         Err(err) => json!({"ok": false, "error": err}).to_string(),
+    }
+}
+
+fn stage_request(image: &str) -> String {
+    if !admin_exists() {
+        return json!({"ok": false, "error": "Host update refused until an admin exists"})
+            .to_string();
+    }
+    if image.is_empty() {
+        return json!({"ok": false, "error": "Host image required"}).to_string();
+    }
+    if let Err(err) = write_pending(image) {
+        return json!({"ok": false, "error": err}).to_string();
+    }
+    match bootc_switch(image) {
+        Ok(()) => {
+            let (booted, staged, rollback) = bootc_images();
+            if !staged.is_empty() {
+                let _ = write_pending(&staged);
+            }
+            json!({
+                "ok": true,
+                "reboot_required": true,
+                "booted": booted,
+                "staged": staged,
+                "rollback": rollback,
+            })
+            .to_string()
+        }
+        Err(err) => {
+            clear_pending();
+            json!({"ok": false, "error": err}).to_string()
+        }
     }
 }
 
@@ -238,6 +290,163 @@ fn wheel_gid() -> Option<u32> {
     None
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApplianceHealth {
+    Ok,
+    DefaultTargetNotReached,
+    FwdMissing,
+    MgmtMissing,
+    NetdNotRunning,
+}
+
+impl ApplianceHealth {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::DefaultTargetNotReached => "default target not reached",
+            Self::FwdMissing => "fwd missing",
+            Self::MgmtMissing => "mgmt missing",
+            Self::NetdNotRunning => "netd not running",
+        }
+    }
+}
+
+fn assess_health(default_target: bool, fwd: bool, mgmt: bool, netd: bool) -> ApplianceHealth {
+    if !default_target {
+        ApplianceHealth::DefaultTargetNotReached
+    } else if !fwd {
+        ApplianceHealth::FwdMissing
+    } else if !mgmt {
+        ApplianceHealth::MgmtMissing
+    } else if !netd {
+        ApplianceHealth::NetdNotRunning
+    } else {
+        ApplianceHealth::Ok
+    }
+}
+
+fn should_auto_rollback(
+    pending_this_boot: bool,
+    has_rollback: bool,
+    health: ApplianceHealth,
+) -> bool {
+    pending_this_boot && has_rollback && health != ApplianceHealth::Ok
+}
+
+fn pending_is_this_boot(pending: &str, booted: &str) -> bool {
+    fn norm(s: &str) -> &str {
+        let s = s.strip_prefix("docker://").unwrap_or(s);
+        s.split('@').next().unwrap_or(s)
+    }
+    let pending = norm(pending);
+    let booted = norm(booted);
+    !pending.is_empty() && !booted.is_empty() && pending == booted
+}
+
+fn write_pending(image: &str) -> Result<(), String> {
+    if let Some(dir) = Path::new(PENDING).parent() {
+        fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    }
+    fs::write(PENDING, format!("{image}\n")).map_err(|e| format!("write {PENDING}: {e}"))
+}
+
+fn read_pending() -> String {
+    fs::read_to_string(PENDING)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_default()
+}
+
+fn clear_pending() {
+    let _ = fs::remove_file(PENDING);
+}
+
+fn bootc_rollback() -> Result<(), String> {
+    let output = Command::new("bootc")
+        .args(["rollback"])
+        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("bootc rollback: {e}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "bootc rollback failed: {} {}",
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+fn run_health() -> Result<(), String> {
+    let pending = read_pending();
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let deadline = Instant::now() + HEALTH_TIMEOUT;
+    loop {
+        let (booted, _, rollback) = bootc_images();
+        if !booted.is_empty() && !pending_is_this_boot(&pending, &booted) {
+            return Ok(());
+        }
+        let this_boot = pending_is_this_boot(&pending, &booted);
+        let has_rollback = !rollback.is_empty();
+        let health = assess_health(
+            default_target_reached(),
+            netns_exists("fwd"),
+            netns_exists("mgmt"),
+            netd_running(),
+        );
+        if this_boot && health == ApplianceHealth::Ok {
+            clear_pending();
+            console_log("appliance health ok");
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            if should_auto_rollback(this_boot, has_rollback, health) {
+                console_log(&format!(
+                    "appliance health failed ({}); rolling back",
+                    health.as_str()
+                ));
+                bootc_rollback()?;
+                clear_pending();
+                request_reboot();
+            } else if this_boot {
+                clear_pending();
+            }
+            return Ok(());
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+}
+
+fn default_target_reached() -> bool {
+    Command::new("systemctl")
+        .args(["is-active", "--quiet", "default.target"])
+        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn netns_exists(name: &str) -> bool {
+    Path::new("/run/netns").join(name).exists()
+}
+
+fn netd_running() -> bool {
+    UnixStream::connect(NETD_SOCK).is_ok()
+}
+
+fn console_log(msg: &str) {
+    let line = format!("fwos-update: {msg}\n");
+    eprint!("{line}");
+    if let Ok(mut f) = fs::OpenOptions::new().write(true).open("/dev/console") {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,5 +487,90 @@ mod tests {
         let l = s.to_ascii_lowercase();
         assert!(l.contains("admin") || l.contains("refus"));
         assert!(!s.contains("\"ok\":true") && !s.contains("\"ok\": true"));
+    }
+
+    #[test]
+    fn rollback_op_without_admin_is_refused() {
+        let s = handle_request(Request {
+            op: "rollback".into(),
+            image: String::new(),
+        });
+        assert!(!s.contains("unknown op"));
+        let l = s.to_ascii_lowercase();
+        assert!(l.contains("admin") || l.contains("refus"));
+        assert!(!s.contains("\"ok\":true") && !s.contains("\"ok\": true"));
+    }
+
+    #[test]
+    fn appliance_health_is_target_netns_and_netd_not_desired_state() {
+        assert_eq!(assess_health(true, true, true, true), ApplianceHealth::Ok);
+        assert_eq!(
+            assess_health(false, true, true, true),
+            ApplianceHealth::DefaultTargetNotReached
+        );
+        assert_eq!(
+            assess_health(true, false, true, true),
+            ApplianceHealth::FwdMissing
+        );
+        assert_eq!(
+            assess_health(true, true, false, true),
+            ApplianceHealth::MgmtMissing
+        );
+        assert_eq!(
+            assess_health(true, true, true, false),
+            ApplianceHealth::NetdNotRunning
+        );
+    }
+
+    #[test]
+    fn auto_rollback_only_after_host_update_boot_with_a_rollback_target() {
+        assert!(!should_auto_rollback(
+            false,
+            true,
+            ApplianceHealth::NetdNotRunning
+        ));
+        assert!(!should_auto_rollback(
+            true,
+            false,
+            ApplianceHealth::NetdNotRunning
+        ));
+        assert!(!should_auto_rollback(true, true, ApplianceHealth::Ok));
+        assert!(should_auto_rollback(
+            true,
+            true,
+            ApplianceHealth::NetdNotRunning
+        ));
+        assert!(should_auto_rollback(
+            true,
+            true,
+            ApplianceHealth::FwdMissing
+        ));
+        assert!(should_auto_rollback(
+            true,
+            true,
+            ApplianceHealth::DefaultTargetNotReached
+        ));
+    }
+
+    #[test]
+    fn pending_matches_booted_image_refs() {
+        assert!(pending_is_this_boot(
+            "10.0.2.2:5000/fwos:next",
+            "10.0.2.2:5000/fwos:next"
+        ));
+        assert!(pending_is_this_boot(
+            "docker://10.0.2.2:5000/fwos:next",
+            "10.0.2.2:5000/fwos:next"
+        ));
+        assert!(pending_is_this_boot(
+            "10.0.2.2:5000/fwos:next",
+            "10.0.2.2:5000/fwos:next@sha256:abc"
+        ));
+        assert!(!pending_is_this_boot(
+            "10.0.2.2:5000/fwos:next",
+            "10.0.2.2:5000/fwos:dev"
+        ));
+        assert!(!pending_is_this_boot("", "10.0.2.2:5000/fwos:next"));
+        assert!(!pending_is_this_boot("10.0.2.2:5000/fwos:next", ""));
     }
 }

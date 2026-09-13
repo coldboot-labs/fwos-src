@@ -26,6 +26,31 @@ pub fn run() -> Result<(), String> {
     }
 }
 
+fn clear_tty(out: &mut impl Write) -> Result<(), String> {
+    write!(out, "\x1b[2J\x1b[H").map_err(|e| e.to_string())?;
+    out.flush().map_err(|e| e.to_string())
+}
+
+fn write_prompt(out: &mut impl Write) -> Result<(), String> {
+    write!(out, "> ").map_err(|e| e.to_string())?;
+    out.flush().map_err(|e| e.to_string())
+}
+
+fn nics_key(nics: &[Nic]) -> String {
+    nics.iter()
+        .map(|n| {
+            let addrs = n
+                .addrs
+                .iter()
+                .map(|a| a.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{}={addrs}", n.name)
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
 fn bootstrapped() -> bool {
     Path::new(BOOTSTRAPPED).exists()
 }
@@ -34,15 +59,30 @@ fn bootstrap_run() -> Result<(), String> {
     let mut stdout = io::stdout();
     let fd = io::stdin().as_raw_fd();
     let mut acc = Vec::new();
+    clear_tty(&mut stdout)?;
     print_status(&mut stdout)?;
+    write_prompt(&mut stdout)?;
+    let mut key = nics_key(&host_nics().unwrap_or_default());
     loop {
         if bootstrapped() {
             return switch_to_admin(&mut stdout);
         }
-        write!(stdout, "> ").map_err(|e| e.to_string())?;
-        stdout.flush().map_err(|e| e.to_string())?;
         match read_line_poll(fd, &mut acc, 500)? {
-            Input::Timeout => continue,
+            Input::Timeout => {
+                if bootstrapped() {
+                    return switch_to_admin(&mut stdout);
+                }
+                let now = nics_key(&host_nics().unwrap_or_default());
+                if now != key {
+                    // NIC list going empty is placement, not a status to show.
+                    let skip = now.is_empty() && !key.is_empty();
+                    key = now;
+                    if !skip {
+                        print_status(&mut stdout)?;
+                        write_prompt(&mut stdout)?;
+                    }
+                }
+            }
             Input::Eof => return Ok(()),
             Input::Line(line) => {
                 if bootstrapped() {
@@ -52,6 +92,8 @@ fn bootstrap_run() -> Result<(), String> {
                     writeln!(stdout, "{err}").map_err(|e| e.to_string())?;
                     stdout.flush().map_err(|e| e.to_string())?;
                 }
+                write_prompt(&mut stdout)?;
+                key = nics_key(&host_nics().unwrap_or_default());
             }
         }
     }
@@ -150,6 +192,7 @@ fn admin_run() -> Result<(), String> {
     let mut stdout = io::stdout();
     let fd = io::stdin().as_raw_fd();
     let mut acc = Vec::new();
+    clear_tty(&mut stdout)?;
     writeln!(stdout, "FWOS Appliance CLI").map_err(|e| e.to_string())?;
     stdout.flush().map_err(|e| e.to_string())?;
     loop {
@@ -826,5 +869,23 @@ mod tests {
         assert!(eq_ct(b"abc", b"abc"));
         assert!(!eq_ct(b"abc", b"abd"));
         assert!(!eq_ct(b"ab", b"abc"));
+    }
+
+    #[test]
+    fn nics_key_changes_when_addresses_change() {
+        let a = vec![Nic {
+            name: "enp0s2".into(),
+            addrs: vec!["10.0.2.15".parse().unwrap()],
+        }];
+        let b = vec![Nic {
+            name: "enp0s2".into(),
+            addrs: vec![
+                "10.0.2.15".parse().unwrap(),
+                "192.168.200.50".parse().unwrap(),
+            ],
+        }];
+        assert_eq!(nics_key(&a), nics_key(&a));
+        assert_ne!(nics_key(&a), nics_key(&b));
+        assert!(nics_key(&[]).is_empty());
     }
 }

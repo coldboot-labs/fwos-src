@@ -180,7 +180,6 @@ fn apply(state: &mut DesiredState) -> Result<(), String> {
         })?;
         persist(state)?;
         program_nft(state)?;
-        write_sshd_stamp()?;
     }
     for iface in &state.interfaces {
         if iface.placement == "fwd" && iface.vlan.is_none() {
@@ -228,7 +227,6 @@ fn apply(state: &mut DesiredState) -> Result<(), String> {
     if has_mgmt_path(state) {
         host_default_via_mgmt()?;
         program_host_pull_nat()?;
-        write_sshd_stamp()?;
     }
     program_wg(state)?;
     program_routes(state)?;
@@ -446,11 +444,6 @@ fn program_vlans(state: &DesiredState) -> Result<(), String> {
     Ok(())
 }
 
-fn write_sshd_stamp() -> Result<(), String> {
-    fs::write("/var/lib/fwos/sshd-mgmt", "mgmt\n")
-        .map_err(|e| format!("write sshd-mgmt stamp: {e}"))
-}
-
 fn link_exists(name: &str) -> Result<bool, String> {
     let status = ip_cmd()
         .args(["link", "show", "dev", name])
@@ -647,7 +640,7 @@ fn program_nft(state: &DesiredState) -> Result<(), String> {
     rules.push_str("    ct state established,related accept\n");
     if let Some(parent) = stick {
         rules.push_str(&format!(
-            "    iifname \"{}\" oifname \"{FWD_MGMT_VETH}\" tcp dport {{ 22, 443 }} accept\n",
+            "    iifname \"{}\" oifname \"{FWD_MGMT_VETH}\" tcp dport 443 accept\n",
             parent.name
         ));
     }
@@ -660,11 +653,9 @@ fn program_nft(state: &DesiredState) -> Result<(), String> {
         rules.push_str("    type nat hook prerouting priority dstnat; policy accept;\n");
         match stick_ip.as_deref() {
             Some(ip) => rules.push_str(&format!(
-                "    ip daddr {ip} tcp dport {{ 22, 443 }} dnat ip to {MGMT_FWD_IP}\n"
+                "    ip daddr {ip} tcp dport 443 dnat ip to {MGMT_FWD_IP}\n"
             )),
-            None => rules.push_str(&format!(
-                "    tcp dport {{ 22, 443 }} dnat ip to {MGMT_FWD_IP}\n"
-            )),
+            None => rules.push_str(&format!("    tcp dport 443 dnat ip to {MGMT_FWD_IP}\n")),
         }
         rules.push_str("  }\n");
     }

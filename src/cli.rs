@@ -64,6 +64,12 @@ fn apply_desired(raw: &str) -> Result<String, String> {
     socket_roundtrip(SOCK, json.as_bytes())
 }
 
+fn netd_json(body: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let raw = serde_json::to_vec(body).map_err(|e| format!("encode netd cmd: {e}"))?;
+    let reply = socket_roundtrip(SOCK, &raw)?;
+    serde_json::from_str(&reply).map_err(|e| format!("parse netd reply: {e}"))
+}
+
 fn show_desired() -> Result<String, String> {
     fs::read_to_string(DESIRED).map_err(|e| format!("read {DESIRED}: {e}"))
 }

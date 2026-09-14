@@ -13,8 +13,22 @@ fn run() -> Result<(), String> {
         ensure_netns(name)?;
         up_lo(name)?;
         enable_v4_forward(name)?;
+        lock_autoconf(name)?;
     }
     Ok(())
+}
+
+fn lock_autoconf(name: &str) -> Result<(), String> {
+    let script = "echo 0 > /proc/sys/net/ipv6/conf/all/accept_ra; echo 0 > /proc/sys/net/ipv6/conf/default/accept_ra; echo 0 > /proc/sys/net/ipv6/conf/all/autoconf; echo 0 > /proc/sys/net/ipv6/conf/default/autoconf; echo 2 > /proc/sys/net/ipv4/conf/all/rp_filter; echo 2 > /proc/sys/net/ipv4/conf/default/rp_filter";
+    let status = Command::new("ip")
+        .args(["netns", "exec", name, "sh", "-c", script])
+        .status()
+        .map_err(|e| format!("lock autoconf in {name}: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("lock autoconf in {name} failed ({status})"))
+    }
 }
 
 fn ensure_netns(name: &str) -> Result<(), String> {
@@ -53,7 +67,7 @@ fn enable_v4_forward(name: &str) -> Result<(), String> {
             name,
             "sh",
             "-c",
-            "echo 1 > /proc/sys/net/ipv4/ip_forward",
+            "echo 1 > /proc/sys/net/ipv4/ip_forward; echo 1 > /proc/sys/net/ipv6/conf/all/forwarding",
         ])
         .status()
         .map_err(|e| format!("ip_forward in {name}: {e}"))?;

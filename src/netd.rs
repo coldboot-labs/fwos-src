@@ -7,9 +7,12 @@ use std::path::Path;
 use std::process::{self, Command};
 
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
 const SOCK: &str = "/var/lib/fwos/netd.sock";
 const DESIRED: &str = "/var/lib/fwos/desired.toml";
+const OPT_FILE: &str = "/var/lib/fwos/first-boot-opt.json";
+const BOOTSTRAPPED: &str = "/var/lib/fwos/bootstrapped";
 const HOST_NS: &str = "/run/host-netns";
 const MGMT_NS: &str = "/run/netns/mgmt";
 const HOST_VETH: &str = "h0mgmt";
@@ -23,6 +26,10 @@ const FWD_MGMT_ADDR: &str = "169.254.127.5/30";
 const MGMT_FWD_ADDR: &str = "169.254.127.6/30";
 const FWD_MGMT_GW: &str = "169.254.127.5";
 const MGMT_FWD_IP: &str = "169.254.127.6";
+const FWD_MGMT_ADDR6: &str = "fd53:1:1::5/64";
+const MGMT_FWD_ADDR6: &str = "fd53:1:1::6/64";
+const MGMT_FWD_IP6: &str = "fd53:1:1::6";
+const CGNAT: [u8; 2] = [100, 64];
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct DesiredState {
@@ -86,6 +93,14 @@ struct Qdisc {
     kind: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FirstBootOpt {
+    nic: String,
+    mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cidr: Option<String>,
+}
+
 fn main() {
     if let Err(err) = run() {
         eprintln!("netd: {err}");
@@ -104,12 +119,16 @@ fn run() -> Result<(), String> {
         .map_err(|e| format!("chmod {SOCK}: {e}"))?;
     let gid = wheel_gid().unwrap_or(10);
     chown(path, Some(0), Some(gid)).map_err(|e| format!("chown {SOCK}: {e}"))?;
+    setup_plumbing()?;
+    claim_traffic_nics()?;
     if Path::new(DESIRED).exists() {
         let raw = fs::read_to_string(DESIRED).map_err(|e| format!("read {DESIRED}: {e}"))?;
         let mut state: DesiredState =
             toml::from_str(&raw).map_err(|e| format!("parse {DESIRED}: {e}"))?;
         apply(&mut state)?;
         persist(&state)?;
+    } else if let Some(opt) = load_opt() {
+        apply_opt(&opt)?;
     }
     loop {
         let (stream, _) = listener
@@ -126,18 +145,22 @@ fn handle_client(mut stream: UnixStream) -> Result<(), String> {
     stream
         .read_to_end(&mut buf)
         .map_err(|e| format!("read socket: {e}"))?;
-    let reply = match serde_json::from_slice::<DesiredState>(&buf) {
-        Ok(mut state) => match apply(&mut state) {
-            Ok(()) => {
-                if let Err(err) = persist(&state) {
-                    serde_json::json!({"ok": false, "error": err}).to_string()
-                } else {
-                    serde_json::json!({"ok": true}).to_string()
+    let reply = match serde_json::from_slice::<Value>(&buf) {
+        Ok(v) if v.get("op").and_then(Value::as_str).is_some() => handle_cmd(&v),
+        Ok(v) => match serde_json::from_value::<DesiredState>(v) {
+            Ok(mut state) => match apply(&mut state) {
+                Ok(()) => {
+                    if let Err(err) = persist(&state) {
+                        json!({"ok": false, "error": err}).to_string()
+                    } else {
+                        json!({"ok": true}).to_string()
+                    }
                 }
-            }
-            Err(err) => serde_json::json!({"ok": false, "error": err}).to_string(),
+                Err(err) => json!({"ok": false, "error": err}).to_string(),
+            },
+            Err(err) => json!({"ok": false, "error": err.to_string()}).to_string(),
         },
-        Err(err) => serde_json::json!({"ok": false, "error": err.to_string()}).to_string(),
+        Err(err) => json!({"ok": false, "error": err.to_string()}).to_string(),
     };
     stream
         .write_all(reply.as_bytes())
@@ -146,21 +169,59 @@ fn handle_client(mut stream: UnixStream) -> Result<(), String> {
     Ok(())
 }
 
+fn handle_cmd(v: &Value) -> String {
+    match v.get("op").and_then(Value::as_str).unwrap_or("") {
+        "list" => list_nics_reply(),
+        "opt" => match parse_opt(v).and_then(apply_and_persist_opt) {
+            Ok(()) => json!({"ok": true}).to_string(),
+            Err(err) => json!({"ok": false, "error": err}).to_string(),
+        },
+        other => json!({"ok": false, "error": format!("unknown op {other}")}).to_string(),
+    }
+}
+
+fn parse_opt(v: &Value) -> Result<FirstBootOpt, String> {
+    let nic = v
+        .get("nic")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let mode = v
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if nic.is_empty() {
+        return Err("missing nic".into());
+    }
+    if mode != "static" && mode != "dhcp" && mode != "slaac" {
+        return Err("mode must be static, dhcp, or slaac".into());
+    }
+    let cidr = v
+        .get("cidr")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if mode == "static" && cidr.is_none() {
+        return Err("static opt needs a cidr".into());
+    }
+    Ok(FirstBootOpt { nic, mode, cidr })
+}
+
 fn persist(state: &DesiredState) -> Result<(), String> {
     let raw = toml::to_string_pretty(state).map_err(|e| format!("encode TOML: {e}"))?;
     fs::write(DESIRED, raw).map_err(|e| format!("write {DESIRED}: {e}"))
 }
 
 fn apply(state: &mut DesiredState) -> Result<(), String> {
-    // Capture Management NIC addresses while they still live in the Host netns,
-    // before the veth replaces the host default route. `ip -n` / `ip netns exec`
-    // hang in this container's mount ns (named-netns bind), so all mgmt work
-    // uses setns instead. Persist whatever we captured so reboot does not
-    // depend on DHCP racing netd.
+    // Capture UI-exposure addresses before tearing down the first-boot opt.
+    // A placement=mgmt NIC stays in fwd; UI exposure is nft DNAT, not setns.
     let mut mgmt_saved: Vec<(String, Vec<String>, Option<String>)> = Vec::new();
     for iface in &mut state.interfaces {
         if iface.placement == "mgmt" || iface.role.as_deref() == Some("stick") {
-            let (mut addrs, gw) = capture_host_ipv4(&iface.name)?;
+            let (mut addrs, gw) = capture_ipv4(&iface.name)?;
             if addrs.is_empty() {
                 addrs = iface.addresses.clone();
             } else if iface.addresses.is_empty() {
@@ -169,21 +230,11 @@ fn apply(state: &mut DesiredState) -> Result<(), String> {
             mgmt_saved.push((iface.name.clone(), addrs, gw));
         }
     }
-    if has_mgmt_path(state) {
-        ensure_host_mgmt_veth()?;
-    }
-    if is_stick(state) {
-        ensure_fwd_mgmt_veth()?;
-        with_mgmt_net(|| {
-            let _ = run_ip(&["route", "replace", "default", "via", FWD_MGMT_GW]);
-            Ok(())
-        })?;
-        persist(state)?;
-        program_nft(state)?;
-    }
+    discard_opt()?;
+    setup_plumbing()?;
     for iface in &state.interfaces {
-        if iface.placement == "fwd" && iface.vlan.is_none() {
-            ensure_in_ns(&iface.name, "fwd")?;
+        if iface.vlan.is_none() {
+            ensure_in_fwd(&iface.name)?;
             run_ip(&["link", "set", &iface.name, "up"])?;
             let extra = mgmt_saved
                 .iter()
@@ -196,79 +247,13 @@ fn apply(state: &mut DesiredState) -> Result<(), String> {
         }
     }
     program_vlans(state)?;
-    for iface in &state.interfaces {
-        if iface.placement == "mgmt" {
-            let (addrs, gw) = mgmt_saved
-                .iter()
-                .find(|(n, _, _)| n == &iface.name)
-                .map(|(_, a, g)| (a.clone(), g.clone()))
-                .unwrap_or_default();
-            ensure_in_ns(&iface.name, "mgmt")?;
-            with_mgmt_net(|| {
-                run_ip(&["link", "set", &iface.name, "up"])?;
-                for addr in addrs.iter().chain(iface.addresses.iter()) {
-                    add_addr(&iface.name, addr)?;
-                }
-                if let Some(gw) = gw {
-                    let _ = run_ip(&[
-                        "route",
-                        "replace",
-                        "default",
-                        "via",
-                        &gw,
-                        "dev",
-                        &iface.name,
-                    ]);
-                }
-                Ok(())
-            })?;
-        }
-    }
-    if has_mgmt_path(state) {
-        host_default_via_mgmt()?;
-        program_host_pull_nat()?;
-    }
+    host_default_via_mgmt()?;
     program_wg(state)?;
     program_routes(state)?;
     program_qdiscs(state)?;
     program_lan_services(state)?;
     persist(state)?;
     program_nft(state)
-}
-
-fn has_mgmt(state: &DesiredState) -> bool {
-    state.interfaces.iter().any(|i| i.placement == "mgmt")
-}
-
-fn is_stick(state: &DesiredState) -> bool {
-    state
-        .interfaces
-        .iter()
-        .any(|i| i.role.as_deref() == Some("stick"))
-}
-
-fn has_mgmt_path(state: &DesiredState) -> bool {
-    has_mgmt(state) || is_stick(state)
-}
-
-fn stick_parent(state: &DesiredState) -> Option<&Iface> {
-    state
-        .interfaces
-        .iter()
-        .find(|i| i.role.as_deref() == Some("stick"))
-}
-
-fn ensure_in_ns(name: &str, ns: &str) -> Result<(), String> {
-    if ns_has_link(ns, name)? {
-        return Ok(());
-    }
-    if ns == "fwd" {
-        return ensure_in_fwd(name);
-    }
-    with_host_net(|| {
-        let _ = run_ip(&["link", "set", name, "down"]);
-        run_ip(&["link", "set", name, "netns", &format!("/run/netns/{ns}")])
-    })
 }
 
 fn ensure_in_fwd(name: &str) -> Result<(), String> {
@@ -284,14 +269,6 @@ fn ensure_in_fwd(name: &str) -> Result<(), String> {
     moved?;
     back.map_err(|e| format!("setns fwd: {e}"))?;
     Ok(())
-}
-
-fn ns_has_link(ns: &str, name: &str) -> Result<bool, String> {
-    match ns {
-        "fwd" => link_exists(name),
-        "mgmt" => with_mgmt_net(|| link_exists(name)),
-        _ => Err(format!("unknown netns {ns}")),
-    }
 }
 
 fn with_netns<T>(ns_path: &str, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
@@ -377,15 +354,6 @@ fn host_default_via_mgmt() -> Result<(), String> {
     with_host_net(|| run_ip(&["route", "replace", "default", "via", HOST_VETH_GW]))
 }
 
-fn program_host_pull_nat() -> Result<(), String> {
-    // Host-netns pulls (bootc) leave via the mgmt veth; masquerade so they
-    // can reach a Workstation-local registry on the Management NIC.
-    let rules = format!(
-        "destroy table ip fwos-host-pull\ntable ip fwos-host-pull {{\n  chain postrouting {{\n    type nat hook postrouting priority srcnat; policy accept;\n    ip saddr {HOST_VETH_ADDR} masquerade\n  }}\n}}\n"
-    );
-    with_mgmt_net(|| nft_apply(&rules))
-}
-
 fn ensure_fwd_mgmt_veth() -> Result<(), String> {
     if !link_exists(FWD_MGMT_VETH)? {
         run_ip(&[
@@ -401,9 +369,11 @@ fn ensure_fwd_mgmt_veth() -> Result<(), String> {
         run_ip(&["link", "set", MGMT_FWD_VETH, "netns", MGMT_NS])?;
     }
     add_addr(FWD_MGMT_VETH, FWD_MGMT_ADDR)?;
+    add_addr(FWD_MGMT_VETH, FWD_MGMT_ADDR6)?;
     run_ip(&["link", "set", FWD_MGMT_VETH, "up"])?;
     with_mgmt_net(|| {
         add_addr(MGMT_FWD_VETH, MGMT_FWD_ADDR)?;
+        add_addr(MGMT_FWD_VETH, MGMT_FWD_ADDR6)?;
         run_ip(&["link", "set", MGMT_FWD_VETH, "up"])?;
         Ok(())
     })?;
@@ -604,23 +574,15 @@ fn program_nft(state: &DesiredState) -> Result<(), String> {
     let wans: Vec<&str> = state
         .interfaces
         .iter()
-        .filter(|i| i.placement == "fwd" && i.role.as_deref() == Some("wan"))
+        .filter(|i| i.role.as_deref() == Some("wan"))
         .map(|i| i.name.as_str())
         .collect();
     let v4_wan = state.interfaces.iter().any(|i| {
-        i.placement == "fwd"
-            && i.role.as_deref() == Some("wan")
-            && i.addresses.iter().any(|a| a.contains('.'))
+        i.role.as_deref() == Some("wan") && i.addresses.iter().any(|a| a.contains('.'))
     });
-    let stick = stick_parent(state);
-    let stick_ip = stick.and_then(|s| {
-        s.addresses
-            .iter()
-            .find(|a| a.contains('.'))
-            .and_then(|a| a.split('/').next())
-            .map(str::to_string)
-    });
+    let exposure = ui_exposure(state);
     let mut rules = String::from("flush ruleset\n");
+    rules.push_str(&host_pull_nft());
     rules.push_str("table inet fwos {\n");
     rules.push_str("  chain input {\n");
     rules.push_str("    type filter hook input priority filter; policy accept;\n");
@@ -638,24 +600,38 @@ fn program_nft(state: &DesiredState) -> Result<(), String> {
     rules.push_str("  chain forward {\n");
     rules.push_str("    type filter hook forward priority filter; policy drop;\n");
     rules.push_str("    ct state established,related accept\n");
-    if let Some(parent) = stick {
+    // Host-netns pulls and DNATed UI replies arrive from mgmt on this veth.
+    rules.push_str(&format!("    iifname \"{FWD_MGMT_VETH}\" accept\n"));
+    for (name, _) in &exposure {
         rules.push_str(&format!(
-            "    iifname \"{}\" oifname \"{FWD_MGMT_VETH}\" tcp dport 443 accept\n",
-            parent.name
+            "    iifname \"{name}\" oifname \"{FWD_MGMT_VETH}\" tcp dport 443 accept\n"
         ));
     }
     for wan in &wans {
         rules.push_str(&format!("    oifname \"{wan}\" accept\n"));
     }
     rules.push_str("  }\n");
-    if stick.is_some() {
+    if !exposure.is_empty() {
         rules.push_str("  chain prerouting {\n");
         rules.push_str("    type nat hook prerouting priority dstnat; policy accept;\n");
-        match stick_ip.as_deref() {
-            Some(ip) => rules.push_str(&format!(
-                "    ip daddr {ip} tcp dport 443 dnat ip to {MGMT_FWD_IP}\n"
-            )),
-            None => rules.push_str(&format!("    tcp dport 443 dnat ip to {MGMT_FWD_IP}\n")),
+        let mut any_dnat = false;
+        for (name, addrs) in &exposure {
+            for ip in expose_ips(addrs) {
+                any_dnat = true;
+                if ip.contains(':') {
+                    rules.push_str(&format!(
+                        "    iifname \"{name}\" ip6 daddr {ip} tcp dport 443 dnat ip6 to {MGMT_FWD_IP6}\n"
+                    ));
+                } else {
+                    rules.push_str(&format!(
+                        "    iifname \"{name}\" ip daddr {ip} tcp dport 443 dnat ip to {MGMT_FWD_IP}\n"
+                    ));
+                }
+            }
+        }
+        if !any_dnat {
+            // Stick JSON may omit a parent address; keep HTTPS on that L2.
+            rules.push_str(&format!("    tcp dport 443 dnat ip to {MGMT_FWD_IP}\n"));
         }
         rules.push_str("  }\n");
     }
@@ -791,6 +767,437 @@ fn setns_net(fd: i32) -> Result<(), String> {
     }
 }
 
+fn setup_plumbing() -> Result<(), String> {
+    ensure_fwd_mgmt_veth()?;
+    ensure_host_mgmt_veth()?;
+    host_default_via_mgmt()?;
+    with_mgmt_net(|| {
+        let _ = run_ip(&["route", "replace", "default", "via", FWD_MGMT_GW]);
+        let _ = fs::write("/proc/sys/net/ipv4/ip_forward", "1");
+        Ok(())
+    })?;
+    let _ = fs::write("/proc/sys/net/ipv4/ip_forward", "1");
+    write_sysctl("all", "ipv4", "rp_filter", "2");
+    write_sysctl("default", "ipv4", "rp_filter", "2");
+    write_sysctl(FWD_MGMT_VETH, "ipv4", "rp_filter", "2");
+    // Host-netns pull sources live on h0mgmt (169.254.127.0/30), not on the
+    // fwd↔mgmt /30. Return traffic after masquerade un-SNAT needs this route.
+    let _ = run_ip(&[
+        "route",
+        "replace",
+        "169.254.127.0/30",
+        "via",
+        MGMT_FWD_IP,
+        "dev",
+        FWD_MGMT_VETH,
+    ]);
+    let _ = nft_apply("destroy table ip fwos-pull\n");
+    let _ = nft_apply(&host_pull_nft());
+    Ok(())
+}
+
+fn host_pull_nft() -> String {
+    String::from(
+        "table ip fwos-pull {\n  chain postrouting {\n    type nat hook postrouting priority srcnat; policy accept;\n    ip saddr 169.254.127.0/30 masquerade\n  }\n}\n",
+    )
+}
+
+fn claim_traffic_nics() -> Result<(), String> {
+    let names = host_ethernet()?;
+    for name in names {
+        ensure_in_fwd(&name)?;
+        lock_unopted(&name)?;
+        let _ = run_ip(&["link", "set", &name, "up"]);
+    }
+    Ok(())
+}
+
+fn host_ethernet() -> Result<Vec<String>, String> {
+    with_host_net(|| {
+        let out = ip_cmd()
+            .args(["-o", "link", "show"])
+            .output()
+            .map_err(|e| format!("ip link show: {e}"))?;
+        let mut names = Vec::new();
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let name = link_name(line);
+            if is_ethernet(&name) {
+                names.push(name);
+            }
+        }
+        Ok(names)
+    })
+}
+
+fn link_name(line: &str) -> String {
+    let name = line.split(':').nth(1).unwrap_or("").trim();
+    name.split('@').next().unwrap_or(name).to_string()
+}
+
+fn addr_dev(line: &str) -> String {
+    line.split_whitespace()
+        .nth(1)
+        .unwrap_or("")
+        .split('@')
+        .next()
+        .unwrap_or("")
+        .to_string()
+}
+
+fn is_ethernet(name: &str) -> bool {
+    name.starts_with("enp")
+        || name.starts_with("eth")
+        || name.starts_with("ens")
+        || name.starts_with("eno")
+}
+
+fn lock_unopted(nic: &str) -> Result<(), String> {
+    write_sysctl(nic, "ipv6", "accept_ra", "0");
+    write_sysctl(nic, "ipv6", "autoconf", "0");
+    write_sysctl(nic, "ipv4", "rp_filter", "2");
+    let _ = run_ip(&["addr", "flush", "dev", nic]);
+    Ok(())
+}
+
+fn write_sysctl(nic: &str, fam: &str, key: &str, val: &str) {
+    let path = format!("/proc/sys/net/{fam}/conf/{nic}/{key}");
+    let _ = fs::write(&path, val);
+}
+
+fn load_opt() -> Option<FirstBootOpt> {
+    let raw = fs::read_to_string(OPT_FILE).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn persist_opt(opt: &FirstBootOpt) -> Result<(), String> {
+    let raw = serde_json::to_string_pretty(opt).map_err(|e| format!("encode opt: {e}"))?;
+    if let Some(dir) = Path::new(OPT_FILE).parent() {
+        fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+    }
+    fs::write(OPT_FILE, raw).map_err(|e| format!("write {OPT_FILE}: {e}"))?;
+    // Hard reset (QEMU system_reset / power loss) must still see the opt.
+    if let Ok(f) = File::open(OPT_FILE) {
+        let _ = f.sync_all();
+    }
+    if let Ok(dir) = File::open("/var/lib/fwos") {
+        let _ = dir.sync_all();
+    }
+    unsafe {
+        libc::sync();
+    }
+    Ok(())
+}
+
+fn apply_and_persist_opt(opt: FirstBootOpt) -> Result<(), String> {
+    if Path::new(BOOTSTRAPPED).exists() {
+        return Err("already bootstrapped".into());
+    }
+    apply_opt(&opt)?;
+    persist_opt(&opt)
+}
+
+fn apply_opt(opt: &FirstBootOpt) -> Result<(), String> {
+    if let Some(prev) = load_opt() {
+        if prev.nic != opt.nic || prev.mode != opt.mode || prev.cidr != opt.cidr {
+            teardown_opt(&prev)?;
+        }
+    }
+    setup_plumbing()?;
+    ensure_in_fwd(&opt.nic)?;
+    run_ip(&["link", "set", &opt.nic, "up"])?;
+    match opt.mode.as_str() {
+        "static" => {
+            let cidr = opt.cidr.as_deref().ok_or("static opt needs a cidr")?;
+            add_addr(&opt.nic, cidr)?;
+        }
+        "dhcp" => ephemeral_dhcp(&opt.nic)?,
+        "slaac" => {
+            write_sysctl(&opt.nic, "ipv6", "accept_ra", "1");
+            write_sysctl(&opt.nic, "ipv6", "autoconf", "1");
+        }
+        other => return Err(format!("unknown opt mode {other}")),
+    }
+    let addrs = iface_cidrs(&opt.nic)?;
+    program_first_boot_nft(&opt.nic, &addrs)
+}
+
+fn teardown_opt(opt: &FirstBootOpt) -> Result<(), String> {
+    stop_dhclient();
+    if opt.mode == "slaac" {
+        write_sysctl(&opt.nic, "ipv6", "accept_ra", "0");
+        write_sysctl(&opt.nic, "ipv6", "autoconf", "0");
+    }
+    if link_exists(&opt.nic)? {
+        lock_unopted(&opt.nic)?;
+        let _ = run_ip(&["link", "set", &opt.nic, "up"]);
+    }
+    let _ = nft_apply("destroy table ip fwos-first-boot\ndestroy table ip6 fwos-first-boot\n");
+    Ok(())
+}
+
+fn discard_opt() -> Result<(), String> {
+    if let Some(opt) = load_opt() {
+        teardown_opt(&opt)?;
+    }
+    let _ = fs::remove_file(OPT_FILE);
+    Ok(())
+}
+
+fn ephemeral_dhcp(nic: &str) -> Result<(), String> {
+    stop_dhclient();
+    write_dhclient_script()?;
+    let output = Command::new("dhclient")
+        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+        .args([
+            "-1",
+            "-sf",
+            "/var/lib/fwos/dhclient-script",
+            "-lf",
+            "/var/lib/fwos/dhclient.leases",
+            "-pf",
+            "/var/lib/fwos/dhclient.pid",
+            nic,
+        ])
+        .output()
+        .map_err(|e| format!("dhclient: {e}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "dhcp on {nic} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+fn write_dhclient_script() -> Result<(), String> {
+    let script = r#"#!/bin/sh
+case "${reason}" in
+BOUND|RENEW|REBIND|REBOOT)
+  pfx="${new_prefix}"
+  if [ -z "${pfx}" ]; then
+    pfx=24
+  fi
+  ip addr replace "${new_ip_address}/${pfx}" dev "${interface}"
+  if [ -n "${new_routers}" ]; then
+    gw=$(echo "${new_routers}" | awk '{print $1}')
+    ip route replace default via "${gw}" dev "${interface}"
+  fi
+  ;;
+esac
+exit 0
+"#;
+    fs::write("/var/lib/fwos/dhclient-script", script)
+        .map_err(|e| format!("write dhclient-script: {e}"))?;
+    let mut perms = fs::metadata("/var/lib/fwos/dhclient-script")
+        .map_err(|e| format!("stat dhclient-script: {e}"))?
+        .permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions("/var/lib/fwos/dhclient-script", perms)
+        .map_err(|e| format!("chmod dhclient-script: {e}"))
+}
+
+fn stop_dhclient() {
+    if let Ok(pid) = fs::read_to_string("/var/lib/fwos/dhclient.pid") {
+        let pid = pid.trim();
+        if !pid.is_empty() {
+            let _ = Command::new("kill")
+                .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+                .args(["-TERM", pid])
+                .status();
+        }
+    }
+    let _ = fs::remove_file("/var/lib/fwos/dhclient.pid");
+}
+
+fn program_first_boot_nft(nic: &str, cidrs: &[String]) -> Result<(), String> {
+    let ips = expose_ips(cidrs);
+    let _ = nft_apply("destroy table ip fwos-first-boot\ndestroy table ip6 fwos-first-boot\n");
+    let rules = first_boot_nft(nic, &ips);
+    if rules.trim().is_empty() {
+        Ok(())
+    } else {
+        nft_apply(&rules)
+    }
+}
+
+fn first_boot_nft(nic: &str, ips: &[String]) -> String {
+    let mut rules = String::new();
+    let v4: Vec<&str> = ips.iter().map(|s| s.as_str()).filter(|s| !s.contains(':')).collect();
+    let v6: Vec<&str> = ips.iter().map(|s| s.as_str()).filter(|s| s.contains(':')).collect();
+    if !v4.is_empty() {
+        rules.push_str("table ip fwos-first-boot {\n");
+        rules.push_str("  chain prerouting {\n");
+        rules.push_str("    type nat hook prerouting priority dstnat; policy accept;\n");
+        for ip in &v4 {
+            rules.push_str(&format!(
+                "    iifname \"{nic}\" ip daddr {ip} tcp dport 443 dnat ip to {MGMT_FWD_IP}\n"
+            ));
+        }
+        rules.push_str("  }\n");
+        rules.push_str("  chain forward {\n");
+        rules.push_str("    type filter hook forward priority filter; policy accept;\n");
+        rules.push_str(&format!(
+            "    iifname \"{nic}\" oifname \"{FWD_MGMT_VETH}\" tcp dport 443 accept\n"
+        ));
+        rules.push_str("  }\n");
+        rules.push_str("}\n");
+    }
+    if !v6.is_empty() {
+        rules.push_str("table ip6 fwos-first-boot {\n");
+        rules.push_str("  chain prerouting {\n");
+        rules.push_str("    type nat hook prerouting priority dstnat; policy accept;\n");
+        for ip in &v6 {
+            rules.push_str(&format!(
+                "    iifname \"{nic}\" ip6 daddr {ip} tcp dport 443 dnat to {MGMT_FWD_IP6}\n"
+            ));
+        }
+        rules.push_str("  }\n");
+        rules.push_str("}\n");
+    }
+    rules
+}
+
+fn ui_exposure(state: &DesiredState) -> Vec<(String, Vec<String>)> {
+    state
+        .interfaces
+        .iter()
+        .filter(|i| i.placement == "mgmt" || i.role.as_deref() == Some("stick"))
+        .map(|i| (i.name.clone(), i.addresses.clone()))
+        .collect()
+}
+
+fn expose_ips(cidrs: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for cidr in cidrs {
+        let ip = cidr.split('/').next().unwrap_or(cidr);
+        if expose_allowed(ip) && !out.iter().any(|e| e == ip) {
+            out.push(ip.to_string());
+        }
+    }
+    out
+}
+
+fn expose_allowed(ip: &str) -> bool {
+    if let Ok(v4) = ip.parse::<std::net::Ipv4Addr>() {
+        if v4.is_loopback() {
+            return false;
+        }
+        let o = v4.octets();
+        if o[0] == CGNAT[0] && (64..=127).contains(&o[1]) {
+            return false;
+        }
+        // Host↔mgmt plumbing is not operator reachability.
+        if o[0] == 169 && o[1] == 254 && o[2] == 127 {
+            return false;
+        }
+        return v4.is_private() || v4.is_link_local();
+    }
+    if let Ok(v6) = ip.parse::<std::net::Ipv6Addr>() {
+        if v6.is_loopback() {
+            return false;
+        }
+        return v6.is_unicast_link_local() || (v6.octets()[0] & 0xfe) == 0xfc;
+    }
+    false
+}
+
+fn list_nics_reply() -> String {
+    let nics = list_ethernet_json();
+    let opt = load_opt();
+    json!({"ok": true, "nics": nics, "opt": opt}).to_string()
+}
+
+fn list_ethernet_json() -> Vec<Value> {
+    let Ok(out) = ip_cmd().args(["-o", "link", "show"]).output() else {
+        return Vec::new();
+    };
+    let mut nics: Vec<(String, Vec<String>)> = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let name = link_name(line);
+        if is_ethernet(&name) {
+            nics.push((name, Vec::new()));
+        }
+    }
+    if let Ok(addrs) = ip_cmd().args(["-o", "addr", "show"]).output() {
+        for line in String::from_utf8_lossy(&addrs.stdout).lines() {
+            let name = addr_dev(line);
+            let Some((_, addrs)) = nics.iter_mut().find(|(n, _)| n == &name) else {
+                continue;
+            };
+            if let Some(cidr) = addr_cidr(line) {
+                if !addrs.contains(&cidr) {
+                    addrs.push(cidr);
+                }
+            }
+        }
+    }
+    nics.into_iter()
+        .map(|(name, addresses)| json!({"name": name, "addresses": addresses}))
+        .collect()
+}
+
+fn addr_cidr(line: &str) -> Option<String> {
+    let mut toks = line.split_whitespace();
+    while let Some(tok) = toks.next() {
+        if tok == "inet" || tok == "inet6" {
+            return toks.next().map(str::to_string);
+        }
+    }
+    None
+}
+
+fn iface_cidrs(name: &str) -> Result<Vec<String>, String> {
+    let out = ip_cmd()
+        .args(["-o", "addr", "show", "dev", name])
+        .output()
+        .map_err(|e| format!("ip addr show {name}: {e}"))?;
+    let mut addrs = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        if let Some(cidr) = addr_cidr(line) {
+            if !addrs.contains(&cidr) {
+                addrs.push(cidr);
+            }
+        }
+    }
+    Ok(addrs)
+}
+
+fn capture_ipv4(name: &str) -> Result<(Vec<String>, Option<String>), String> {
+    if link_exists(name)? {
+        return capture_ipv4_here(name);
+    }
+    capture_host_ipv4(name)
+}
+
+fn capture_ipv4_here(name: &str) -> Result<(Vec<String>, Option<String>), String> {
+    let addr_out = ip_cmd()
+        .args(["-o", "addr", "show", "dev", name])
+        .output()
+        .map_err(|e| format!("ip addr show {name}: {e}"))?;
+    let mut addrs = Vec::new();
+    for word in String::from_utf8_lossy(&addr_out.stdout).split_whitespace() {
+        if word.contains('/') && word.contains('.') {
+            addrs.push(word.to_string());
+        }
+    }
+    let route_out = ip_cmd()
+        .args(["-o", "route", "show", "default"])
+        .output()
+        .map_err(|e| format!("ip route: {e}"))?;
+    let route = String::from_utf8_lossy(&route_out.stdout);
+    let gw = if route.contains(name) {
+        route
+            .split_whitespace()
+            .skip_while(|w| *w != "via")
+            .nth(1)
+            .map(str::to_string)
+    } else {
+        None
+    };
+    Ok((addrs, gw))
+}
+
 fn wheel_gid() -> Option<u32> {
     let group = fs::read_to_string("/etc/group").ok()?;
     for line in group.lines() {
@@ -802,4 +1209,81 @@ fn wheel_gid() -> Option<u32> {
         return parts.next()?.parse().ok();
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cmd_json_is_not_empty_desired() {
+        let v: Value = serde_json::from_str(r#"{"op":"list"}"#).unwrap();
+        assert!(v.get("op").and_then(Value::as_str).is_some());
+        let desired = serde_json::from_value::<DesiredState>(v.clone());
+        assert!(desired.unwrap().interfaces.is_empty());
+    }
+
+    #[test]
+    fn parse_opt_requires_cidr_for_static() {
+        let v: Value = serde_json::from_str(r#"{"op":"opt","nic":"enp1s0","mode":"static"}"#).unwrap();
+        assert!(parse_opt(&v).is_err());
+        let v: Value = serde_json::from_str(
+            r#"{"op":"opt","nic":"enp1s0","mode":"static","cidr":"10.0.2.15/24"}"#,
+        )
+        .unwrap();
+        let opt = parse_opt(&v).unwrap();
+        assert_eq!(opt.nic, "enp1s0");
+        assert_eq!(opt.cidr.as_deref(), Some("10.0.2.15/24"));
+    }
+
+    #[test]
+    fn first_boot_nft_dnats_https_on_the_opted_nic() {
+        let rules = first_boot_nft("enp1s0", &["10.0.2.15".into()]);
+        assert!(rules.contains("iifname \"enp1s0\""));
+        assert!(rules.contains("ip daddr 10.0.2.15 tcp dport 443 dnat ip to 169.254.127.6"));
+        assert!(!rules.contains("flush ruleset"));
+    }
+
+    #[test]
+    fn expose_allowed_is_non_global() {
+        assert!(expose_allowed("10.0.2.15"));
+        assert!(expose_allowed("192.168.1.1"));
+        assert!(expose_allowed("169.254.1.1"));
+        assert!(!expose_allowed("169.254.127.6"));
+        assert!(!expose_allowed("8.8.8.8"));
+        assert!(!expose_allowed("100.64.0.1"));
+        assert!(!expose_allowed("2001:db8::1"));
+        assert!(expose_allowed("fd53:1:1::9"));
+    }
+
+    #[test]
+    fn ui_exposure_keeps_placement_mgmt_in_the_set() {
+        let state = DesiredState {
+            interfaces: vec![
+                Iface {
+                    name: "enp1s0".into(),
+                    placement: "mgmt".into(),
+                    role: None,
+                    addresses: vec!["10.0.2.15/24".into()],
+                    vlan: None,
+                    parent: None,
+                    dhcp: false,
+                },
+                Iface {
+                    name: "enp2s0".into(),
+                    placement: "fwd".into(),
+                    role: Some("wan".into()),
+                    addresses: vec!["192.0.2.1/24".into()],
+                    vlan: None,
+                    parent: None,
+                    dhcp: false,
+                },
+            ],
+            ..DesiredState::default()
+        };
+        let exp = ui_exposure(&state);
+        assert_eq!(exp.len(), 1);
+        assert_eq!(exp[0].0, "enp1s0");
+        assert!(!exp.iter().any(|(n, _)| n == "enp2s0"));
+    }
 }

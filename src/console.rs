@@ -4,7 +4,6 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::process::Command;
 use std::sync::Mutex;
 
 const CGNAT: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 0);
@@ -153,12 +152,12 @@ fn print_help(out: &mut impl Write) -> Result<(), String> {
 
 fn print_status(out: &mut impl Write) -> Result<(), String> {
     writeln!(out, "FWOS Bootstrap console").map_err(|e| e.to_string())?;
-    let nics = host_nics()?;
+    let list = list_from_netd();
     writeln!(out, "NICs:").map_err(|e| e.to_string())?;
-    if nics.is_empty() {
+    if list.nics.is_empty() {
         writeln!(out, "  (none)").map_err(|e| e.to_string())?;
     }
-    for nic in &nics {
+    for nic in &list.nics {
         let addrs = nic
             .addrs
             .iter()
@@ -173,7 +172,10 @@ fn print_status(out: &mut impl Write) -> Result<(), String> {
     }
     writeln!(out, "Reach the UI:").map_err(|e| e.to_string())?;
     let mut urls = 0;
-    for nic in &nics {
+    for nic in &list.nics {
+        if list.opted.as_deref() != Some(nic.name.as_str()) {
+            continue;
+        }
         for addr in &nic.addrs {
             if let Some(url) = ui_url(&nic.name, *addr) {
                 writeln!(out, "  {url}").map_err(|e| e.to_string())?;
@@ -536,65 +538,55 @@ struct Nic {
 }
 
 fn host_nics() -> Result<Vec<Nic>, String> {
-    let links = ip_output(&["-o", "link", "show"])?;
+    Ok(list_from_netd().nics)
+}
+
+struct NicList {
+    nics: Vec<Nic>,
+    opted: Option<String>,
+}
+
+fn list_from_netd() -> NicList {
+    match super::netd_json(&serde_json::json!({"op": "list"})) {
+        Ok(v) if v.get("ok").and_then(|x| x.as_bool()) != Some(false) => parse_nic_list(&v),
+        _ => NicList {
+            nics: Vec::new(),
+            opted: None,
+        },
+    }
+}
+
+fn parse_nic_list(v: &serde_json::Value) -> NicList {
     let mut nics = Vec::new();
-    for line in links.lines() {
-        let name = link_name(line);
-        if !is_ethernet(&name) {
-            continue;
-        }
-        nics.push(Nic {
-            name,
-            addrs: Vec::new(),
-        });
-    }
-    let addrs = ip_output(&["-o", "addr", "show"])?;
-    for line in addrs.lines() {
-        let name = addr_dev(line);
-        let Some(nic) = nics.iter_mut().find(|n| n.name == name) else {
-            continue;
-        };
-        if let Some(ip) = addr_ip(line) {
-            if !nic.addrs.contains(&ip) {
-                nic.addrs.push(ip);
+    if let Some(arr) = v.get("nics").and_then(|x| x.as_array()) {
+        for nic in arr {
+            let Some(name) = nic.get("name").and_then(|x| x.as_str()) else {
+                continue;
+            };
+            let mut addrs = Vec::new();
+            if let Some(list) = nic.get("addresses").and_then(|x| x.as_array()) {
+                for a in list {
+                    if let Some(s) = a.as_str() {
+                        if let Some(ip) = s.split('/').next().and_then(|p| p.parse().ok()) {
+                            if !addrs.contains(&ip) {
+                                addrs.push(ip);
+                            }
+                        }
+                    }
+                }
             }
+            nics.push(Nic {
+                name: name.to_string(),
+                addrs,
+            });
         }
     }
-    Ok(nics)
-}
-
-fn link_name(line: &str) -> String {
-    let name = line.split(':').nth(1).unwrap_or("").trim();
-    name.split('@').next().unwrap_or(name).to_string()
-}
-
-fn addr_dev(line: &str) -> String {
-    line.split_whitespace()
-        .nth(1)
-        .unwrap_or("")
-        .split('@')
-        .next()
-        .unwrap_or("")
-        .to_string()
-}
-
-fn addr_ip(line: &str) -> Option<IpAddr> {
-    let mut toks = line.split_whitespace();
-    while let Some(tok) = toks.next() {
-        if tok == "inet" || tok == "inet6" {
-            let cidr = toks.next()?;
-            let ip = cidr.split('/').next()?;
-            return ip.parse().ok();
-        }
-    }
-    None
-}
-
-fn is_ethernet(name: &str) -> bool {
-    name.starts_with("enp")
-        || name.starts_with("eth")
-        || name.starts_with("ens")
-        || name.starts_with("eno")
+    let opted = v
+        .get("opt")
+        .and_then(|o| o.get("nic"))
+        .and_then(|x| x.as_str())
+        .map(str::to_string);
+    NicList { nics, opted }
 }
 
 fn ui_url(nic: &str, addr: IpAddr) -> Option<String> {
@@ -635,84 +627,32 @@ fn is_ula(addr: Ipv6Addr) -> bool {
 }
 
 fn ephemeral_static(nic: &str, cidr: &str) -> Result<(), String> {
-    ip_ok(&["link", "set", "dev", nic, "up"])?;
-    ip_add(nic, cidr)
+    netd_opt("static", nic, Some(cidr))
 }
 
 fn ephemeral_dhcp(nic: &str) -> Result<(), String> {
-    ip_ok(&["link", "set", "dev", nic, "up"])?;
-    if cmd_ok("nmcli", &["device", "connect", nic]) {
-        return Ok(());
-    }
-    if cmd_ok("dhclient", &["-1", nic]) {
-        return Ok(());
-    }
-    Err(format!("dhcp on {nic} failed"))
+    netd_opt("dhcp", nic, None)
 }
 
 fn ephemeral_slaac(nic: &str) -> Result<(), String> {
-    ip_ok(&["link", "set", "dev", nic, "up"])?;
-    let key = format!("net.ipv6.conf.{nic}.accept_ra=1");
-    if !cmd_ok("sysctl", &["-w", &key]) {
-        return Err(format!("slaac on {nic} failed"));
-    }
-    Ok(())
+    netd_opt("slaac", nic, None)
 }
 
-fn ip_add(nic: &str, cidr: &str) -> Result<(), String> {
-    let output = Command::new("ip")
-        .args(["addr", "add", cidr, "dev", nic])
-        .output()
-        .map_err(|e| format!("ip addr add: {e}"))?;
-    if output.status.success() {
-        return Ok(());
+fn netd_opt(mode: &str, nic: &str, cidr: Option<&str>) -> Result<(), String> {
+    let mut body = serde_json::json!({"op": "opt", "nic": nic, "mode": mode});
+    if let Some(cidr) = cidr {
+        body["cidr"] = serde_json::json!(cidr);
     }
-    let err = String::from_utf8_lossy(&output.stderr);
-    if err.contains("File exists") {
+    let reply = super::netd_json(&body)?;
+    if reply.get("ok").and_then(|x| x.as_bool()) == Some(true) {
         Ok(())
     } else {
-        Err(format!("ip addr add {cidr} dev {nic}: {}", err.trim()))
+        Err(reply
+            .get("error")
+            .and_then(|x| x.as_str())
+            .unwrap_or("opt failed")
+            .to_string())
     }
-}
-
-fn ip_ok(args: &[&str]) -> Result<(), String> {
-    let output = Command::new("ip")
-        .args(args)
-        .output()
-        .map_err(|e| format!("ip: {e}"))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "ip {}: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
-    }
-}
-
-fn ip_output(args: &[&str]) -> Result<String, String> {
-    let output = Command::new("ip")
-        .args(args)
-        .output()
-        .map_err(|e| format!("ip: {e}"))?;
-    if output.status.success() {
-        String::from_utf8(output.stdout).map_err(|_| "ip output was not UTF-8".into())
-    } else {
-        Err(format!(
-            "ip {}: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
-    }
-}
-
-fn cmd_ok(bin: &str, args: &[&str]) -> bool {
-    Command::new(bin)
-        .args(args)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
 }
 
 #[cfg(test)]

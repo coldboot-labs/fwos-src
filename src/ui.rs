@@ -21,8 +21,6 @@ const BOOTSTRAP: &str = "/var/lib/fwos/bootstrapped";
 const HOSTNAME_FILE: &str = "/var/lib/fwos/hostname";
 const DESIRED: &str = "/var/lib/fwos/desired.toml";
 const STATIC_DIR: &str = "/usr/share/fwos-ui";
-const CGNAT: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 0);
-
 fn main() {
     if let Err(err) = run() {
         eprintln!("fwos-ui: {err}");
@@ -108,93 +106,18 @@ impl std::fmt::Display for BindAddr {
 }
 
 fn wait_bind_addrs() -> Result<Vec<BindAddr>, String> {
-    for _ in 0..300 {
-        let addrs = host_bind_addrs()?;
-        if !addrs.is_empty() {
-            return Ok(addrs);
-        }
-        thread::sleep(Duration::from_millis(200));
-    }
-    Err("no allowed addresses to bind".into())
-}
-
-fn host_bind_addrs() -> Result<Vec<BindAddr>, String> {
-    let out = ip_output(&["-o", "addr", "show"])?;
-    let mut found = Vec::new();
-    for line in out.lines() {
-        let mut parts = line.split_whitespace();
-        let Some(_idx) = parts.next() else { continue };
-        let Some(ifname) = parts.next() else { continue };
-        let ifname = ifname.split('@').next().unwrap_or(ifname);
-        let Some(fam) = parts.next() else { continue };
-        let Some(cidr) = parts.next() else { continue };
-        let ip_s = cidr.split('/').next().unwrap_or(cidr);
-        let Ok(ip) = ip_s.parse::<IpAddr>() else {
-            continue;
-        };
-        if !bind_allowed(ip) {
-            continue;
-        }
-        let mut scope = 0;
-        if fam == "inet6" {
-            if let IpAddr::V6(v6) = ip {
-                if v6.is_unicast_link_local() {
-                    match if_index(ifname) {
-                        Some(idx) => scope = idx,
-                        None => continue,
-                    }
-                }
-            }
-        }
-        let addr = BindAddr { ip, scope };
-        if !found
-            .iter()
-            .any(|a: &BindAddr| a.ip == addr.ip && a.scope == addr.scope)
-        {
-            found.push(addr);
-        }
-    }
-    Ok(found)
-}
-
-fn bind_allowed(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            if v4.is_loopback() {
-                return false;
-            }
-            let oct = v4.octets();
-            if oct[0] == CGNAT.octets()[0] && oct[1] >= 64 && oct[1] <= 127 {
-                return false;
-            }
-            // Host↔mgmt and fwd↔mgmt veths are not operator reachability.
-            if oct[0] == 169 && oct[1] == 254 && oct[2] == 127 {
-                return false;
-            }
-            v4.is_private() || v4.is_link_local()
-        }
-        IpAddr::V6(v6) => {
-            if v6.is_loopback() {
-                return false;
-            }
-            v6.is_unicast_link_local() || is_ula(v6)
-        }
-    }
-}
-
-fn is_ula(addr: Ipv6Addr) -> bool {
-    let b = addr.octets()[0];
-    (b & 0xfe) == 0xfc
-}
-
-fn if_index(name: &str) -> Option<u32> {
-    let c = std::ffi::CString::new(name).ok()?;
-    let idx = unsafe { libc::if_nametoindex(c.as_ptr()) };
-    if idx == 0 {
-        None
-    } else {
-        Some(idx)
-    }
+    // Wildcard listen in mgmt so nft DNAT of HTTPS from fwd lands on the
+    // plumbing veth. Operator-facing addresses stay the Traffic NIC's.
+    Ok(vec![
+        BindAddr {
+            ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            scope: 0,
+        },
+        BindAddr {
+            ip: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            scope: 0,
+        },
+    ])
 }
 
 fn bind_one(addr: &BindAddr) -> io::Result<TcpListener> {
@@ -667,65 +590,32 @@ fn status_json() -> Value {
 }
 
 fn list_nics() -> Vec<Value> {
-    let Ok(links) = ip_output(&["-o", "link", "show"]) else {
+    let Ok(reply) = netd_cmd(&json!({"op": "list"})) else {
         return Vec::new();
     };
-    let mut nics: Vec<(String, Vec<String>)> = Vec::new();
-    for line in links.lines() {
-        let name = link_name(line);
-        if !is_ethernet(&name) {
-            continue;
-        }
-        nics.push((name, Vec::new()));
-    }
-    if let Ok(addrs) = ip_output(&["-o", "addr", "show"]) {
-        for line in addrs.lines() {
-            let name = addr_dev(line);
-            let Some((_, addrs)) = nics.iter_mut().find(|(n, _)| n == &name) else {
-                continue;
-            };
-            if let Some(cidr) = addr_cidr(line) {
-                if !addrs.contains(&cidr) {
-                    addrs.push(cidr);
-                }
-            }
-        }
-    }
-    nics.into_iter()
-        .map(|(name, addresses)| json!({"name": name, "addresses": addresses}))
-        .collect()
+    reply
+        .get("nics")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
 }
 
-fn link_name(line: &str) -> String {
-    let name = line.split(':').nth(1).unwrap_or("").trim();
-    name.split('@').next().unwrap_or(name).to_string()
-}
-
-fn addr_dev(line: &str) -> String {
-    line.split_whitespace()
-        .nth(1)
-        .unwrap_or("")
-        .split('@')
-        .next()
-        .unwrap_or("")
-        .to_string()
-}
-
-fn addr_cidr(line: &str) -> Option<String> {
-    let mut toks = line.split_whitespace();
-    while let Some(tok) = toks.next() {
-        if tok == "inet" || tok == "inet6" {
-            return toks.next().map(str::to_string);
-        }
-    }
-    None
-}
-
-fn is_ethernet(name: &str) -> bool {
-    name.starts_with("enp")
-        || name.starts_with("eth")
-        || name.starts_with("ens")
-        || name.starts_with("eno")
+fn netd_cmd(body: &Value) -> Result<Value, String> {
+    let raw = serde_json::to_vec(body).map_err(|e| format!("encode netd cmd: {e}"))?;
+    let mut stream = UnixStream::connect(SOCK).map_err(|e| format!("connect {SOCK}: {e}"))?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+    stream
+        .write_all(&raw)
+        .map_err(|e| format!("write socket: {e}"))?;
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .map_err(|e| format!("shutdown socket: {e}"))?;
+    let mut reply = Vec::new();
+    stream
+        .read_to_end(&mut reply)
+        .map_err(|e| format!("read socket: {e}"))?;
+    serde_json::from_slice(&reply).map_err(|e| format!("parse netd reply: {e}"))
 }
 
 fn valid_hostname(name: &str) -> bool {
@@ -753,33 +643,15 @@ fn valid_admin(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
 }
 
-fn ip_output(args: &[&str]) -> Result<String, String> {
-    let output = Command::new("ip")
-        .args(args)
-        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
-        .output()
-        .map_err(|e| format!("ip: {e}"))?;
-    if output.status.success() {
-        String::from_utf8(output.stdout).map_err(|_| "ip output was not UTF-8".into())
-    } else {
-        Err(format!(
-            "ip {}: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn ui_does_not_bind_internal_veth() {
-        assert!(!bind_allowed("169.254.127.2".parse().unwrap()));
-        assert!(!bind_allowed("169.254.127.6".parse().unwrap()));
-        assert!(bind_allowed("10.0.2.15".parse().unwrap()));
-        assert!(bind_allowed("169.254.1.1".parse().unwrap()));
+    fn ui_listens_wildcard_so_dnat_lands() {
+        let addrs = wait_bind_addrs().unwrap();
+        assert!(addrs.iter().any(|a| a.ip == IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
+        assert!(addrs.iter().any(|a| a.ip == IpAddr::V6(Ipv6Addr::UNSPECIFIED)));
     }
 
     #[test]

@@ -1526,26 +1526,72 @@ mod tests {
         };
         let err = validate(&state).unwrap_err();
         assert!(err.contains("parent") && err.contains("tag"), "{err}");
+    }
 
-        let ok = DesiredState {
+    #[test]
+    fn reject_wan_and_lan_same_parent_and_vid() {
+        let state = DesiredState {
             interfaces: vec![
-                vlan_iface("enp1s0.10", "wan", "enp1s0", 10, &["192.0.2.1/24"]),
-                vlan_iface("enp1s0.20", "lan", "enp1s0", 20, &["192.168.1.1/24"]),
+                vlan_iface("enp1s0.100", "wan", "enp1s0", 100, &["192.0.2.1/24"]),
+                vlan_iface("lan100", "lan", "enp1s0", 100, &["192.168.1.1/24"]),
             ],
-            ui_exposure: vec!["enp1s0.20".into()],
+            ui_exposure: vec!["lan100".into()],
             ..DesiredState::default()
         };
-        assert!(validate(&ok).is_ok());
+        let err = validate(&state).unwrap_err();
+        assert!(err.contains("parent") && err.contains("tag"), "{err}");
+    }
 
-        let mixed = DesiredState {
+    fn assert_one_nic_lan_only(state: &DesiredState, lan: &str, wan: &str) {
+        assert!(validate(state).is_ok());
+        let exp = ui_exposure(state);
+        assert_eq!(exp.len(), 1);
+        assert_eq!(exp[0].0, lan);
+        assert!(!exp.iter().any(|(n, _)| n == wan));
+    }
+
+    #[test]
+    fn one_nic_wan_untagged_lan_tagged() {
+        let state = DesiredState {
             interfaces: vec![
                 iface("enp1s0", "wan", &["192.0.2.1/24"]),
-                vlan_iface("enp1s0.20", "lan", "enp1s0", 20, &["192.168.1.1/24"]),
+                vlan_iface("enp1s0.42", "lan", "enp1s0", 42, &["192.168.1.1/24"]),
             ],
-            ui_exposure: vec!["enp1s0.20".into()],
+            ui_exposure: vec!["enp1s0.42".into()],
+            lan_prefix: Some("192.168.1.0/24".into()),
             ..DesiredState::default()
         };
-        assert!(validate(&mixed).is_ok());
+        assert_one_nic_lan_only(&state, "enp1s0.42", "enp1s0");
+    }
+
+    #[test]
+    fn one_nic_wan_tagged_lan_untagged() {
+        let state = DesiredState {
+            interfaces: vec![
+                vlan_iface("enp1s0.100", "wan", "enp1s0", 100, &["192.0.2.1/24"]),
+                iface("enp1s0", "lan", &["192.168.1.1/24"]),
+            ],
+            ui_exposure: vec!["enp1s0".into()],
+            lan_prefix: Some("192.168.1.0/24".into()),
+            ..DesiredState::default()
+        };
+        assert_one_nic_lan_only(&state, "enp1s0", "enp1s0.100");
+    }
+
+    #[test]
+    fn one_nic_both_tagged() {
+        let state = DesiredState {
+            interfaces: vec![
+                iface("enp1s0", "unused", &[]),
+                vlan_iface("enp1s0.100", "wan", "enp1s0", 100, &["192.0.2.1/24"]),
+                vlan_iface("enp1s0.200", "lan", "enp1s0", 200, &["192.168.1.1/24"]),
+            ],
+            ui_exposure: vec!["enp1s0.200".into()],
+            lan_prefix: Some("192.168.1.0/24".into()),
+            ..DesiredState::default()
+        };
+        assert_one_nic_lan_only(&state, "enp1s0.200", "enp1s0.100");
+        assert!(!ui_exposure(&state).iter().any(|(n, _)| n == "enp1s0"));
     }
 
     #[test]

@@ -762,6 +762,48 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_rejects_wan_lan_same_parent_vid() {
+        let req = parse_boot(
+            r#"{"hostname":"fwos-box","admin":"alice","password":"secret12","interfaces":[{"name":"enp1s0.100","role":"wan","parent":"enp1s0","vlan":100},{"name":"lan100","role":"lan","parent":"enp1s0","vlan":100}],"ui_exposure":["lan100"]}"#,
+        );
+        let err = validate_bootstrap(&req).unwrap_err();
+        assert!(err.contains("parent") && err.contains("tag"), "{err}");
+    }
+
+    #[test]
+    fn bootstrap_one_nic_wan_untagged_lan_tagged() {
+        let req = parse_boot(
+            r#"{"hostname":"fwos-box","admin":"alice","password":"secret12","interfaces":[{"name":"enp1s0","role":"wan","addresses":["192.0.2.1/24"]},{"name":"enp1s0.42","role":"lan","parent":"enp1s0","vlan":42,"addresses":["192.168.1.1/24"]}],"ui_exposure":["enp1s0.42"],"lan_prefix":"192.168.1.0/24"}"#,
+        );
+        assert!(validate_bootstrap(&req).is_ok());
+    }
+
+    #[test]
+    fn bootstrap_one_nic_wan_tagged_lan_untagged() {
+        let req = parse_boot(
+            r#"{"hostname":"fwos-box","admin":"alice","password":"secret12","interfaces":[{"name":"enp1s0.100","role":"wan","parent":"enp1s0","vlan":100,"addresses":["192.0.2.1/24"]},{"name":"enp1s0","role":"lan","addresses":["192.168.1.1/24"]}],"ui_exposure":["enp1s0"],"lan_prefix":"192.168.1.0/24"}"#,
+        );
+        assert!(validate_bootstrap(&req).is_ok());
+    }
+
+    #[test]
+    fn bootstrap_one_nic_both_tagged() {
+        let req = parse_boot(
+            r#"{"hostname":"fwos-box","admin":"alice","password":"secret12","interfaces":[{"name":"enp1s0","role":"unused"},{"name":"enp1s0.100","role":"wan","parent":"enp1s0","vlan":100,"addresses":["192.0.2.1/24"]},{"name":"enp1s0.200","role":"lan","parent":"enp1s0","vlan":200,"addresses":["192.168.1.1/24"]}],"ui_exposure":["enp1s0.200"],"lan_prefix":"192.168.1.0/24"}"#,
+        );
+        assert!(validate_bootstrap(&req).is_ok());
+    }
+
+    #[test]
+    fn bootstrap_one_nic_rejects_wan_in_exposure() {
+        let req = parse_boot(
+            r#"{"hostname":"fwos-box","admin":"alice","password":"secret12","interfaces":[{"name":"enp1s0","role":"wan","addresses":["192.0.2.1/24"]},{"name":"enp1s0.42","role":"lan","parent":"enp1s0","vlan":42}],"ui_exposure":["enp1s0"]}"#,
+        );
+        let err = validate_bootstrap(&req).unwrap_err();
+        assert!(err.contains("WAN"), "{err}");
+    }
+
+    #[test]
     fn ui_has_no_host_update_route() {
         let req = HttpRequest {
             method: "POST".into(),

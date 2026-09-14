@@ -226,9 +226,12 @@ fn validate(state: &DesiredState) -> Result<(), String> {
             return Err("placement=mgmt is not a contract; use roles and ui_exposure".into());
         }
         if let Some(role) = iface.role.as_deref() {
-            if !matches!(role, "wan" | "lan" | "unused" | "stick") {
+            if !matches!(role, "wan" | "lan" | "unused" | "stick" | "mgmt") {
                 return Err(format!("unknown role {role}"));
             }
+        }
+        if iface.role.as_deref() == Some("mgmt") {
+            validate_mgmt_iface(iface)?;
         }
     }
     let wans: Vec<&Iface> = state
@@ -240,6 +243,11 @@ fn validate(state: &DesiredState) -> Result<(), String> {
         .interfaces
         .iter()
         .filter(|i| i.role.as_deref() == Some("lan"))
+        .collect();
+    let mgmts: Vec<&Iface> = state
+        .interfaces
+        .iter()
+        .filter(|i| i.role.as_deref() == Some("mgmt"))
         .collect();
     if wans.is_empty() {
         return Err("need at least one WAN".into());
@@ -254,6 +262,12 @@ fn validate(state: &DesiredState) -> Result<(), String> {
             }
         }
     }
+    let mgmt_parents: Vec<String> = mgmts.iter().map(|i| l2_key(i).0).collect();
+    for iface in wans.iter().chain(lans.iter()) {
+        if mgmt_parents.iter().any(|p| p == &l2_key(iface).0) {
+            return Err("WAN or LAN must not share a parent with a Management NIC".into());
+        }
+    }
     if state.ui_exposure.is_empty() {
         return Err("ui_exposure must not be empty".into());
     }
@@ -264,6 +278,24 @@ fn validate(state: &DesiredState) -> Result<(), String> {
         if iface.role.as_deref() == Some("wan") {
             return Err("ui_exposure cannot include a WAN".into());
         }
+    }
+    for mgmt in &mgmts {
+        if !state.ui_exposure.iter().any(|n| n == &mgmt.name) {
+            return Err("Management NIC must be in ui_exposure".into());
+        }
+    }
+    Ok(())
+}
+
+fn validate_mgmt_iface(iface: &Iface) -> Result<(), String> {
+    if iface.vlan.is_some() || iface.parent.is_some() {
+        return Err("Management NIC owns the whole parent".into());
+    }
+    if iface.dhcp {
+        return Err("Management NIC is on-link static; no DHCP or gateway".into());
+    }
+    if iface.addresses.is_empty() {
+        return Err("Management NIC needs an on-link static prefix".into());
     }
     Ok(())
 }
@@ -698,6 +730,10 @@ fn pd_pool(pd: &str) -> Option<(String, String)> {
 }
 
 fn program_nft(state: &DesiredState) -> Result<(), String> {
+    nft_apply(&nft_rules(state))
+}
+
+fn nft_rules(state: &DesiredState) -> String {
     let wans: Vec<&str> = state
         .interfaces
         .iter()
@@ -734,6 +770,16 @@ fn program_nft(state: &DesiredState) -> Result<(), String> {
         rules.push_str(&format!(
             "    iifname \"{name}\" oifname \"{FWD_MGMT_VETH}\" tcp dport 443 accept\n"
         ));
+    }
+    let mgmts: Vec<&str> = state
+        .interfaces
+        .iter()
+        .filter(|i| i.role.as_deref() == Some("mgmt"))
+        .map(|i| i.name.as_str())
+        .collect();
+    for mgmt in &mgmts {
+        rules.push_str(&format!("    iifname \"{mgmt}\" drop\n"));
+        rules.push_str(&format!("    oifname \"{mgmt}\" drop\n"));
     }
     for wan in &wans {
         rules.push_str(&format!("    oifname \"{wan}\" accept\n"));
@@ -774,7 +820,7 @@ fn program_nft(state: &DesiredState) -> Result<(), String> {
         rules.push_str("  }\n");
     }
     rules.push_str("}\n");
-    nft_apply(&rules)
+    rules
 }
 
 fn nft_apply(rules: &str) -> Result<(), String> {
@@ -1665,5 +1711,215 @@ mod tests {
         );
         assert!(kea4.contains("enp1s0.20"));
         assert!(!kea4.contains("lan0"));
+    }
+
+    fn wan_lan_mgmt() -> DesiredState {
+        DesiredState {
+            interfaces: vec![
+                iface("enp1s0", "lan", &["192.168.1.1/24"]),
+                iface("enp2s0", "wan", &["192.0.2.1/24"]),
+                iface("enp3s0", "mgmt", &["10.0.2.15/24"]),
+            ],
+            ui_exposure: vec!["enp3s0".into()],
+            lan_prefix: Some("192.168.1.0/24".into()),
+            dhcp_pool: Some("192.168.1.100-192.168.1.200".into()),
+            ..DesiredState::default()
+        }
+    }
+
+    #[test]
+    fn accept_role_mgmt_oob_only_exposure() {
+        let state = wan_lan_mgmt();
+        assert!(validate(&state).is_ok(), "{:?}", validate(&state).err());
+        let exp = ui_exposure(&state);
+        assert_eq!(exp.len(), 1);
+        assert_eq!(exp[0].0, "enp3s0");
+        assert!(!exp.iter().any(|(n, _)| n == "enp1s0"));
+        assert!(!exp.iter().any(|(n, _)| n == "enp2s0"));
+    }
+
+    #[test]
+    fn accept_role_mgmt_and_lan_in_exposure() {
+        let mut state = wan_lan_mgmt();
+        state.ui_exposure = vec!["enp3s0".into(), "enp1s0".into()];
+        assert!(validate(&state).is_ok(), "{:?}", validate(&state).err());
+        let exp = ui_exposure(&state);
+        assert!(exp.iter().any(|(n, _)| n == "enp3s0"));
+        assert!(exp.iter().any(|(n, _)| n == "enp1s0"));
+    }
+
+    #[test]
+    fn reject_placement_mgmt_even_with_role_mgmt() {
+        let mut state = wan_lan_mgmt();
+        state.interfaces[2].placement = "mgmt".into();
+        let err = validate(&state).unwrap_err();
+        assert!(err.contains("placement=mgmt"), "{err}");
+    }
+
+    #[test]
+    fn reject_wan_on_mgmt_parent() {
+        let state = DesiredState {
+            interfaces: vec![
+                iface("enp1s0", "lan", &["192.168.1.1/24"]),
+                iface("enp3s0", "mgmt", &["10.0.2.15/24"]),
+                iface("enp3s0", "wan", &["192.0.2.1/24"]),
+            ],
+            ui_exposure: vec!["enp3s0".into()],
+            ..DesiredState::default()
+        };
+        let err = validate(&state).unwrap_err();
+        assert!(err.to_ascii_lowercase().contains("parent"), "{err}");
+    }
+
+    #[test]
+    fn reject_lan_vlan_on_mgmt_parent() {
+        let state = DesiredState {
+            interfaces: vec![
+                iface("enp2s0", "wan", &["192.0.2.1/24"]),
+                iface("enp3s0", "mgmt", &["10.0.2.15/24"]),
+                vlan_iface("enp3s0.20", "lan", "enp3s0", 20, &["192.168.1.1/24"]),
+            ],
+            ui_exposure: vec!["enp3s0".into()],
+            ..DesiredState::default()
+        };
+        let err = validate(&state).unwrap_err();
+        assert!(err.to_ascii_lowercase().contains("parent"), "{err}");
+    }
+
+    #[test]
+    fn reject_wan_vlan_on_mgmt_parent() {
+        let state = DesiredState {
+            interfaces: vec![
+                iface("enp1s0", "lan", &["192.168.1.1/24"]),
+                iface("enp3s0", "mgmt", &["10.0.2.15/24"]),
+                vlan_iface("enp3s0.10", "wan", "enp3s0", 10, &["192.0.2.1/24"]),
+            ],
+            ui_exposure: vec!["enp3s0".into()],
+            ..DesiredState::default()
+        };
+        let err = validate(&state).unwrap_err();
+        assert!(err.to_ascii_lowercase().contains("parent"), "{err}");
+    }
+
+    #[test]
+    fn reject_mgmt_without_on_link_prefix() {
+        let mut state = wan_lan_mgmt();
+        state.interfaces[2].addresses.clear();
+        let err = validate(&state).unwrap_err();
+        assert!(
+            err.to_ascii_lowercase().contains("static")
+                || err.to_ascii_lowercase().contains("prefix")
+                || err.to_ascii_lowercase().contains("address"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn reject_mgmt_dhcp() {
+        let mut state = wan_lan_mgmt();
+        state.interfaces[2].dhcp = true;
+        let err = validate(&state).unwrap_err();
+        assert!(
+            err.to_ascii_lowercase().contains("dhcp")
+                || err.to_ascii_lowercase().contains("static")
+                || err.to_ascii_lowercase().contains("gateway"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn reject_mgmt_vlan() {
+        let state = DesiredState {
+            interfaces: vec![
+                iface("enp1s0", "lan", &["192.168.1.1/24"]),
+                iface("enp2s0", "wan", &["192.0.2.1/24"]),
+                vlan_iface("enp3s0.9", "mgmt", "enp3s0", 9, &["10.0.2.15/24"]),
+            ],
+            ui_exposure: vec!["enp3s0.9".into()],
+            ..DesiredState::default()
+        };
+        let err = validate(&state).unwrap_err();
+        assert!(
+            err.to_ascii_lowercase().contains("parent")
+                || err.to_ascii_lowercase().contains("vlan"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn reject_mgmt_missing_from_ui_exposure() {
+        let mut state = wan_lan_mgmt();
+        state.ui_exposure = vec!["enp1s0".into()];
+        let err = validate(&state).unwrap_err();
+        assert!(
+            err.to_ascii_lowercase().contains("ui_exposure")
+                || err.to_ascii_lowercase().contains("management"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn still_require_wan_and_lan_when_mgmt_exists() {
+        let mut state = wan_lan_mgmt();
+        state
+            .interfaces
+            .retain(|i| i.role.as_deref() != Some("lan"));
+        let err = validate(&state).unwrap_err();
+        assert!(err.to_ascii_lowercase().contains("lan"), "{err}");
+    }
+
+    #[test]
+    fn kea_and_unbound_stay_on_lan_not_mgmt() {
+        let state = wan_lan_mgmt();
+        let lan = lan_l2(&state).unwrap();
+        assert_eq!(lan.name, "enp1s0");
+        assert_ne!(lan.name, "enp3s0");
+        let kea4 = kea_dhcp4_conf(
+            &lan.name,
+            "192.168.1.0/24",
+            "192.168.1.100",
+            "192.168.1.200",
+            "192.168.1.1",
+        );
+        assert!(kea4.contains("\"interfaces\": [ \"enp1s0\" ]"), "{kea4}");
+        assert!(!kea4.contains("enp3s0"), "{kea4}");
+        let unbound = unbound_conf("192.168.1.1", "192.168.1.0/24");
+        assert!(unbound.contains("interface: 192.168.1.1"), "{unbound}");
+        assert!(!unbound.contains("10.0.2.15"), "{unbound}");
+    }
+
+    #[test]
+    fn nft_does_not_forward_mgmt_to_wan_or_lan() {
+        let state = wan_lan_mgmt();
+        let rules = nft_rules(&state);
+        let iif_drop = rules
+            .find("iifname \"enp3s0\" drop")
+            .expect(&format!("mgmt iif drop missing in {rules}"));
+        let oif_drop = rules
+            .find("oifname \"enp3s0\" drop")
+            .expect(&format!("mgmt oif drop missing in {rules}"));
+        let wan_fwd = rules
+            .find("oifname \"enp2s0\" accept")
+            .expect(&format!("WAN forward missing in {rules}"));
+        assert!(
+            iif_drop < wan_fwd && oif_drop < wan_fwd,
+            "Management NIC drop must precede WAN forward:\n{rules}"
+        );
+        assert!(
+            !rules.contains("iifname \"enp3s0\" oifname \"enp2s0\" accept"),
+            "{rules}"
+        );
+        assert!(
+            !rules.contains("iifname \"enp3s0\" oifname \"enp1s0\" accept"),
+            "{rules}"
+        );
+        assert!(
+            rules.contains("iifname \"enp3s0\" ip daddr 10.0.2.15 tcp dport 443 dnat"),
+            "UI DNAT on the Management NIC:\n{rules}"
+        );
+        assert!(
+            rules.contains("iifname \"enp3s0\" oifname \"f0mgmt\" tcp dport 443 accept"),
+            "HTTPS to the UI veth is not LAN/WAN forward:\n{rules}"
+        );
     }
 }

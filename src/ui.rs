@@ -434,8 +434,19 @@ fn validate_bootstrap(req: &Bootstrap) -> Result<(), String> {
             return Err("placement is not a contract; use roles and ui_exposure".into());
         }
         if let Some(role) = iface.role.as_deref() {
-            if !matches!(role, "wan" | "lan" | "unused" | "stick") {
+            if !matches!(role, "wan" | "lan" | "unused" | "stick" | "mgmt") {
                 return Err(format!("unknown role {role}"));
+            }
+        }
+        if iface.role.as_deref() == Some("mgmt") {
+            if iface.vlan.is_some() || iface.parent.is_some() {
+                return Err("Management NIC owns the whole parent".into());
+            }
+            if iface.dhcp {
+                return Err("Management NIC is on-link static; no DHCP or gateway".into());
+            }
+            if iface.addresses.is_empty() {
+                return Err("Management NIC needs an on-link static prefix".into());
             }
         }
     }
@@ -468,6 +479,21 @@ fn validate_bootstrap(req: &Bootstrap) -> Result<(), String> {
             }
         }
     }
+    let mgmt_parents: Vec<String> = req
+        .interfaces
+        .iter()
+        .filter(|i| i.role.as_deref() == Some("mgmt"))
+        .map(|i| boot_l2_key(i).0)
+        .collect();
+    for iface in req
+        .interfaces
+        .iter()
+        .filter(|i| matches!(i.role.as_deref(), Some("wan") | Some("lan")))
+    {
+        if mgmt_parents.iter().any(|p| p == &boot_l2_key(iface).0) {
+            return Err("WAN or LAN must not share a parent with a Management NIC".into());
+        }
+    }
     if req.ui_exposure.is_empty() {
         return Err("ui_exposure must not be empty".into());
     }
@@ -477,6 +503,15 @@ fn validate_bootstrap(req: &Bootstrap) -> Result<(), String> {
         };
         if iface.role.as_deref() == Some("wan") {
             return Err("ui_exposure cannot include a WAN".into());
+        }
+    }
+    for iface in req
+        .interfaces
+        .iter()
+        .filter(|i| i.role.as_deref() == Some("mgmt"))
+    {
+        if !req.ui_exposure.iter().any(|n| n == &iface.name) {
+            return Err("Management NIC must be in ui_exposure".into());
         }
     }
     Ok(())
@@ -801,6 +836,75 @@ mod tests {
         );
         let err = validate_bootstrap(&req).unwrap_err();
         assert!(err.contains("WAN"), "{err}");
+    }
+
+    #[test]
+    fn bootstrap_accepts_role_mgmt_oob_only() {
+        let req = parse_boot(
+            r#"{"hostname":"fwos-box","admin":"alice","password":"secret12","interfaces":[{"name":"enp1s0","role":"lan","addresses":["192.168.1.1/24"]},{"name":"enp2s0","role":"wan","addresses":["192.0.2.1/24"]},{"name":"enp3s0","role":"mgmt","addresses":["10.0.2.15/24"]}],"ui_exposure":["enp3s0"],"lan_prefix":"192.168.1.0/24"}"#,
+        );
+        assert!(
+            validate_bootstrap(&req).is_ok(),
+            "{:?}",
+            validate_bootstrap(&req).err()
+        );
+    }
+
+    #[test]
+    fn bootstrap_accepts_mgmt_and_optional_lan_exposure() {
+        let req = parse_boot(
+            r#"{"hostname":"fwos-box","admin":"alice","password":"secret12","interfaces":[{"name":"enp1s0","role":"lan"},{"name":"enp2s0","role":"wan"},{"name":"enp3s0","role":"mgmt","addresses":["10.0.2.15/24"]}],"ui_exposure":["enp3s0","enp1s0"]}"#,
+        );
+        assert!(
+            validate_bootstrap(&req).is_ok(),
+            "{:?}",
+            validate_bootstrap(&req).err()
+        );
+    }
+
+    #[test]
+    fn bootstrap_rejects_wan_on_mgmt_parent() {
+        let req = parse_boot(
+            r#"{"hostname":"fwos-box","admin":"alice","password":"secret12","interfaces":[{"name":"enp1s0","role":"lan"},{"name":"enp3s0","role":"mgmt","addresses":["10.0.2.15/24"]},{"name":"enp3s0","role":"wan","addresses":["192.0.2.1/24"]}],"ui_exposure":["enp3s0"]}"#,
+        );
+        let err = validate_bootstrap(&req).unwrap_err();
+        assert!(err.to_ascii_lowercase().contains("parent"), "{err}");
+    }
+
+    #[test]
+    fn bootstrap_rejects_lan_vlan_on_mgmt_parent() {
+        let req = parse_boot(
+            r#"{"hostname":"fwos-box","admin":"alice","password":"secret12","interfaces":[{"name":"enp2s0","role":"wan"},{"name":"enp3s0","role":"mgmt","addresses":["10.0.2.15/24"]},{"name":"enp3s0.20","role":"lan","parent":"enp3s0","vlan":20}],"ui_exposure":["enp3s0"]}"#,
+        );
+        let err = validate_bootstrap(&req).unwrap_err();
+        assert!(err.to_ascii_lowercase().contains("parent"), "{err}");
+    }
+
+    #[test]
+    fn bootstrap_rejects_mgmt_without_prefix() {
+        let req = parse_boot(
+            r#"{"hostname":"fwos-box","admin":"alice","password":"secret12","interfaces":[{"name":"enp1s0","role":"lan"},{"name":"enp2s0","role":"wan"},{"name":"enp3s0","role":"mgmt"}],"ui_exposure":["enp3s0"]}"#,
+        );
+        let err = validate_bootstrap(&req).unwrap_err();
+        assert!(
+            err.to_ascii_lowercase().contains("static")
+                || err.to_ascii_lowercase().contains("prefix")
+                || err.to_ascii_lowercase().contains("address"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn bootstrap_rejects_mgmt_missing_from_exposure() {
+        let req = parse_boot(
+            r#"{"hostname":"fwos-box","admin":"alice","password":"secret12","interfaces":[{"name":"enp1s0","role":"lan"},{"name":"enp2s0","role":"wan"},{"name":"enp3s0","role":"mgmt","addresses":["10.0.2.15/24"]}],"ui_exposure":["enp1s0"]}"#,
+        );
+        let err = validate_bootstrap(&req).unwrap_err();
+        assert!(
+            err.to_ascii_lowercase().contains("ui_exposure")
+                || err.to_ascii_lowercase().contains("management"),
+            "{err}"
+        );
     }
 
     #[test]

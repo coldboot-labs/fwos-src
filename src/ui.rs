@@ -443,7 +443,7 @@ fn validate_bootstrap(req: &Bootstrap) -> Result<(), String> {
                 return Err("Management NIC owns the whole parent".into());
             }
             if iface.dhcp {
-                return Err("Management NIC is on-link static; no DHCP or gateway".into());
+                return Err("Management NIC is on-link static; no DHCP".into());
             }
             if iface.addresses.is_empty() {
                 return Err("Management NIC needs an on-link static prefix".into());

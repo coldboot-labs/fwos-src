@@ -292,7 +292,7 @@ fn validate_mgmt_iface(iface: &Iface) -> Result<(), String> {
         return Err("Management NIC owns the whole parent".into());
     }
     if iface.dhcp {
-        return Err("Management NIC is on-link static; no DHCP or gateway".into());
+        return Err("Management NIC is on-link static; no DHCP".into());
     }
     if iface.addresses.is_empty() {
         return Err("Management NIC needs an on-link static prefix".into());
@@ -1821,8 +1821,7 @@ mod tests {
         let err = validate(&state).unwrap_err();
         assert!(
             err.to_ascii_lowercase().contains("dhcp")
-                || err.to_ascii_lowercase().contains("static")
-                || err.to_ascii_lowercase().contains("gateway"),
+                || err.to_ascii_lowercase().contains("static"),
             "{err}"
         );
     }

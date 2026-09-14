@@ -366,7 +366,7 @@ fn print_admin_status(out: &mut impl Write) -> Result<(), String> {
     {
         let names: Vec<&str> = exp.iter().filter_map(|x| x.as_str()).collect();
         if !names.is_empty() {
-            writeln!(out, "ui_exposure: {}", names.join(" ")).map_err(|e| e.to_string())?;
+            writeln!(out, "UI exposure: {}", names.join(" ")).map_err(|e| e.to_string())?;
         }
     }
     writeln!(

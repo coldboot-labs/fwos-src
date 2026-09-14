@@ -327,6 +327,8 @@ struct Bootstrap {
     #[serde(default)]
     interfaces: Vec<BootIface>,
     #[serde(default)]
+    ui_exposure: Vec<String>,
+    #[serde(default)]
     lan_prefix: String,
     #[serde(default)]
     dhcp_pool: String,
@@ -337,6 +339,7 @@ struct Bootstrap {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 struct BootIface {
     name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     placement: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     role: Option<String>,
@@ -378,34 +381,8 @@ fn bootstrap(body: &[u8]) -> HttpResponse {
     if req.interfaces.is_empty() {
         return json_response(400, json!({"ok": false, "error": "missing interfaces"}));
     }
-    for iface in &req.interfaces {
-        if iface.name.trim().is_empty() {
-            return json_response(400, json!({"ok": false, "error": "missing NIC name"}));
-        }
-        if iface.placement != "fwd" && iface.placement != "mgmt" {
-            return json_response(
-                400,
-                json!({"ok": false, "error": "placement must be fwd or mgmt"}),
-            );
-        }
-    }
-    let has_mgmt = req.interfaces.iter().any(|i| i.placement == "mgmt");
-    let has_stick = req
-        .interfaces
-        .iter()
-        .any(|i| i.role.as_deref() == Some("stick"));
-    let has_wan = req
-        .interfaces
-        .iter()
-        .any(|i| i.role.as_deref() == Some("wan"));
-    if !has_mgmt && !has_stick {
-        return json_response(
-            400,
-            json!({"ok": false, "error": "need a mgmt NIC or stick exception"}),
-        );
-    }
-    if !has_wan && !has_stick {
-        return json_response(400, json!({"ok": false, "error": "need a WAN NIC"}));
+    if let Err(err) = validate_bootstrap(&req) {
+        return json_response(400, json!({"ok": false, "error": err}));
     }
     if let Err(err) = set_hostname(hostname) {
         return json_response(502, json!({"ok": false, "error": err}));
@@ -416,6 +393,7 @@ fn bootstrap(body: &[u8]) -> HttpResponse {
     let mut desired = json!({
         "hostname": hostname,
         "interfaces": req.interfaces,
+        "ui_exposure": req.ui_exposure,
     });
     if !req.lan_prefix.trim().is_empty() {
         desired["lan_prefix"] = json!(req.lan_prefix.trim());
@@ -442,6 +420,81 @@ fn bootstrap(body: &[u8]) -> HttpResponse {
         }
         Err(err) => json_response(502, json!({"ok": false, "error": err})),
     }
+}
+
+fn validate_bootstrap(req: &Bootstrap) -> Result<(), String> {
+    for iface in &req.interfaces {
+        if iface.name.trim().is_empty() {
+            return Err("missing NIC name".into());
+        }
+        if iface.placement == "mgmt" {
+            return Err("placement=mgmt is not a contract; use roles and ui_exposure".into());
+        }
+        if !iface.placement.is_empty() && iface.placement != "fwd" {
+            return Err("placement is not a contract; use roles and ui_exposure".into());
+        }
+        if let Some(role) = iface.role.as_deref() {
+            if !matches!(role, "wan" | "lan" | "unused" | "stick") {
+                return Err(format!("unknown role {role}"));
+            }
+        }
+    }
+    let has_wan = req
+        .interfaces
+        .iter()
+        .any(|i| i.role.as_deref() == Some("wan"));
+    let has_lan = req
+        .interfaces
+        .iter()
+        .any(|i| i.role.as_deref() == Some("lan"));
+    if !has_wan {
+        return Err("need at least one WAN".into());
+    }
+    if !has_lan {
+        return Err("need at least one LAN".into());
+    }
+    for wan in req
+        .interfaces
+        .iter()
+        .filter(|i| i.role.as_deref() == Some("wan"))
+    {
+        for lan in req
+            .interfaces
+            .iter()
+            .filter(|i| i.role.as_deref() == Some("lan"))
+        {
+            if boot_l2_key(wan) == boot_l2_key(lan) {
+                return Err("WAN and LAN must not share the same parent and tag".into());
+            }
+        }
+    }
+    if req.ui_exposure.is_empty() {
+        return Err("ui_exposure must not be empty".into());
+    }
+    for name in &req.ui_exposure {
+        let Some(iface) = req.interfaces.iter().find(|i| i.name == *name) else {
+            return Err(format!("ui_exposure {name} is not an interface"));
+        };
+        if iface.role.as_deref() == Some("wan") {
+            return Err("ui_exposure cannot include a WAN".into());
+        }
+    }
+    Ok(())
+}
+
+fn boot_l2_key(iface: &BootIface) -> (String, Option<u16>) {
+    let parent = iface.parent.clone().unwrap_or_else(|| {
+        if iface.vlan.is_some() {
+            iface
+                .name
+                .rsplit_once('.')
+                .map(|(p, _)| p.to_string())
+                .unwrap_or_else(|| iface.name.clone())
+        } else {
+            iface.name.clone()
+        }
+    });
+    (parent, iface.vlan)
 }
 
 fn stamp_bootstrap() -> Result<(), String> {
@@ -541,6 +594,7 @@ fn status_json() -> Value {
         "hostname": hostname,
         "nics": nics,
         "interfaces": [],
+        "ui_exposure": [],
         "lan_prefix": Value::Null,
         "dhcp_pool": Value::Null,
         "wan_pd": Value::Null,
@@ -561,11 +615,16 @@ fn status_json() -> Value {
             if let Some(p) = v.get("wan_pd").and_then(|x| x.as_str()) {
                 out["wan_pd"] = json!(p);
             }
+            if let Some(exp) = v.get("ui_exposure") {
+                if let Ok(j) = serde_json::to_value(exp) {
+                    out["ui_exposure"] = j;
+                }
+            }
             if let Some(ifaces) = v.get("interfaces").and_then(|x| x.as_array()) {
                 let mut shown = Vec::new();
                 for iface in ifaces {
                     let mut one = serde_json::Map::new();
-                    for key in ["name", "placement", "role", "vlan", "parent"] {
+                    for key in ["name", "role", "vlan", "parent"] {
                         if let Some(val) = iface.get(key) {
                             if let Ok(j) = serde_json::to_value(val) {
                                 one.insert(key.to_string(), j);
@@ -650,8 +709,56 @@ mod tests {
     #[test]
     fn ui_listens_wildcard_so_dnat_lands() {
         let addrs = wildcard_bind_addrs().unwrap();
-        assert!(addrs.iter().any(|a| a.ip == IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
-        assert!(addrs.iter().any(|a| a.ip == IpAddr::V6(Ipv6Addr::UNSPECIFIED)));
+        assert!(addrs
+            .iter()
+            .any(|a| a.ip == IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
+        assert!(addrs
+            .iter()
+            .any(|a| a.ip == IpAddr::V6(Ipv6Addr::UNSPECIFIED)));
+    }
+
+    fn parse_boot(raw: &str) -> Bootstrap {
+        serde_json::from_str(raw).unwrap()
+    }
+
+    #[test]
+    fn bootstrap_accepts_wan_lan_ui_exposure() {
+        let req = parse_boot(
+            r#"{"hostname":"fwos-box","admin":"alice","password":"secret12","interfaces":[{"name":"enp1s0","role":"lan","addresses":["192.168.1.1/24"]},{"name":"enp2s0","role":"wan","addresses":["192.0.2.1/24"]}],"ui_exposure":["enp1s0"],"lan_prefix":"192.168.1.0/24"}"#,
+        );
+        assert!(validate_bootstrap(&req).is_ok());
+    }
+
+    #[test]
+    fn bootstrap_rejects_placement_mgmt() {
+        let req = parse_boot(
+            r#"{"hostname":"fwos-box","admin":"alice","password":"secret12","interfaces":[{"name":"enp1s0","placement":"mgmt"},{"name":"enp2s0","role":"wan","addresses":["192.0.2.1/24"]}],"lan_prefix":"192.168.1.0/24"}"#,
+        );
+        let err = validate_bootstrap(&req).unwrap_err();
+        assert!(err.contains("placement=mgmt"), "{err}");
+    }
+
+    #[test]
+    fn bootstrap_rejects_wan_in_exposure_and_empty_set() {
+        let req = parse_boot(
+            r#"{"hostname":"fwos-box","admin":"alice","password":"secret12","interfaces":[{"name":"enp1s0","role":"lan"},{"name":"enp2s0","role":"wan"}],"ui_exposure":["enp2s0"]}"#,
+        );
+        let err = validate_bootstrap(&req).unwrap_err();
+        assert!(err.contains("WAN"), "{err}");
+        let req = parse_boot(
+            r#"{"hostname":"fwos-box","admin":"alice","password":"secret12","interfaces":[{"name":"enp1s0","role":"lan"},{"name":"enp2s0","role":"wan"}]}"#,
+        );
+        let err = validate_bootstrap(&req).unwrap_err();
+        assert!(err.contains("ui_exposure"), "{err}");
+    }
+
+    #[test]
+    fn bootstrap_rejects_wan_lan_same_parent_tag() {
+        let req = parse_boot(
+            r#"{"hostname":"fwos-box","admin":"alice","password":"secret12","interfaces":[{"name":"enp1s0","role":"wan"},{"name":"enp1s0","role":"lan"}],"ui_exposure":["enp1s0"]}"#,
+        );
+        let err = validate_bootstrap(&req).unwrap_err();
+        assert!(err.contains("parent") && err.contains("tag"), "{err}");
     }
 
     #[test]

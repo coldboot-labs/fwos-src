@@ -351,17 +351,22 @@ fn print_admin_status(out: &mut impl Write) -> Result<(), String> {
         writeln!(out, "NICs:").map_err(|e| e.to_string())?;
         for iface in ifaces {
             let name = iface.get("name").and_then(|x| x.as_str()).unwrap_or("?");
-            let place = iface
-                .get("placement")
-                .and_then(|x| x.as_str())
-                .unwrap_or("");
             let role = iface.get("role").and_then(|x| x.as_str()).unwrap_or("");
-            let extra = format!("{place} {role}").trim().to_string();
-            if extra.is_empty() {
+            if role.is_empty() {
                 writeln!(out, "  {name}").map_err(|e| e.to_string())?;
             } else {
-                writeln!(out, "  {name}  {extra}").map_err(|e| e.to_string())?;
+                writeln!(out, "  {name}  {role}").map_err(|e| e.to_string())?;
             }
+        }
+    }
+    if let Some(exp) = desired
+        .as_ref()
+        .and_then(|v| v.get("ui_exposure"))
+        .and_then(|x| x.as_array())
+    {
+        let names: Vec<&str> = exp.iter().filter_map(|x| x.as_str()).collect();
+        if !names.is_empty() {
+            writeln!(out, "ui_exposure: {}", names.join(" ")).map_err(|e| e.to_string())?;
         }
     }
     writeln!(

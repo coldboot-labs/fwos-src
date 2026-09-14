@@ -53,11 +53,14 @@ struct DesiredState {
     dhcp_pool: Option<String>,
     #[serde(default)]
     wan_pd: Option<String>,
+    #[serde(default)]
+    ui_exposure: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Iface {
     name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     placement: String,
     #[serde(default)]
     role: Option<String>,
@@ -217,31 +220,146 @@ fn persist(state: &DesiredState) -> Result<(), String> {
     fs::write(DESIRED, raw).map_err(|e| format!("write {DESIRED}: {e}"))
 }
 
-fn apply(state: &mut DesiredState) -> Result<(), String> {
-    // Capture UI-exposure addresses before tearing down the first-boot opt.
-    // A placement=mgmt NIC stays in fwd; UI exposure is nft DNAT, not setns.
-    let mut mgmt_saved: Vec<(String, Vec<String>, Option<String>)> = Vec::new();
-    for iface in &mut state.interfaces {
-        if iface.placement == "mgmt" || iface.role.as_deref() == Some("stick") {
-            let (mut addrs, gw) = capture_ipv4(&iface.name)?;
-            if addrs.is_empty() {
-                addrs = iface.addresses.clone();
-            } else if iface.addresses.is_empty() {
-                iface.addresses = addrs.clone();
+fn validate(state: &DesiredState) -> Result<(), String> {
+    for iface in &state.interfaces {
+        if iface.placement == "mgmt" {
+            return Err("placement=mgmt is not a contract; use roles and ui_exposure".into());
+        }
+        if let Some(role) = iface.role.as_deref() {
+            if !matches!(role, "wan" | "lan" | "unused" | "stick") {
+                return Err(format!("unknown role {role}"));
             }
-            mgmt_saved.push((iface.name.clone(), addrs, gw));
         }
     }
+    let wans: Vec<&Iface> = state
+        .interfaces
+        .iter()
+        .filter(|i| i.role.as_deref() == Some("wan"))
+        .collect();
+    let lans: Vec<&Iface> = state
+        .interfaces
+        .iter()
+        .filter(|i| i.role.as_deref() == Some("lan"))
+        .collect();
+    if wans.is_empty() {
+        return Err("need at least one WAN".into());
+    }
+    if lans.is_empty() {
+        return Err("need at least one LAN".into());
+    }
+    for wan in &wans {
+        for lan in &lans {
+            if l2_key(wan) == l2_key(lan) {
+                return Err("WAN and LAN must not share the same parent and tag".into());
+            }
+        }
+    }
+    if state.ui_exposure.is_empty() {
+        return Err("ui_exposure must not be empty".into());
+    }
+    for name in &state.ui_exposure {
+        let Some(iface) = state.interfaces.iter().find(|i| i.name == *name) else {
+            return Err(format!("ui_exposure {name} is not an interface"));
+        };
+        if iface.role.as_deref() == Some("wan") {
+            return Err("ui_exposure cannot include a WAN".into());
+        }
+    }
+    Ok(())
+}
+
+fn l2_key(iface: &Iface) -> (String, Option<u16>) {
+    let parent = iface.parent.clone().unwrap_or_else(|| {
+        if iface.vlan.is_some() {
+            iface
+                .name
+                .rsplit_once('.')
+                .map(|(p, _)| p.to_string())
+                .unwrap_or_else(|| iface.name.clone())
+        } else {
+            iface.name.clone()
+        }
+    });
+    (parent, iface.vlan)
+}
+
+fn exposes_ui(state: &DesiredState, name: &str) -> bool {
+    state.ui_exposure.iter().any(|n| n == name)
+}
+
+fn lan_l2(state: &DesiredState) -> Option<&Iface> {
+    state
+        .interfaces
+        .iter()
+        .find(|i| i.role.as_deref() == Some("lan"))
+}
+
+fn merge_lan_prefix_addr(state: &mut DesiredState) {
+    let Some(prefix) = state
+        .lan_prefix
+        .clone()
+        .or_else(|| state.dhcp_pool.as_deref().and_then(prefix_from_pool))
+    else {
+        return;
+    };
+    let Some(lan_v4) = first_v4_host(&prefix) else {
+        return;
+    };
+    let plen = prefix.split('/').nth(1).unwrap_or("24");
+    let cidr = format!("{lan_v4}/{plen}");
+    if let Some(iface) = state
+        .interfaces
+        .iter_mut()
+        .find(|i| i.role.as_deref() == Some("lan"))
+    {
+        if !iface
+            .addresses
+            .iter()
+            .any(|a| a == &cidr || a.starts_with(&format!("{lan_v4}/")))
+        {
+            iface.addresses.push(cidr);
+        }
+    }
+}
+
+fn apply(state: &mut DesiredState) -> Result<(), String> {
+    validate(state)?;
+    // Capture UI-exposure / LAN addresses before tearing down the first-boot
+    // opt so HTTPS stays at the LAN interface address after apply.
+    let capture_names: Vec<String> = state
+        .interfaces
+        .iter()
+        .filter(|i| {
+            i.vlan.is_none() && (exposes_ui(state, &i.name) || i.role.as_deref() == Some("lan"))
+        })
+        .map(|i| i.name.clone())
+        .collect();
+    let mut saved: Vec<(String, Vec<String>)> = Vec::new();
+    for iface in &mut state.interfaces {
+        if !capture_names.iter().any(|n| n == &iface.name) {
+            continue;
+        }
+        let Ok((mut addrs, _)) = capture_ipv4(&iface.name) else {
+            continue;
+        };
+        if addrs.is_empty() {
+            addrs = iface.addresses.clone();
+        } else if iface.addresses.is_empty() {
+            iface.addresses = addrs.clone();
+        }
+        saved.push((iface.name.clone(), addrs));
+    }
+    merge_lan_prefix_addr(state);
     discard_opt()?;
     setup_plumbing()?;
     for iface in &state.interfaces {
         if iface.vlan.is_none() {
             ensure_in_fwd(&iface.name)?;
             run_ip(&["link", "set", &iface.name, "up"])?;
-            let extra = mgmt_saved
+            let extra = saved
                 .iter()
-                .find(|(n, _, _)| n == &iface.name)
-                .map(|(_, a, _)| a.clone())
+                .find(|(n, _)| n == &iface.name)
+                .map(|(_, a)| a.clone())
                 .unwrap_or_default();
             for addr in extra.iter().chain(iface.addresses.iter()) {
                 add_addr(&iface.name, addr)?;
@@ -444,37 +562,57 @@ fn add_addr(dev: &str, cidr: &str) -> Result<(), String> {
 }
 
 fn program_lan_services(state: &DesiredState) -> Result<(), String> {
-    let Some(pool) = state.dhcp_pool.as_deref() else {
+    let Some(lan) = lan_l2(state) else {
         return Ok(());
     };
     let prefix = state
         .lan_prefix
         .clone()
-        .or_else(|| prefix_from_pool(pool))
-        .ok_or_else(|| "lan_prefix or a parseable dhcp_pool is required".to_string())?;
+        .or_else(|| state.dhcp_pool.as_deref().and_then(prefix_from_pool));
+    let Some(prefix) = prefix else {
+        return Ok(());
+    };
     let lan_v4 = first_v4_host(&prefix).ok_or_else(|| "lan_prefix has no v4 host".to_string())?;
-    ensure_lan_dev(
-        "lan0",
-        &format!("{lan_v4}/{}", prefix.split('/').nth(1).unwrap_or("24")),
-    )?;
+    let plen = prefix.split('/').nth(1).unwrap_or("24");
+    add_addr(&lan.name, &format!("{lan_v4}/{plen}"))?;
     if let Some(pd) = state.wan_pd.as_deref() {
         if let Some(v6) = pd_lan_addr(pd) {
-            add_addr("lan0", &v6)?;
+            add_addr(&lan.name, &v6)?;
         }
     }
+    let Some(pool) = state.dhcp_pool.as_deref() else {
+        return Ok(());
+    };
     fs::create_dir_all("/var/lib/fwos/kea").map_err(|e| format!("mkdir kea: {e}"))?;
     fs::create_dir_all("/var/lib/fwos/unbound").map_err(|e| format!("mkdir unbound: {e}"))?;
     let (p1, p2) = split_pool(pool);
-    let kea4 = format!(
+    let kea4 = kea_dhcp4_conf(&lan.name, &prefix, &p1, &p2, &lan_v4);
+    fs::write("/var/lib/fwos/kea/kea-dhcp4.conf", kea4)
+        .map_err(|e| format!("write kea-dhcp4: {e}"))?;
+    if let Some(pd) = state.wan_pd.as_deref() {
+        if let (Some(v6_sub), Some((v6p1, v6p2))) = (pd_subnet64(pd), pd_pool(pd)) {
+            let kea6 = kea_dhcp6_conf(&lan.name, &v6_sub, &v6p1, &v6p2);
+            fs::write("/var/lib/fwos/kea/kea-dhcp6.conf", kea6)
+                .map_err(|e| format!("write kea-dhcp6: {e}"))?;
+        }
+    }
+    let unbound = unbound_conf(&lan_v4, &prefix);
+    fs::write("/var/lib/fwos/unbound/unbound.conf", unbound)
+        .map_err(|e| format!("write unbound: {e}"))?;
+    Ok(())
+}
+
+fn kea_dhcp4_conf(dev: &str, prefix: &str, p1: &str, p2: &str, lan_v4: &str) -> String {
+    format!(
         r#"{{
   "Dhcp4": {{
-    "interfaces-config": {{ "interfaces": [ "lan0" ], "re-detect": true }},
+    "interfaces-config": {{ "interfaces": [ "{dev}" ], "re-detect": true }},
     "lease-database": {{ "type": "memfile", "persist": false, "name": "/tmp/dhcp4.leases" }},
     "valid-lifetime": 3600,
     "subnet4": [ {{
       "id": 1,
       "subnet": "{prefix}",
-      "interface": "lan0",
+      "interface": "{dev}",
       "pools": [ {{ "pool": "{p1} - {p2}" }} ],
       "option-data": [
         {{ "name": "routers", "data": "{lan_v4}" }},
@@ -485,46 +623,33 @@ fn program_lan_services(state: &DesiredState) -> Result<(), String> {
   }}
 }}
 "#
-    );
-    fs::write("/var/lib/fwos/kea/kea-dhcp4.conf", kea4)
-        .map_err(|e| format!("write kea-dhcp4: {e}"))?;
-    if let Some(pd) = state.wan_pd.as_deref() {
-        if let (Some(v6_sub), Some((v6p1, v6p2))) = (pd_subnet64(pd), pd_pool(pd)) {
-            let kea6 = format!(
-                r#"{{
+    )
+}
+
+fn kea_dhcp6_conf(dev: &str, subnet: &str, p1: &str, p2: &str) -> String {
+    format!(
+        r#"{{
   "Dhcp6": {{
-    "interfaces-config": {{ "interfaces": [ "lan0" ], "re-detect": true }},
+    "interfaces-config": {{ "interfaces": [ "{dev}" ], "re-detect": true }},
     "lease-database": {{ "type": "memfile", "persist": false, "name": "/tmp/dhcp6.leases" }},
     "server-id": {{ "type": "LLT", "persist": false }},
     "subnet6": [ {{
       "id": 1,
-      "subnet": "{v6_sub}",
-      "interface": "lan0",
-      "pools": [ {{ "pool": "{v6p1} - {v6p2}" }} ]
+      "subnet": "{subnet}",
+      "interface": "{dev}",
+      "pools": [ {{ "pool": "{p1} - {p2}" }} ]
     }} ],
     "loggers": [ {{ "name": "kea-dhcp6", "severity": "INFO", "output-options": [ {{ "output": "stdout" }} ] }} ]
   }}
 }}
 "#
-            );
-            fs::write("/var/lib/fwos/kea/kea-dhcp6.conf", kea6)
-                .map_err(|e| format!("write kea-dhcp6: {e}"))?;
-        }
-    }
-    let unbound = format!(
-        "server:\n  interface: {lan_v4}\n  port: 53\n  access-control: {prefix} allow\n  access-control: 127.0.0.0/8 allow\n  do-daemonize: no\n  username: \"\"\n  chroot: \"\"\n  directory: \"/tmp\"\n  pidfile: \"/tmp/unbound.pid\"\n  use-syslog: no\n  logfile: /dev/null\n"
-    );
-    fs::write("/var/lib/fwos/unbound/unbound.conf", unbound)
-        .map_err(|e| format!("write unbound: {e}"))?;
-    Ok(())
+    )
 }
 
-fn ensure_lan_dev(name: &str, cidr: &str) -> Result<(), String> {
-    if !link_exists(name)? {
-        run_ip(&["link", "add", name, "type", "dummy"])?;
-    }
-    run_ip(&["link", "set", name, "up"])?;
-    add_addr(name, cidr)
+fn unbound_conf(lan_v4: &str, prefix: &str) -> String {
+    format!(
+        "server:\n  interface: {lan_v4}\n  port: 53\n  access-control: {prefix} allow\n  access-control: 127.0.0.0/8 allow\n  do-daemonize: no\n  username: \"\"\n  chroot: \"\"\n  directory: \"/tmp\"\n  pidfile: \"/tmp/unbound.pid\"\n  use-syslog: no\n  logfile: /dev/null\n"
+    )
 }
 
 fn split_pool(pool: &str) -> (String, String) {
@@ -579,9 +704,10 @@ fn program_nft(state: &DesiredState) -> Result<(), String> {
         .filter(|i| i.role.as_deref() == Some("wan"))
         .map(|i| i.name.as_str())
         .collect();
-    let v4_wan = state.interfaces.iter().any(|i| {
-        i.role.as_deref() == Some("wan") && i.addresses.iter().any(|a| a.contains('.'))
-    });
+    let v4_wan = state
+        .interfaces
+        .iter()
+        .any(|i| i.role.as_deref() == Some("wan") && i.addresses.iter().any(|a| a.contains('.')));
     let exposure = ui_exposure(state);
     let mut rules = String::from("flush ruleset\n");
     rules.push_str(&host_pull_nft());
@@ -616,10 +742,16 @@ fn program_nft(state: &DesiredState) -> Result<(), String> {
     if !exposure.is_empty() {
         rules.push_str("  chain prerouting {\n");
         rules.push_str("    type nat hook prerouting priority dstnat; policy accept;\n");
-        let mut any_dnat = false;
         for (name, addrs) in &exposure {
-            for ip in expose_ips(addrs) {
-                any_dnat = true;
+            let ips = expose_ips(addrs);
+            if ips.is_empty() {
+                // LAN L2 with no address yet: DNAT only on that interface, never on a WAN.
+                rules.push_str(&format!(
+                    "    iifname \"{name}\" tcp dport 443 dnat ip to {MGMT_FWD_IP}\n"
+                ));
+                continue;
+            }
+            for ip in ips {
                 if ip.contains(':') {
                     rules.push_str(&format!(
                         "    iifname \"{name}\" ip6 daddr {ip} tcp dport 443 dnat ip6 to {MGMT_FWD_IP6}\n"
@@ -630,10 +762,6 @@ fn program_nft(state: &DesiredState) -> Result<(), String> {
                     ));
                 }
             }
-        }
-        if !any_dnat {
-            // Stick JSON may omit a parent address; keep HTTPS on that L2.
-            rules.push_str(&format!("    tcp dport 443 dnat ip to {MGMT_FWD_IP}\n"));
         }
         rules.push_str("  }\n");
     }
@@ -1041,8 +1169,16 @@ fn program_first_boot_nft(nic: &str, cidrs: &[String]) -> Result<(), String> {
 
 fn first_boot_nft(nic: &str, ips: &[String]) -> String {
     let mut rules = String::new();
-    let v4: Vec<&str> = ips.iter().map(|s| s.as_str()).filter(|s| !s.contains(':')).collect();
-    let v6: Vec<&str> = ips.iter().map(|s| s.as_str()).filter(|s| s.contains(':')).collect();
+    let v4: Vec<&str> = ips
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|s| !s.contains(':'))
+        .collect();
+    let v6: Vec<&str> = ips
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|s| s.contains(':'))
+        .collect();
     if !v4.is_empty() {
         rules.push_str("table ip fwos-first-boot {\n");
         rules.push_str("  chain prerouting {\n");
@@ -1084,9 +1220,14 @@ fn first_boot_nft(nic: &str, ips: &[String]) -> String {
 
 fn ui_exposure(state: &DesiredState) -> Vec<(String, Vec<String>)> {
     state
-        .interfaces
+        .ui_exposure
         .iter()
-        .filter(|i| i.placement == "mgmt" || i.role.as_deref() == Some("stick"))
+        .filter_map(|name| {
+            state
+                .interfaces
+                .iter()
+                .find(|i| i.name == *name && i.role.as_deref() != Some("wan"))
+        })
         .map(|i| (i.name.clone(), i.addresses.clone()))
         .collect()
 }
@@ -1249,7 +1390,8 @@ mod tests {
 
     #[test]
     fn parse_opt_requires_cidr_for_static() {
-        let v: Value = serde_json::from_str(r#"{"op":"opt","nic":"enp1s0","mode":"static"}"#).unwrap();
+        let v: Value =
+            serde_json::from_str(r#"{"op":"opt","nic":"enp1s0","mode":"static"}"#).unwrap();
         assert!(parse_opt(&v).is_err());
         let v: Value = serde_json::from_str(
             r#"{"op":"opt","nic":"enp1s0","mode":"static","cidr":"10.0.2.15/24"}"#,
@@ -1285,34 +1427,197 @@ mod tests {
         assert!(expose_allowed("fe80::1"));
     }
 
-    #[test]
-    fn ui_exposure_keeps_placement_mgmt_in_the_set() {
-        let state = DesiredState {
+    fn iface(name: &str, role: &str, addrs: &[&str]) -> Iface {
+        Iface {
+            name: name.into(),
+            placement: String::new(),
+            role: Some(role.into()),
+            addresses: addrs.iter().map(|s| (*s).to_string()).collect(),
+            vlan: None,
+            parent: None,
+            dhcp: false,
+        }
+    }
+
+    fn vlan_iface(name: &str, role: &str, parent: &str, vid: u16, addrs: &[&str]) -> Iface {
+        Iface {
+            name: name.into(),
+            placement: String::new(),
+            role: Some(role.into()),
+            addresses: addrs.iter().map(|s| (*s).to_string()).collect(),
+            vlan: Some(vid),
+            parent: Some(parent.into()),
+            dhcp: false,
+        }
+    }
+
+    fn wan_lan() -> DesiredState {
+        DesiredState {
             interfaces: vec![
-                Iface {
-                    name: "enp1s0".into(),
-                    placement: "mgmt".into(),
-                    role: None,
-                    addresses: vec!["10.0.2.15/24".into()],
-                    vlan: None,
-                    parent: None,
-                    dhcp: false,
-                },
-                Iface {
-                    name: "enp2s0".into(),
-                    placement: "fwd".into(),
-                    role: Some("wan".into()),
-                    addresses: vec!["192.0.2.1/24".into()],
-                    vlan: None,
-                    parent: None,
-                    dhcp: false,
-                },
+                iface("enp1s0", "lan", &["10.0.2.15/24", "192.168.1.1/24"]),
+                iface("enp2s0", "wan", &["192.0.2.1/24"]),
             ],
+            ui_exposure: vec!["enp1s0".into()],
+            lan_prefix: Some("192.168.1.0/24".into()),
+            dhcp_pool: Some("192.168.1.100-192.168.1.200".into()),
             ..DesiredState::default()
-        };
+        }
+    }
+
+    #[test]
+    fn ui_exposure_is_lan_not_wan() {
+        let state = wan_lan();
         let exp = ui_exposure(&state);
         assert_eq!(exp.len(), 1);
         assert_eq!(exp[0].0, "enp1s0");
         assert!(!exp.iter().any(|(n, _)| n == "enp2s0"));
+        assert!(validate(&state).is_ok());
+    }
+
+    #[test]
+    fn reject_placement_mgmt() {
+        let mut state = wan_lan();
+        state.interfaces[0].placement = "mgmt".into();
+        let err = validate(&state).unwrap_err();
+        assert!(err.contains("placement=mgmt"), "{err}");
+    }
+
+    #[test]
+    fn reject_empty_ui_exposure() {
+        let mut state = wan_lan();
+        state.ui_exposure.clear();
+        let err = validate(&state).unwrap_err();
+        assert!(err.contains("ui_exposure"), "{err}");
+    }
+
+    #[test]
+    fn reject_wan_in_ui_exposure() {
+        let mut state = wan_lan();
+        state.ui_exposure = vec!["enp2s0".into()];
+        let err = validate(&state).unwrap_err();
+        assert!(err.contains("WAN"), "{err}");
+    }
+
+    #[test]
+    fn require_wan_and_lan() {
+        let mut state = wan_lan();
+        state
+            .interfaces
+            .retain(|i| i.role.as_deref() != Some("lan"));
+        let err = validate(&state).unwrap_err();
+        assert!(err.to_ascii_lowercase().contains("lan"), "{err}");
+        let mut state = wan_lan();
+        state
+            .interfaces
+            .retain(|i| i.role.as_deref() != Some("wan"));
+        let err = validate(&state).unwrap_err();
+        assert!(err.to_ascii_lowercase().contains("wan"), "{err}");
+    }
+
+    #[test]
+    fn reject_wan_and_lan_same_parent_and_tag() {
+        let state = DesiredState {
+            interfaces: vec![
+                iface("enp1s0", "wan", &["192.0.2.1/24"]),
+                iface("enp1s0", "lan", &["192.168.1.1/24"]),
+            ],
+            ui_exposure: vec!["enp1s0".into()],
+            ..DesiredState::default()
+        };
+        let err = validate(&state).unwrap_err();
+        assert!(err.contains("parent") && err.contains("tag"), "{err}");
+
+        let ok = DesiredState {
+            interfaces: vec![
+                vlan_iface("enp1s0.10", "wan", "enp1s0", 10, &["192.0.2.1/24"]),
+                vlan_iface("enp1s0.20", "lan", "enp1s0", 20, &["192.168.1.1/24"]),
+            ],
+            ui_exposure: vec!["enp1s0.20".into()],
+            ..DesiredState::default()
+        };
+        assert!(validate(&ok).is_ok());
+
+        let mixed = DesiredState {
+            interfaces: vec![
+                iface("enp1s0", "wan", &["192.0.2.1/24"]),
+                vlan_iface("enp1s0.20", "lan", "enp1s0", 20, &["192.168.1.1/24"]),
+            ],
+            ui_exposure: vec!["enp1s0.20".into()],
+            ..DesiredState::default()
+        };
+        assert!(validate(&mixed).is_ok());
+    }
+
+    #[test]
+    fn extra_unused_nics_are_not_wans() {
+        let state = DesiredState {
+            interfaces: vec![
+                iface("enp1s0", "lan", &["192.168.1.1/24"]),
+                iface("enp2s0", "wan", &["192.0.2.1/24"]),
+                iface("enp3s0", "unused", &[]),
+            ],
+            ui_exposure: vec!["enp1s0".into()],
+            ..DesiredState::default()
+        };
+        assert!(validate(&state).is_ok());
+        let wans: Vec<_> = state
+            .interfaces
+            .iter()
+            .filter(|i| i.role.as_deref() == Some("wan"))
+            .map(|i| i.name.as_str())
+            .collect();
+        assert_eq!(wans, vec!["enp2s0"]);
+        let exp = ui_exposure(&state);
+        assert!(!exp.iter().any(|(n, _)| n == "enp3s0"));
+    }
+
+    #[test]
+    fn kea_and_unbound_bind_the_lan_l2_not_dummy() {
+        let state = wan_lan();
+        let lan = lan_l2(&state).unwrap();
+        assert_eq!(lan.name, "enp1s0");
+        assert_ne!(lan.name, "lan0");
+        let kea4 = kea_dhcp4_conf(
+            &lan.name,
+            "192.168.1.0/24",
+            "192.168.1.100",
+            "192.168.1.200",
+            "192.168.1.1",
+        );
+        assert!(kea4.contains("\"interfaces\": [ \"enp1s0\" ]"), "{kea4}");
+        assert!(kea4.contains("\"interface\": \"enp1s0\""), "{kea4}");
+        assert!(!kea4.contains("lan0"), "{kea4}");
+        let kea6 = kea_dhcp6_conf(&lan.name, "2001:db8::/64", "2001:db8::100", "2001:db8::1ff");
+        assert!(kea6.contains("enp1s0"), "{kea6}");
+        assert!(!kea6.contains("lan0"), "{kea6}");
+        let unbound = unbound_conf("192.168.1.1", "192.168.1.0/24");
+        assert!(unbound.contains("interface: 192.168.1.1"), "{unbound}");
+    }
+
+    #[test]
+    fn stick_json_with_ui_exposure_on_lan_vlan_is_valid() {
+        let state = DesiredState {
+            interfaces: vec![
+                iface("enp1s0", "stick", &[]),
+                vlan_iface("enp1s0.10", "wan", "enp1s0", 10, &["192.0.2.1/24"]),
+                vlan_iface("enp1s0.20", "lan", "enp1s0", 20, &["192.168.1.1/24"]),
+            ],
+            ui_exposure: vec!["enp1s0.20".into()],
+            lan_prefix: Some("192.168.1.0/24".into()),
+            dhcp_pool: Some("192.168.1.100-192.168.1.200".into()),
+            ..DesiredState::default()
+        };
+        assert!(validate(&state).is_ok());
+        let exp = ui_exposure(&state);
+        assert_eq!(exp[0].0, "enp1s0.20");
+        let kea4 = kea_dhcp4_conf(
+            "enp1s0.20",
+            "192.168.1.0/24",
+            "192.168.1.100",
+            "192.168.1.200",
+            "192.168.1.1",
+        );
+        assert!(kea4.contains("enp1s0.20"));
+        assert!(!kea4.contains("lan0"));
     }
 }

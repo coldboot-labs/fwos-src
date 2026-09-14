@@ -34,7 +34,7 @@ fn run() -> Result<(), String> {
         .map_err(|_| "install rustls ring provider".to_string())?;
     ensure_cert()?;
     let cfg = tls_config()?;
-    let addrs = wait_bind_addrs()?;
+    let addrs = wildcard_bind_addrs()?;
     let mut joins = Vec::new();
     for addr in addrs {
         let listener = match bind_one(&addr) {
@@ -105,7 +105,7 @@ impl std::fmt::Display for BindAddr {
     }
 }
 
-fn wait_bind_addrs() -> Result<Vec<BindAddr>, String> {
+fn wildcard_bind_addrs() -> Result<Vec<BindAddr>, String> {
     // Wildcard listen in mgmt so nft DNAT of HTTPS from fwd lands on the
     // plumbing veth. Operator-facing addresses stay the Traffic NIC's.
     Ok(vec![
@@ -649,7 +649,7 @@ mod tests {
 
     #[test]
     fn ui_listens_wildcard_so_dnat_lands() {
-        let addrs = wait_bind_addrs().unwrap();
+        let addrs = wildcard_bind_addrs().unwrap();
         assert!(addrs.iter().any(|a| a.ip == IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
         assert!(addrs.iter().any(|a| a.ip == IpAddr::V6(Ipv6Addr::UNSPECIFIED)));
     }

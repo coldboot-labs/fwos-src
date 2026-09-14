@@ -61,7 +61,7 @@ fn bootstrap_run() -> Result<(), String> {
     clear_tty(&mut stdout)?;
     print_status(&mut stdout)?;
     write_prompt(&mut stdout)?;
-    let mut key = nics_key(&host_nics().unwrap_or_default());
+    let mut key = nics_key(&traffic_nics().unwrap_or_default());
     loop {
         if bootstrapped() {
             return switch_to_admin(&mut stdout);
@@ -71,7 +71,7 @@ fn bootstrap_run() -> Result<(), String> {
                 if bootstrapped() {
                     return switch_to_admin(&mut stdout);
                 }
-                let now = nics_key(&host_nics().unwrap_or_default());
+                let now = nics_key(&traffic_nics().unwrap_or_default());
                 if now != key {
                     // NIC list going empty is placement, not a status to show.
                     let skip = now.is_empty() && !key.is_empty();
@@ -92,7 +92,7 @@ fn bootstrap_run() -> Result<(), String> {
                     stdout.flush().map_err(|e| e.to_string())?;
                 }
                 write_prompt(&mut stdout)?;
-                key = nics_key(&host_nics().unwrap_or_default());
+                key = nics_key(&traffic_nics().unwrap_or_default());
             }
         }
     }
@@ -537,7 +537,7 @@ struct Nic {
     addrs: Vec<IpAddr>,
 }
 
-fn host_nics() -> Result<Vec<Nic>, String> {
+fn traffic_nics() -> Result<Vec<Nic>, String> {
     Ok(list_from_netd().nics)
 }
 

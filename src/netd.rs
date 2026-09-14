@@ -5,6 +5,8 @@ use std::os::unix::fs::{chown, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::process::{self, Command};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -803,7 +805,7 @@ fn host_pull_nft() -> String {
 }
 
 fn claim_traffic_nics() -> Result<(), String> {
-    let names = host_ethernet()?;
+    let names = host_netns_ethernet()?;
     for name in names {
         ensure_in_fwd(&name)?;
         lock_unopted(&name)?;
@@ -812,7 +814,7 @@ fn claim_traffic_nics() -> Result<(), String> {
     Ok(())
 }
 
-fn host_ethernet() -> Result<Vec<String>, String> {
+fn host_netns_ethernet() -> Result<Vec<String>, String> {
     with_host_net(|| {
         let out = ip_cmd()
             .args(["-o", "link", "show"])
@@ -912,13 +914,29 @@ fn apply_opt(opt: &FirstBootOpt) -> Result<(), String> {
         }
         "dhcp" => ephemeral_dhcp(&opt.nic)?,
         "slaac" => {
-            write_sysctl(&opt.nic, "ipv6", "accept_ra", "1");
+            // fwd has IPv6 forwarding on (Host pull / DNAT). Kernel ignores
+            // accept_ra=1 on a forwarding interface; 2 still learns RAs.
+            write_sysctl(&opt.nic, "ipv6", "accept_ra", "2");
             write_sysctl(&opt.nic, "ipv6", "autoconf", "1");
         }
         other => return Err(format!("unknown opt mode {other}")),
     }
-    let addrs = iface_cidrs(&opt.nic)?;
+    let addrs = match opt.mode.as_str() {
+        "slaac" => wait_expose_cidrs(&opt.nic)?,
+        _ => iface_cidrs(&opt.nic)?,
+    };
     program_first_boot_nft(&opt.nic, &addrs)
+}
+
+fn wait_expose_cidrs(nic: &str) -> Result<Vec<String>, String> {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let addrs = iface_cidrs(nic)?;
+        if !expose_ips(&addrs).is_empty() || Instant::now() >= deadline {
+            return Ok(addrs);
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
 }
 
 fn teardown_opt(opt: &FirstBootOpt) -> Result<(), String> {
@@ -1049,9 +1067,15 @@ fn first_boot_nft(nic: &str, ips: &[String]) -> String {
         rules.push_str("    type nat hook prerouting priority dstnat; policy accept;\n");
         for ip in &v6 {
             rules.push_str(&format!(
-                "    iifname \"{nic}\" ip6 daddr {ip} tcp dport 443 dnat to {MGMT_FWD_IP6}\n"
+                "    iifname \"{nic}\" ip6 daddr {ip} tcp dport 443 dnat ip6 to {MGMT_FWD_IP6}\n"
             ));
         }
+        rules.push_str("  }\n");
+        rules.push_str("  chain forward {\n");
+        rules.push_str("    type filter hook forward priority filter; policy accept;\n");
+        rules.push_str(&format!(
+            "    iifname \"{nic}\" oifname \"{FWD_MGMT_VETH}\" tcp dport 443 accept\n"
+        ));
         rules.push_str("  }\n");
         rules.push_str("}\n");
     }
@@ -1242,6 +1266,10 @@ mod tests {
         assert!(rules.contains("iifname \"enp1s0\""));
         assert!(rules.contains("ip daddr 10.0.2.15 tcp dport 443 dnat ip to 169.254.127.6"));
         assert!(!rules.contains("flush ruleset"));
+        let v6 = first_boot_nft("enp1s0", &["fe80::1".into(), "fd53:1:1::9".into()]);
+        assert!(v6.contains("ip6 daddr fe80::1 tcp dport 443 dnat ip6 to fd53:1:1::6"));
+        assert!(v6.contains("chain forward"));
+        assert!(!v6.contains("dnat to fd53"));
     }
 
     #[test]
@@ -1254,6 +1282,7 @@ mod tests {
         assert!(!expose_allowed("100.64.0.1"));
         assert!(!expose_allowed("2001:db8::1"));
         assert!(expose_allowed("fd53:1:1::9"));
+        assert!(expose_allowed("fe80::1"));
     }
 
     #[test]

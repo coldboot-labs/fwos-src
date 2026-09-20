@@ -591,8 +591,11 @@ fn bootstrap(body: &[u8]) -> HttpResponse {
     if !valid_admin(admin) {
         return json_response(400, json!({"ok": false, "error": "invalid admin"}));
     }
-    if req.password.is_empty() {
-        return json_response(400, json!({"ok": false, "error": "missing password"}));
+    if !identity::valid_password(&req.password) {
+        return json_response(
+            400,
+            json!({"ok": false, "error": "password must contain 1–1024 bytes without ASCII control characters"}),
+        );
     }
     if req.interfaces.is_empty() {
         return json_response(400, json!({"ok": false, "error": "missing interfaces"}));

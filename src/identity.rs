@@ -269,8 +269,12 @@ pub fn valid_username(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
 }
 
-fn valid_password(password: &str) -> bool {
-    !password.is_empty() && password.len() <= 1024 && !password.contains('\0')
+/// Accept the same credential through HTTPS and the line-oriented console.
+/// ASCII controls are terminal input commands, not usable password characters.
+pub fn valid_password(password: &str) -> bool {
+    !password.is_empty()
+        && password.len() <= 1024
+        && !password.bytes().any(|byte| byte.is_ascii_control())
 }
 
 pub fn random_token() -> Result<String, String> {

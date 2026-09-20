@@ -1,13 +1,16 @@
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6, TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{self, Command, Stdio};
-use std::sync::Arc;
+use std::process;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use fwos_fwd_setup::identity::{self, Authentication, AuthenticationResult};
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
@@ -21,6 +24,18 @@ const BOOTSTRAP: &str = "/var/lib/fwos/bootstrapped";
 const HOSTNAME_FILE: &str = "/var/lib/fwos/hostname";
 const DESIRED: &str = "/var/lib/fwos/desired.toml";
 const STATIC_DIR: &str = "/usr/share/fwos-ui";
+const SESSION_COOKIE: &str = "__Host-fwos";
+const SESSION_LIFETIME: Duration = Duration::from_secs(30 * 60);
+
+struct Session {
+    authentication: Authentication,
+    expires: Instant,
+}
+
+fn sessions() -> &'static Mutex<HashMap<String, Session>> {
+    static SESSIONS: OnceLock<Mutex<HashMap<String, Session>>> = OnceLock::new();
+    SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
 fn main() {
     if let Err(err) = run() {
         eprintln!("fwos-ui: {err}");
@@ -148,8 +163,14 @@ fn handle_conn(tcp: TcpStream, cfg: Arc<ServerConfig>) -> Result<(), String> {
     let conn = ServerConnection::new(cfg).map_err(|e| format!("tls conn: {e}"))?;
     let mut tls = StreamOwned::new(conn, tcp);
     let req = read_request(&mut tls)?;
+    // Keep concurrent unauthenticated Bootstrap submissions from replacing the
+    // first administrator between applying networking and recording ownership.
+    static BOOTSTRAP_LOCK: Mutex<()> = Mutex::new(());
+    let _bootstrap_guard = (req.method == "POST"
+        && req.path.split('?').next() == Some("/api/bootstrap"))
+    .then(|| BOOTSTRAP_LOCK.lock().unwrap_or_else(|p| p.into_inner()));
     let resp = dispatch(&req);
-    write_response(&mut tls, resp.status, resp.ctype, &resp.body)?;
+    write_response(&mut tls, &resp)?;
     tls.conn.send_close_notify();
     let _ = tls.flush();
     if resp.stamp {
@@ -164,6 +185,7 @@ struct HttpRequest {
     method: String,
     path: String,
     body: Vec<u8>,
+    headers: HashMap<String, String>,
 }
 
 struct HttpResponse {
@@ -171,6 +193,7 @@ struct HttpResponse {
     ctype: &'static str,
     body: Vec<u8>,
     stamp: bool,
+    headers: Vec<(String, String)>,
 }
 
 fn read_request(stream: &mut impl Read) -> Result<HttpRequest, String> {
@@ -185,6 +208,9 @@ fn read_request(stream: &mut impl Read) -> Result<HttpRequest, String> {
         }
         buf.extend_from_slice(&tmp[..n]);
         if let Some(pos) = find_headers_end(&buf) {
+            if pos > 64 * 1024 {
+                return Err("headers too large".into());
+            }
             break pos;
         }
         if buf.len() > 64 * 1024 {
@@ -199,11 +225,22 @@ fn read_request(stream: &mut impl Read) -> Result<HttpRequest, String> {
     let method = req_parts.next().unwrap_or("").to_string();
     let path = req_parts.next().unwrap_or("/").to_string();
     let mut content_length = 0usize;
+    let mut request_headers = HashMap::new();
     for line in lines {
-        let lower = line.to_ascii_lowercase();
-        if let Some(v) = lower.strip_prefix("content-length:") {
-            content_length = v.trim().parse().unwrap_or(0);
+        let (name, value) = line.split_once(':').ok_or("invalid request header")?;
+        let name = name.to_ascii_lowercase();
+        if request_headers
+            .insert(name, value.trim().to_string())
+            .is_some()
+        {
+            return Err("duplicate request header".into());
         }
+    }
+    if request_headers.contains_key("transfer-encoding") {
+        return Err("unsupported transfer encoding".into());
+    }
+    if let Some(value) = request_headers.get("content-length") {
+        content_length = value.parse().map_err(|_| "invalid content length")?;
     }
     if content_length > 1024 * 1024 {
         return Err("body too large".into());
@@ -214,36 +251,49 @@ fn read_request(stream: &mut impl Read) -> Result<HttpRequest, String> {
             .read(&mut tmp)
             .map_err(|e| format!("read body: {e}"))?;
         if n == 0 {
-            break;
+            return Err("client closed during body".into());
         }
         body.extend_from_slice(&tmp[..n]);
     }
     body.truncate(content_length);
-    Ok(HttpRequest { method, path, body })
+    Ok(HttpRequest {
+        method,
+        path,
+        body,
+        headers: request_headers,
+    })
 }
 
 fn find_headers_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
-fn write_response(
-    stream: &mut impl Write,
-    status: u16,
-    ctype: &str,
-    body: &[u8],
-) -> Result<(), String> {
+fn write_response(stream: &mut impl Write, response: &HttpResponse) -> Result<(), String> {
+    let status = response.status;
+    let ctype = response.ctype;
+    let body = &response.body;
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
         409 => "Conflict",
+        415 => "Unsupported Media Type",
+        429 => "Too Many Requests",
         502 => "Bad Gateway",
+        503 => "Service Unavailable",
         _ => "Error",
     };
+    let headers = response
+        .headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}\r\n"))
+        .collect::<String>();
     write!(
         stream,
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nContent-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'\r\n{headers}\r\n",
         body.len()
     )
     .and_then(|_| stream.write_all(body))
@@ -253,10 +303,38 @@ fn write_response(
 
 fn dispatch(req: &HttpRequest) -> HttpResponse {
     let path = req.path.split('?').next().unwrap_or("/");
+    if req.method == "POST" && path.starts_with("/api/") {
+        if !same_origin_json(req) {
+            return json_response(
+                403,
+                json!({"ok": false, "error": "same-origin JSON required"}),
+            );
+        }
+    }
+    let authentication = authenticated(req);
+    if path.starts_with("/api/")
+        && path != "/api/bootstrap"
+        && path != "/api/login"
+        && (Path::new(BOOTSTRAP).exists() || path == "/api/logout")
+        && authentication.is_none()
+    {
+        return json_response(
+            401,
+            json!({"ok": false, "bootstrapped": Path::new(BOOTSTRAP).exists(), "error": "sign in required"}),
+        );
+    }
     match (req.method.as_str(), path) {
         ("GET", "/") | ("GET", "/index.html") => static_response("index.html"),
         ("GET", "/app.js") => static_response("app.js"),
-        ("GET", "/api/status") => json_response(200, status_json()),
+        ("GET", "/api/status") => {
+            let mut status = status_json();
+            if let Some(authentication) = authentication {
+                status["principal"] = json!(authentication.principal);
+            }
+            json_response(200, status)
+        }
+        ("POST", "/api/login") => login(req),
+        ("POST", "/api/logout") => logout(req),
         ("POST", "/api/bootstrap") => bootstrap(&req.body),
         ("GET", _) if path.starts_with("/api/") => {
             json_response(404, json!({"ok": false, "error": "not found"}))
@@ -267,12 +345,14 @@ fn dispatch(req: &HttpRequest) -> HttpResponse {
             ctype: "text/plain; charset=utf-8",
             body: b"not found".to_vec(),
             stamp: false,
+            headers: Vec::new(),
         },
         _ => HttpResponse {
             status: 405,
             ctype: "text/plain; charset=utf-8",
             body: b"method not allowed".to_vec(),
             stamp: false,
+            headers: Vec::new(),
         },
     }
 }
@@ -284,12 +364,14 @@ fn static_response(name: &str) -> HttpResponse {
             ctype: mime(name),
             body,
             stamp: false,
+            headers: Vec::new(),
         },
         Err(_) => HttpResponse {
             status: 404,
             ctype: "text/plain; charset=utf-8",
             body: b"not found".to_vec(),
             stamp: false,
+            headers: Vec::new(),
         },
     }
 }
@@ -316,10 +398,144 @@ fn json_response(status: u16, value: Value) -> HttpResponse {
         ctype: "application/json; charset=utf-8",
         body: value.to_string().into_bytes(),
         stamp: false,
+        headers: Vec::new(),
     }
 }
 
-#[derive(Debug, Deserialize)]
+fn same_origin_json(req: &HttpRequest) -> bool {
+    let is_json = req
+        .headers
+        .get("content-type")
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"));
+    let origin_matches = req.headers.get("origin").is_none_or(|origin| {
+        req.headers
+            .get("host")
+            .is_some_and(|host| origin == &format!("https://{host}"))
+    });
+    is_json
+        && origin_matches
+        && req
+            .headers
+            .get("sec-fetch-site")
+            .is_none_or(|site| site != "cross-site")
+}
+
+fn session_token(req: &HttpRequest) -> Option<&str> {
+    let mut matches = req.headers.get("cookie")?.split(';').filter_map(|cookie| {
+        let (name, value) = cookie.trim().split_once('=')?;
+        (name == SESSION_COOKIE
+            && value.len() == 64
+            && value.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then_some(value)
+    });
+    let token = matches.next()?;
+    matches.next().is_none().then_some(token)
+}
+
+fn authenticated(req: &HttpRequest) -> Option<Authentication> {
+    let token = session_token(req)?;
+    let mut sessions = sessions().lock().unwrap_or_else(|p| p.into_inner());
+    let now = Instant::now();
+    sessions.retain(|_, session| session.expires > now);
+    let authentication = sessions.get(token)?.authentication.clone();
+    drop(sessions);
+    identity::authorize_administrator(&authentication).then_some(authentication)
+}
+
+fn login(req: &HttpRequest) -> HttpResponse {
+    #[derive(Deserialize)]
+    struct Login {
+        source: String,
+        username: String,
+        password: String,
+    }
+    let credentials: Login = match serde_json::from_slice(&req.body) {
+        Ok(credentials) => credentials,
+        Err(_) => {
+            return json_response(400, json!({"ok": false, "error": "invalid login request"}))
+        }
+    };
+    // Bound concurrent expensive password checks; never queue an unbounded
+    // number of hashing requests from connection threads.
+    static LOGIN_LOCK: Mutex<()> = Mutex::new(());
+    let Ok(_login_guard) = LOGIN_LOCK.try_lock() else {
+        return json_response(
+            429,
+            json!({"ok": false, "error": "login busy; retry shortly"}),
+        );
+    };
+    let authentication = match identity::authenticate(
+        &credentials.source,
+        &credentials.username,
+        &credentials.password,
+    ) {
+        AuthenticationResult::Authenticated(authentication)
+            if identity::authorize_administrator(&authentication) =>
+        {
+            authentication
+        }
+        AuthenticationResult::Challenge(challenge) => {
+            return json_response(
+                403,
+                json!({"ok": false, "challenge": challenge, "error": "additional authentication required"}),
+            );
+        }
+        _ => return json_response(401, json!({"ok": false, "error": "login failed"})),
+    };
+    let token = match identity::random_token() {
+        Ok(token) => token,
+        Err(_) => return json_response(503, json!({"ok": false, "error": "login unavailable"})),
+    };
+    let mut sessions = sessions().lock().unwrap_or_else(|p| p.into_inner());
+    let now = Instant::now();
+    sessions.retain(|_, session| session.expires > now);
+    if let Some(previous) = session_token(req) {
+        sessions.remove(previous);
+    }
+    if sessions.len() >= 1024 {
+        return json_response(
+            503,
+            json!({"ok": false, "error": "session capacity reached"}),
+        );
+    }
+    let mut response = json_response(
+        200,
+        json!({"ok": true, "principal": authentication.principal}),
+    );
+    sessions.insert(
+        token.clone(),
+        Session {
+            authentication,
+            expires: now + SESSION_LIFETIME,
+        },
+    );
+    response.headers.push((
+        "Set-Cookie".into(),
+        format!(
+            "{SESSION_COOKIE}={token}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age={}",
+            SESSION_LIFETIME.as_secs()
+        ),
+    ));
+    response
+}
+
+fn logout(req: &HttpRequest) -> HttpResponse {
+    if let Some(token) = session_token(req) {
+        sessions()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(token);
+    }
+    let mut response = json_response(200, json!({"ok": true}));
+    response.headers.push((
+        "Set-Cookie".into(),
+        format!("{SESSION_COOKIE}=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0"),
+    ));
+    response
+}
+
+#[derive(Deserialize)]
 struct Bootstrap {
     hostname: String,
     admin: String,
@@ -387,7 +603,7 @@ fn bootstrap(body: &[u8]) -> HttpResponse {
     if let Err(err) = set_hostname(hostname) {
         return json_response(502, json!({"ok": false, "error": err}));
     }
-    if let Err(err) = create_admin(admin, &req.password) {
+    if let Err(err) = identity::create_first_administrator(admin, &req.password) {
         return json_response(502, json!({"ok": false, "error": err}));
     }
     let mut desired = json!({
@@ -413,6 +629,7 @@ fn bootstrap(body: &[u8]) -> HttpResponse {
                     ctype: "application/json; charset=utf-8",
                     body: json!({"ok": true}).to_string().into_bytes(),
                     stamp: true,
+                    headers: Vec::new(),
                 }
             } else {
                 json_response(502, reply)
@@ -540,58 +757,14 @@ fn stamp_bootstrap() -> Result<(), String> {
 }
 
 fn set_hostname(name: &str) -> Result<(), String> {
-    fs::write("/etc/hostname", format!("{name}\n"))
-        .map_err(|e| format!("write /etc/hostname: {e}"))?;
     if let Some(dir) = Path::new(HOSTNAME_FILE).parent() {
         fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
     }
     fs::write(HOSTNAME_FILE, format!("{name}\n"))
         .map_err(|e| format!("write {HOSTNAME_FILE}: {e}"))?;
-    // The UI addon has no CAP_SYS_ADMIN; sethostname(2) fails here. Writing
-    // /var/lib/fwos/hostname is the product path (fwos-hostname.service).
-    let _ = Command::new("hostname")
-        .arg(name)
-        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
-        .status();
+    // The Host hostname program consumes this file. The UI does not need a
+    // writable Host /etc mount or privileges for OS account administration.
     Ok(())
-}
-
-fn create_admin(name: &str, password: &str) -> Result<(), String> {
-    let add = Command::new("useradd")
-        .args(["-m", "-G", "wheel", name])
-        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
-        .output()
-        .map_err(|e| format!("useradd: {e}"))?;
-    if !add.status.success() {
-        let err = String::from_utf8_lossy(&add.stderr);
-        if !err.contains("already exists") {
-            return Err(format!("useradd {name}: {}", err.trim()));
-        }
-    }
-    let mut child = Command::new("chpasswd")
-        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("chpasswd: {e}"))?;
-    child
-        .stdin
-        .as_mut()
-        .ok_or_else(|| "chpasswd stdin".to_string())?
-        .write_all(format!("{name}:{password}\n").as_bytes())
-        .map_err(|e| format!("chpasswd write: {e}"))?;
-    let out = child
-        .wait_with_output()
-        .map_err(|e| format!("chpasswd wait: {e}"))?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "chpasswd failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ))
-    }
 }
 
 fn netd_apply(body: &Value) -> Result<Value, String> {
@@ -727,14 +900,7 @@ fn valid_hostname(name: &str) -> bool {
 }
 
 fn valid_admin(name: &str) -> bool {
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    (first.is_ascii_lowercase() || first == '_')
-        && name.len() <= 32
-        && name != "root"
-        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+    identity::valid_username(name)
 }
 
 #[cfg(test)]
@@ -913,6 +1079,7 @@ mod tests {
             method: "POST".into(),
             path: "/api/update".into(),
             body: b"{\"image\":\"10.0.2.2:5000/fwos:next\"}".to_vec(),
+            headers: HashMap::from([("content-type".into(), "application/json".into())]),
         };
         let resp = dispatch(&req);
         assert_eq!(resp.status, 404);

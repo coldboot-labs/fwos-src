@@ -4,18 +4,13 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::sync::Mutex;
+
+use fwos_fwd_setup::identity::{self, Authentication, AuthenticationResult};
 
 const CGNAT: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 0);
 const BOOTSTRAPPED: &str = "/var/lib/fwos/bootstrapped";
 const DESIRED: &str = "/var/lib/fwos/desired.toml";
 const HOSTNAME_FILE: &str = "/var/lib/fwos/hostname";
-
-// libxcrypt; Fedora shadow hashes are yescrypt (`$y$`).
-#[link(name = "crypt")]
-extern "C" {
-    fn crypt(key: *const libc::c_char, salt: *const libc::c_char) -> *mut libc::c_char;
-}
 
 pub fn run() -> Result<(), String> {
     if bootstrapped() {
@@ -208,25 +203,98 @@ fn admin_run() -> Result<(), String> {
         if user.is_empty() {
             continue;
         }
-        write!(stdout, "password: ").map_err(|e| e.to_string())?;
-        stdout.flush().map_err(|e| e.to_string())?;
-        let password = match read_line_poll(fd, &mut acc, -1)? {
-            Input::Eof => return Ok(()),
-            Input::Timeout => continue,
-            Input::Line(line) => line.trim_end_matches(['\r', '\n']).to_string(),
+        let Some(password) = read_password(&mut stdout, fd, &mut acc)? else {
+            return Ok(());
         };
-        if verify_admin(&user, &password) {
-            admin_session(&mut stdout, fd, &mut acc)?;
-        } else {
-            writeln!(stdout, "login failed").map_err(|e| e.to_string())?;
-            stdout.flush().map_err(|e| e.to_string())?;
+        let authentication = identity::authenticate(identity::LOCAL_SOURCE, &user, &password);
+        drop(password);
+        match authentication {
+            AuthenticationResult::Authenticated(authentication)
+                if identity::authorize_administrator(&authentication) =>
+            {
+                admin_session(&mut stdout, fd, &mut acc, &authentication)?;
+            }
+            AuthenticationResult::Challenge(_) => {
+                writeln!(
+                    stdout,
+                    "additional authentication required; console login unavailable"
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            _ => {
+                writeln!(stdout, "login failed").map_err(|e| e.to_string())?;
+            }
         }
+        stdout.flush().map_err(|e| e.to_string())?;
     }
 }
 
-fn admin_session(out: &mut impl Write, fd: i32, acc: &mut Vec<u8>) -> Result<(), String> {
+/// Restore terminal settings even if password input fails or the console exits.
+struct HiddenInput {
+    fd: i32,
+    previous: libc::termios,
+}
+
+impl HiddenInput {
+    fn new(fd: i32) -> Result<Self, String> {
+        let mut previous = unsafe { std::mem::zeroed::<libc::termios>() };
+        if unsafe { libc::tcgetattr(fd, &mut previous) } != 0 {
+            return Err(format!(
+                "read console terminal settings: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        let mut hidden = previous;
+        hidden.c_lflag &= !(libc::ECHO | libc::ECHONL);
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &hidden) } != 0 {
+            return Err(format!(
+                "hide console input: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        Ok(Self { fd, previous })
+    }
+}
+
+impl Drop for HiddenInput {
+    fn drop(&mut self) {
+        unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.previous) };
+    }
+}
+
+fn read_password(
+    out: &mut impl Write,
+    fd: i32,
+    acc: &mut Vec<u8>,
+) -> Result<Option<String>, String> {
+    // Hide input before exposing the prompt, including to very fast serial clients.
+    let hidden = HiddenInput::new(fd)?;
+    write!(out, "password: ").map_err(|e| e.to_string())?;
+    out.flush().map_err(|e| e.to_string())?;
+    let password = loop {
+        match read_line_poll(fd, acc, -1)? {
+            Input::Eof => break None,
+            Input::Timeout => continue,
+            Input::Line(line) => break Some(line),
+        }
+    };
+    drop(hidden);
+    writeln!(out).map_err(|e| e.to_string())?;
+    Ok(password)
+}
+
+fn admin_session(
+    out: &mut impl Write,
+    fd: i32,
+    acc: &mut Vec<u8>,
+    authentication: &Authentication,
+) -> Result<(), String> {
     print_admin_status(out)?;
     loop {
+        if !identity::authorize_administrator(authentication) {
+            writeln!(out, "session authorization expired").map_err(|e| e.to_string())?;
+            return Ok(());
+        }
         write!(out, "fwos> ").map_err(|e| e.to_string())?;
         out.flush().map_err(|e| e.to_string())?;
         let line = match read_line_poll(fd, acc, -1)? {
@@ -234,6 +302,11 @@ fn admin_session(out: &mut impl Write, fd: i32, acc: &mut Vec<u8>) -> Result<(),
             Input::Timeout => continue,
             Input::Line(line) => line,
         };
+        // An account can be changed while this console is waiting for input.
+        if !identity::authorize_administrator(authentication) {
+            writeln!(out, "session authorization expired").map_err(|e| e.to_string())?;
+            return Ok(());
+        }
         match admin_handle(out, line.trim())? {
             AdminAct::Continue => {}
             AdminAct::Logout => return Ok(()),
@@ -409,77 +482,6 @@ fn netns_exists(name: &str) -> bool {
 
 fn netd_running() -> bool {
     UnixStream::connect("/var/lib/fwos/netd.sock").is_ok()
-}
-
-fn verify_admin(name: &str, password: &str) -> bool {
-    if name == "root" || name.is_empty() || password.is_empty() {
-        return false;
-    }
-    if !user_is_admin(name) {
-        return false;
-    }
-    let Some(hash) = shadow_hash(name) else {
-        return false;
-    };
-    crypt_ok(password, &hash)
-}
-
-fn user_is_admin(name: &str) -> bool {
-    let Ok(group) = fs::read_to_string("/etc/group") else {
-        return false;
-    };
-    for line in group.lines() {
-        let Some(rest) = line.strip_prefix("wheel:") else {
-            continue;
-        };
-        let members = rest.rsplit(':').next().unwrap_or("");
-        return members.split(',').any(|m| m == name);
-    }
-    false
-}
-
-fn shadow_hash(name: &str) -> Option<String> {
-    let raw = fs::read_to_string("/etc/shadow").ok()?;
-    for line in raw.lines() {
-        let mut parts = line.split(':');
-        if parts.next()? != name {
-            continue;
-        }
-        let hash = parts.next()?.to_string();
-        if hash.is_empty() || hash == "*" || hash == "!" || hash.starts_with('!') {
-            return None;
-        }
-        return Some(hash);
-    }
-    None
-}
-
-fn crypt_ok(password: &str, setting: &str) -> bool {
-    let Ok(pw) = std::ffi::CString::new(password) else {
-        return false;
-    };
-    let Ok(salt) = std::ffi::CString::new(setting) else {
-        return false;
-    };
-    static LOCK: Mutex<()> = Mutex::new(());
-    let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let enc = unsafe { crypt(pw.as_ptr(), salt.as_ptr()) };
-    if enc.is_null() {
-        return false;
-    }
-    let got = unsafe { std::ffi::CStr::from_ptr(enc) };
-    eq_ct(got.to_bytes(), setting.as_bytes())
-}
-
-fn eq_ct(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut x = 0u8;
-    for (p, q) in a.iter().zip(b) {
-        x |= p ^ q;
-    }
-    x == 0
 }
 
 enum Input {
@@ -807,13 +809,6 @@ mod tests {
         let s = String::from_utf8(out).unwrap();
         assert!(!s.contains("unknown command"));
         assert!(s.contains("update.sock"));
-    }
-
-    #[test]
-    fn eq_ct_matches_only_same_bytes() {
-        assert!(eq_ct(b"abc", b"abc"));
-        assert!(!eq_ct(b"abc", b"abd"));
-        assert!(!eq_ct(b"ab", b"abc"));
     }
 
     #[test]

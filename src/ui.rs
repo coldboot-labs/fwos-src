@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener, TcpStream};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -138,10 +139,58 @@ fn wildcard_bind_addrs() -> Result<Vec<BindAddr>, String> {
 fn bind_one(addr: &BindAddr) -> io::Result<TcpListener> {
     match addr.ip {
         IpAddr::V4(ip) => TcpListener::bind((ip, 443)),
-        IpAddr::V6(ip) => {
-            TcpListener::bind(SocketAddr::V6(SocketAddrV6::new(ip, 443, 0, addr.scope)))
+        IpAddr::V6(ip) => bind_ipv6_only(ip, addr.scope),
+    }
+}
+
+fn bind_ipv6_only(ip: Ipv6Addr, scope: u32) -> io::Result<TcpListener> {
+    // The separate IPv4 wildcard already owns port 443. Linux's default
+    // dual-stack IPv6 wildcard would collide with it, silently losing IPv6.
+    let raw = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // Own the descriptor immediately so every error path closes it.
+    let socket = unsafe { OwnedFd::from_raw_fd(raw) };
+    let enabled: libc::c_int = 1;
+    for (level, option) in [
+        (libc::IPPROTO_IPV6, libc::IPV6_V6ONLY),
+        (libc::SOL_SOCKET, libc::SO_REUSEADDR),
+    ] {
+        if unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                level,
+                option,
+                std::ptr::addr_of!(enabled).cast(),
+                std::mem::size_of_val(&enabled) as libc::socklen_t,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
         }
     }
+    let address = libc::sockaddr_in6 {
+        sin6_family: libc::AF_INET6 as libc::sa_family_t,
+        sin6_port: 443_u16.to_be(),
+        sin6_flowinfo: 0,
+        sin6_addr: libc::in6_addr {
+            s6_addr: ip.octets(),
+        },
+        sin6_scope_id: scope,
+    };
+    if unsafe {
+        libc::bind(
+            socket.as_raw_fd(),
+            std::ptr::addr_of!(address).cast(),
+            std::mem::size_of_val(&address) as libc::socklen_t,
+        )
+    } != 0
+        || unsafe { libc::listen(socket.as_raw_fd(), libc::SOMAXCONN) } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(socket.into())
 }
 
 fn serve(listener: TcpListener, cfg: Arc<ServerConfig>) {

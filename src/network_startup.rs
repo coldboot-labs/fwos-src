@@ -5,9 +5,10 @@ use std::process;
 use super::network::{
     add_addr, ip_cmd, is_ethernet, link_exists, link_name, lock_unopted, run_ip, write_sysctl,
 };
-use super::{host_pull_nft, nft_apply, FWD_MGMT_VETH, MGMT_FWD_IP};
+use super::network::{FWD_MGMT_VETH, MGMT_FWD_IP, MGMT_FWD_IP6};
 
-const HOST_NS: &str = "/run/host-netns";
+const HOST_NS: &str = "/proc/1/ns/net";
+const FWD_NS: &str = "/run/netns/fwd";
 const MGMT_NS: &str = "/run/netns/mgmt";
 const HOST_VETH: &str = "h0mgmt";
 const MGMT_VETH: &str = "m0mgmt";
@@ -19,9 +20,15 @@ const FWD_MGMT_ADDR: &str = "169.254.127.5/30";
 const MGMT_FWD_ADDR: &str = "169.254.127.6/30";
 const FWD_MGMT_GW: &str = "169.254.127.5";
 const FWD_MGMT_ADDR6: &str = "fd53:1:1::5/64";
-const MGMT_FWD_ADDR6: &str = "fd53:1:1::6/64";
 
-pub(super) fn ensure_in_fwd(name: &str) -> Result<(), String> {
+pub(super) fn prepare() -> Result<(), String> {
+    with_netns(FWD_NS, || {
+        setup_plumbing()?;
+        claim_traffic_nics()
+    })
+}
+
+fn ensure_in_fwd(name: &str) -> Result<(), String> {
     if link_exists(name)? {
         return Ok(());
     }
@@ -57,36 +64,6 @@ fn with_mgmt_net<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, String> 
     with_netns(MGMT_NS, f)
 }
 
-pub(super) fn capture_host_ipv4(name: &str) -> Result<(Vec<String>, Option<String>), String> {
-    with_host_net(|| {
-        let addr_out = ip_cmd()
-            .args(["-o", "addr", "show", "dev", name])
-            .output()
-            .map_err(|e| format!("ip addr show {name}: {e}"))?;
-        let mut addrs = Vec::new();
-        for word in String::from_utf8_lossy(&addr_out.stdout).split_whitespace() {
-            if word.contains('/') && word.contains('.') {
-                addrs.push(word.to_string());
-            }
-        }
-        let route_out = ip_cmd()
-            .args(["-o", "route", "show", "default"])
-            .output()
-            .map_err(|e| format!("ip route: {e}"))?;
-        let route = String::from_utf8_lossy(&route_out.stdout);
-        let gw = if route.contains(name) {
-            route
-                .split_whitespace()
-                .skip_while(|w| *w != "via")
-                .nth(1)
-                .map(str::to_string)
-        } else {
-            None
-        };
-        Ok((addrs, gw))
-    })
-}
-
 fn ensure_host_mgmt_veth() -> Result<(), String> {
     with_host_net(|| {
         let status = ip_cmd()
@@ -115,7 +92,7 @@ fn ensure_host_mgmt_veth() -> Result<(), String> {
     Ok(())
 }
 
-pub(super) fn host_default_via_mgmt() -> Result<(), String> {
+fn host_default_via_mgmt() -> Result<(), String> {
     with_host_net(|| run_ip(&["route", "replace", "default", "via", HOST_VETH_GW]))
 }
 
@@ -138,7 +115,7 @@ fn ensure_fwd_mgmt_veth() -> Result<(), String> {
     run_ip(&["link", "set", FWD_MGMT_VETH, "up"])?;
     with_mgmt_net(|| {
         add_addr(MGMT_FWD_VETH, MGMT_FWD_ADDR)?;
-        add_addr(MGMT_FWD_VETH, MGMT_FWD_ADDR6)?;
+        add_addr(MGMT_FWD_VETH, &format!("{MGMT_FWD_IP6}/64"))?;
         run_ip(&["link", "set", MGMT_FWD_VETH, "up"])?;
         Ok(())
     })?;
@@ -154,22 +131,24 @@ fn setns_net(fd: i32) -> Result<(), String> {
     }
 }
 
-pub(super) fn setup_plumbing() -> Result<(), String> {
+fn setup_plumbing() -> Result<(), String> {
     ensure_fwd_mgmt_veth()?;
     ensure_host_mgmt_veth()?;
     host_default_via_mgmt()?;
     with_mgmt_net(|| {
-        let _ = run_ip(&["route", "replace", "default", "via", FWD_MGMT_GW]);
-        let _ = fs::write("/proc/sys/net/ipv4/ip_forward", "1");
+        run_ip(&["route", "replace", "default", "via", FWD_MGMT_GW])?;
+        fs::write("/proc/sys/net/ipv4/ip_forward", "1")
+            .map_err(|e| format!("enable forwarding in mgmt: {e}"))?;
         Ok(())
     })?;
-    let _ = fs::write("/proc/sys/net/ipv4/ip_forward", "1");
-    write_sysctl("all", "ipv4", "rp_filter", "2");
-    write_sysctl("default", "ipv4", "rp_filter", "2");
-    write_sysctl(FWD_MGMT_VETH, "ipv4", "rp_filter", "2");
+    fs::write("/proc/sys/net/ipv4/ip_forward", "1")
+        .map_err(|e| format!("enable forwarding in fwd: {e}"))?;
+    write_sysctl("all", "ipv4", "rp_filter", "2")?;
+    write_sysctl("default", "ipv4", "rp_filter", "2")?;
+    write_sysctl(FWD_MGMT_VETH, "ipv4", "rp_filter", "2")?;
     // Host-netns pull sources live on h0mgmt (169.254.127.0/30), not on the
     // fwd↔mgmt /30. Return traffic after masquerade un-SNAT needs this route.
-    let _ = run_ip(&[
+    run_ip(&[
         "route",
         "replace",
         "169.254.127.0/30",
@@ -177,18 +156,16 @@ pub(super) fn setup_plumbing() -> Result<(), String> {
         MGMT_FWD_IP,
         "dev",
         FWD_MGMT_VETH,
-    ]);
-    let _ = nft_apply("destroy table ip fwos-pull\n");
-    let _ = nft_apply(&host_pull_nft());
+    ])?;
     Ok(())
 }
 
-pub(super) fn claim_traffic_nics() -> Result<(), String> {
+fn claim_traffic_nics() -> Result<(), String> {
     let names = host_netns_ethernet()?;
     for name in names {
         ensure_in_fwd(&name)?;
         lock_unopted(&name)?;
-        let _ = run_ip(&["link", "set", &name, "up"]);
+        run_ip(&["link", "set", &name, "up"])?;
     }
     Ok(())
 }
@@ -199,6 +176,12 @@ fn host_netns_ethernet() -> Result<Vec<String>, String> {
             .args(["-o", "link", "show"])
             .output()
             .map_err(|e| format!("ip link show: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "list Host Traffic NICs: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
         let mut names = Vec::new();
         for line in String::from_utf8_lossy(&out.stdout).lines() {
             let name = link_name(line);

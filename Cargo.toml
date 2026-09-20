@@ -3,7 +3,7 @@ name = "fwos-fwd-setup"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Host program oneshot: create empty fwd and mgmt netns"
+description = "Network startup program: prepare namespaces, fixed links, and Traffic NIC placement"
 
 [dependencies]
 libc = "0.2"

@@ -1,3 +1,6 @@
+mod network;
+mod network_startup;
+
 use std::path::Path;
 use std::process::{self, Command};
 
@@ -15,13 +18,13 @@ fn run() -> Result<(), String> {
         enable_v4_forward(name)?;
         lock_autoconf(name)?;
     }
-    Ok(())
+    network_startup::prepare()
 }
 
 fn lock_autoconf(name: &str) -> Result<(), String> {
     let script = "echo 0 > /proc/sys/net/ipv6/conf/all/accept_ra; echo 0 > /proc/sys/net/ipv6/conf/default/accept_ra; echo 0 > /proc/sys/net/ipv6/conf/all/autoconf; echo 0 > /proc/sys/net/ipv6/conf/default/autoconf; echo 2 > /proc/sys/net/ipv4/conf/all/rp_filter; echo 2 > /proc/sys/net/ipv4/conf/default/rp_filter";
     let status = Command::new("ip")
-        .args(["netns", "exec", name, "sh", "-c", script])
+        .args(["netns", "exec", name, "sh", "-eu", "-c", script])
         .status()
         .map_err(|e| format!("lock autoconf in {name}: {e}"))?;
     if status.success() {
@@ -66,6 +69,7 @@ fn enable_v4_forward(name: &str) -> Result<(), String> {
             "exec",
             name,
             "sh",
+            "-eu",
             "-c",
             "echo 1 > /proc/sys/net/ipv4/ip_forward; echo 1 > /proc/sys/net/ipv6/conf/all/forwarding",
         ])

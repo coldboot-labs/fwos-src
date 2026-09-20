@@ -1,6 +1,10 @@
 use std::fs;
 use std::process::Command;
 
+pub(crate) const FWD_MGMT_VETH: &str = "f0mgmt";
+pub(crate) const MGMT_FWD_IP: &str = "169.254.127.6";
+pub(crate) const MGMT_FWD_IP6: &str = "fd53:1:1::6";
+
 pub(crate) fn link_exists(name: &str) -> Result<bool, String> {
     let status = ip_cmd()
         .args(["link", "show", "dev", name])
@@ -63,14 +67,13 @@ pub(crate) fn is_ethernet(name: &str) -> bool {
 }
 
 pub(crate) fn lock_unopted(nic: &str) -> Result<(), String> {
-    write_sysctl(nic, "ipv6", "accept_ra", "0");
-    write_sysctl(nic, "ipv6", "autoconf", "0");
-    write_sysctl(nic, "ipv4", "rp_filter", "2");
-    let _ = run_ip(&["addr", "flush", "dev", nic]);
-    Ok(())
+    write_sysctl(nic, "ipv6", "accept_ra", "0")?;
+    write_sysctl(nic, "ipv6", "autoconf", "0")?;
+    write_sysctl(nic, "ipv4", "rp_filter", "2")?;
+    run_ip(&["addr", "flush", "dev", nic])
 }
 
-pub(crate) fn write_sysctl(nic: &str, fam: &str, key: &str, val: &str) {
+pub(crate) fn write_sysctl(nic: &str, fam: &str, key: &str, val: &str) -> Result<(), String> {
     let path = format!("/proc/sys/net/{fam}/conf/{nic}/{key}");
-    let _ = fs::write(&path, val);
+    fs::write(&path, val).map_err(|e| format!("write {path}: {e}"))
 }

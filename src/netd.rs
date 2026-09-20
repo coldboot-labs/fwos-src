@@ -1,11 +1,8 @@
-mod netd_startup;
 mod network;
 
-use netd_startup::{
-    capture_host_ipv4, claim_traffic_nics, ensure_in_fwd, host_default_via_mgmt, setup_plumbing,
-};
 use network::{
     add_addr, ip_cmd, is_ethernet, link_exists, link_name, lock_unopted, run_ip, write_sysctl,
+    FWD_MGMT_VETH, MGMT_FWD_IP, MGMT_FWD_IP6,
 };
 
 use std::fs::{self, File};
@@ -24,9 +21,6 @@ const SOCK: &str = "/var/lib/fwos/netd.sock";
 const DESIRED: &str = "/var/lib/fwos/desired.toml";
 const OPT_FILE: &str = "/var/lib/fwos/first-boot-opt.json";
 const BOOTSTRAPPED: &str = "/var/lib/fwos/bootstrapped";
-const FWD_MGMT_VETH: &str = "f0mgmt";
-const MGMT_FWD_IP: &str = "169.254.127.6";
-const MGMT_FWD_IP6: &str = "fd53:1:1::6";
 const CGNAT: [u8; 2] = [100, 64];
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -120,8 +114,7 @@ fn run() -> Result<(), String> {
         .map_err(|e| format!("chmod {SOCK}: {e}"))?;
     let gid = wheel_gid().unwrap_or(10);
     chown(path, Some(0), Some(gid)).map_err(|e| format!("chown {SOCK}: {e}"))?;
-    setup_plumbing()?;
-    claim_traffic_nics()?;
+    program_host_pull()?;
     if Path::new(DESIRED).exists() {
         let raw = fs::read_to_string(DESIRED).map_err(|e| format!("read {DESIRED}: {e}"))?;
         let mut state: DesiredState =
@@ -379,10 +372,9 @@ fn apply(state: &mut DesiredState) -> Result<(), String> {
     }
     merge_lan_prefix_addr(state);
     discard_opt()?;
-    setup_plumbing()?;
     for iface in &state.interfaces {
         if iface.vlan.is_none() {
-            ensure_in_fwd(&iface.name)?;
+            require_in_fwd(&iface.name)?;
             run_ip(&["link", "set", &iface.name, "up"])?;
             let extra = saved
                 .iter()
@@ -395,13 +387,22 @@ fn apply(state: &mut DesiredState) -> Result<(), String> {
         }
     }
     program_vlans(state)?;
-    host_default_via_mgmt()?;
     program_wg(state)?;
     program_routes(state)?;
     program_qdiscs(state)?;
     program_lan_services(state)?;
     persist(state)?;
     program_nft(state)
+}
+
+fn require_in_fwd(name: &str) -> Result<(), String> {
+    if link_exists(name)? {
+        Ok(())
+    } else {
+        Err(format!(
+            "Traffic NIC {name} is missing from fwd; Network startup preparation is incomplete"
+        ))
+    }
 }
 
 fn program_vlans(state: &DesiredState) -> Result<(), String> {
@@ -757,6 +758,11 @@ fn program_qdiscs(state: &DesiredState) -> Result<(), String> {
     Ok(())
 }
 
+fn program_host_pull() -> Result<(), String> {
+    nft_apply("destroy table ip fwos-pull\n")?;
+    nft_apply(&host_pull_nft())
+}
+
 fn host_pull_nft() -> String {
     String::from(
         "table ip fwos-pull {\n  chain postrouting {\n    type nat hook postrouting priority srcnat; policy accept;\n    ip saddr 169.254.127.0/30 masquerade\n  }\n}\n",
@@ -811,8 +817,7 @@ fn apply_opt(opt: &FirstBootOpt) -> Result<(), String> {
             teardown_opt(&prev)?;
         }
     }
-    setup_plumbing()?;
-    ensure_in_fwd(&opt.nic)?;
+    require_in_fwd(&opt.nic)?;
     run_ip(&["link", "set", &opt.nic, "up"])?;
     match opt.mode.as_str() {
         "static" => {
@@ -823,8 +828,8 @@ fn apply_opt(opt: &FirstBootOpt) -> Result<(), String> {
         "slaac" => {
             // fwd has IPv6 forwarding on (Host pull / DNAT). Kernel ignores
             // accept_ra=1 on a forwarding interface; 2 still learns RAs.
-            write_sysctl(&opt.nic, "ipv6", "accept_ra", "2");
-            write_sysctl(&opt.nic, "ipv6", "autoconf", "1");
+            write_sysctl(&opt.nic, "ipv6", "accept_ra", "2")?;
+            write_sysctl(&opt.nic, "ipv6", "autoconf", "1")?;
         }
         other => return Err(format!("unknown opt mode {other}")),
     }
@@ -849,8 +854,8 @@ fn wait_expose_cidrs(nic: &str) -> Result<Vec<String>, String> {
 fn teardown_opt(opt: &FirstBootOpt) -> Result<(), String> {
     stop_dhclient();
     if opt.mode == "slaac" {
-        write_sysctl(&opt.nic, "ipv6", "accept_ra", "0");
-        write_sysctl(&opt.nic, "ipv6", "autoconf", "0");
+        write_sysctl(&opt.nic, "ipv6", "accept_ra", "0")?;
+        write_sysctl(&opt.nic, "ipv6", "autoconf", "0")?;
     }
     if link_exists(&opt.nic)? {
         lock_unopted(&opt.nic)?;
@@ -1108,13 +1113,6 @@ fn iface_cidrs(name: &str) -> Result<Vec<String>, String> {
 }
 
 fn capture_ipv4(name: &str) -> Result<(Vec<String>, Option<String>), String> {
-    if link_exists(name)? {
-        return capture_ipv4_here(name);
-    }
-    capture_host_ipv4(name)
-}
-
-fn capture_ipv4_here(name: &str) -> Result<(Vec<String>, Option<String>), String> {
     let addr_out = ip_cmd()
         .args(["-o", "addr", "show", "dev", name])
         .output()

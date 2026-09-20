@@ -19,6 +19,7 @@ const MGMT_FWD_VETH: &str = "m1mgmt";
 const FWD_MGMT_ADDR: &str = "169.254.127.5/30";
 const MGMT_FWD_ADDR: &str = "169.254.127.6/30";
 const FWD_MGMT_GW: &str = "169.254.127.5";
+const FWD_MGMT_GW6: &str = "fd53:1:1::5";
 const FWD_MGMT_ADDR6: &str = "fd53:1:1::5/64";
 
 pub(super) fn prepare() -> Result<(), String> {
@@ -137,6 +138,7 @@ fn setup_plumbing() -> Result<(), String> {
     host_default_via_mgmt()?;
     with_mgmt_net(|| {
         run_ip(&["route", "replace", "default", "via", FWD_MGMT_GW])?;
+        run_ip(&["-6", "route", "replace", "default", "via", FWD_MGMT_GW6])?;
         fs::write("/proc/sys/net/ipv4/ip_forward", "1")
             .map_err(|e| format!("enable forwarding in mgmt: {e}"))?;
         Ok(())

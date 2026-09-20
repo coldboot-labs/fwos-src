@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 const IDENTITY: &str = "/var/lib/fwos/identity.json";
 const BOOTSTRAPPED: &str = "/var/lib/fwos/bootstrapped";
 pub const LOCAL_SOURCE: &str = "local";
+// libxcrypt's CRYPT_MAX_PASSPHRASE_SIZE is 512, including the terminating NUL.
+pub const MAX_PASSWORD_BYTES: usize = 511;
 
 #[link(name = "crypt")]
 extern "C" {
@@ -273,7 +275,7 @@ pub fn valid_username(name: &str) -> bool {
 /// ASCII controls are terminal input commands, not usable password characters.
 pub fn valid_password(password: &str) -> bool {
     !password.is_empty()
-        && password.len() <= 1024
+        && password.len() <= MAX_PASSWORD_BYTES
         && !password.bytes().any(|byte| byte.is_ascii_control())
 }
 

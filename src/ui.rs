@@ -594,7 +594,7 @@ fn bootstrap(body: &[u8]) -> HttpResponse {
     if !identity::valid_password(&req.password) {
         return json_response(
             400,
-            json!({"ok": false, "error": "password must contain 1–1024 bytes without ASCII control characters"}),
+            json!({"ok": false, "error": format!("password must contain 1–{} bytes without ASCII control characters", identity::MAX_PASSWORD_BYTES)}),
         );
     }
     if req.interfaces.is_empty() {

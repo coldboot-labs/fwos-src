@@ -1,6 +1,8 @@
 use std::fs;
 use std::process::Command;
 
+use serde::Deserialize;
+
 pub(crate) const FWD_MGMT_VETH: &str = "f0mgmt";
 pub(crate) const MGMT_FWD_IP: &str = "169.254.127.6";
 pub(crate) const MGMT_FWD_IP6: &str = "fd53:1:1::6";
@@ -54,16 +56,39 @@ pub(crate) fn ip_cmd() -> Command {
     cmd
 }
 
-pub(crate) fn link_name(line: &str) -> String {
-    let name = line.split(':').nth(1).unwrap_or("").trim();
-    name.split('@').next().unwrap_or(name).to_string()
+#[derive(Deserialize)]
+struct Link {
+    ifname: String,
+    link_type: String,
+    #[serde(default)]
+    linkinfo: LinkInfo,
 }
 
-pub(crate) fn is_ethernet(name: &str) -> bool {
-    name.starts_with("enp")
-        || name.starts_with("eth")
-        || name.starts_with("ens")
-        || name.starts_with("eno")
+#[derive(Default, Deserialize)]
+struct LinkInfo {
+    info_kind: Option<String>,
+}
+
+pub(crate) fn traffic_nic_names() -> Result<Vec<String>, String> {
+    let output = ip_cmd()
+        .args(["-j", "-d", "link", "show"])
+        .output()
+        .map_err(|e| format!("list Traffic NICs: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "list Traffic NICs: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let links: Vec<Link> = serde_json::from_slice(&output.stdout)
+        .map_err(|e| format!("parse Traffic NIC metadata: {e}"))?;
+    Ok(links
+        .into_iter()
+        // Physical, virtio and VF interfaces have Ethernet framing but no
+        // virtual link kind. This also excludes our fixed veth plumbing.
+        .filter(|link| link.link_type == "ether" && link.linkinfo.info_kind.is_none())
+        .map(|link| link.ifname)
+        .collect())
 }
 
 pub(crate) fn lock_unopted(nic: &str) -> Result<(), String> {

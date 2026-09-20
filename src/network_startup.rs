@@ -3,7 +3,7 @@ use std::os::fd::AsRawFd;
 use std::process;
 
 use super::network::{
-    add_addr, ip_cmd, is_ethernet, link_exists, link_name, lock_unopted, run_ip, write_sysctl,
+    add_addr, ip_cmd, link_exists, lock_unopted, run_ip, traffic_nic_names, write_sysctl,
 };
 use super::network::{FWD_MGMT_VETH, MGMT_FWD_IP, MGMT_FWD_IP6};
 
@@ -161,34 +161,11 @@ fn setup_plumbing() -> Result<(), String> {
 }
 
 fn claim_traffic_nics() -> Result<(), String> {
-    let names = host_netns_ethernet()?;
+    let names = with_host_net(traffic_nic_names)?;
     for name in names {
         ensure_in_fwd(&name)?;
         lock_unopted(&name)?;
         run_ip(&["link", "set", &name, "up"])?;
     }
     Ok(())
-}
-
-fn host_netns_ethernet() -> Result<Vec<String>, String> {
-    with_host_net(|| {
-        let out = ip_cmd()
-            .args(["-o", "link", "show"])
-            .output()
-            .map_err(|e| format!("ip link show: {e}"))?;
-        if !out.status.success() {
-            return Err(format!(
-                "list Host Traffic NICs: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
-        }
-        let mut names = Vec::new();
-        for line in String::from_utf8_lossy(&out.stdout).lines() {
-            let name = link_name(line);
-            if is_ethernet(&name) {
-                names.push(name);
-            }
-        }
-        Ok(names)
-    })
 }

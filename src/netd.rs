@@ -1,7 +1,7 @@
 mod network;
 
 use network::{
-    add_addr, ip_cmd, is_ethernet, link_exists, link_name, lock_unopted, run_ip, write_sysctl,
+    add_addr, ip_cmd, link_exists, lock_unopted, run_ip, traffic_nic_names, write_sysctl,
     FWD_MGMT_VETH, MGMT_FWD_IP, MGMT_FWD_IP6,
 };
 
@@ -1058,16 +1058,11 @@ fn list_nics_reply() -> String {
 }
 
 fn list_ethernet_json() -> Vec<Value> {
-    let Ok(out) = ip_cmd().args(["-o", "link", "show"]).output() else {
+    let Ok(names) = traffic_nic_names() else {
         return Vec::new();
     };
-    let mut nics: Vec<(String, Vec<String>)> = Vec::new();
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
-        let name = link_name(line);
-        if is_ethernet(&name) {
-            nics.push((name, Vec::new()));
-        }
-    }
+    let mut nics: Vec<(String, Vec<String>)> =
+        names.into_iter().map(|name| (name, Vec::new())).collect();
     if let Ok(addrs) = ip_cmd().args(["-o", "addr", "show"]).output() {
         for line in String::from_utf8_lossy(&addrs.stdout).lines() {
             let name = addr_dev(line);

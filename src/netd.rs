@@ -7,6 +7,7 @@ use network::{
 
 use std::fs::{self, File};
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{chown, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
@@ -127,7 +128,31 @@ fn run() -> Result<(), String> {
             apply_opt(&opt)?;
         }
     }
+    let mut observed_exposure = None;
+    let mut refresh_at = Instant::now();
     loop {
+        if Instant::now() >= refresh_at {
+            refresh_bootstrap_exposure(&mut observed_exposure)?;
+            refresh_at = Instant::now() + Duration::from_secs(1);
+        }
+        // Keep command application and address observation on the same thread:
+        // an old observation must never republish a replaced selection.
+        let mut ready = libc::pollfd {
+            fd: listener.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let result = unsafe { libc::poll(&mut ready, 1, 1000) };
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(format!("poll {SOCK}: {error}"));
+        }
+        if result == 0 {
+            continue;
+        }
         let (stream, _) = listener
             .accept()
             .map_err(|e| format!("accept {SOCK}: {e}"))?;
@@ -135,6 +160,25 @@ fn run() -> Result<(), String> {
             eprintln!("netd: {err}");
         }
     }
+}
+
+fn refresh_bootstrap_exposure(observed: &mut Option<(String, Vec<String>)>) -> Result<(), String> {
+    if Path::new(DESIRED).exists() || Path::new(BOOTSTRAPPED).exists() {
+        *observed = None;
+        return Ok(());
+    }
+    let Some(opt) = load_opt() else {
+        *observed = None;
+        return Ok(());
+    };
+    let mut addresses = bootstrap_expose_ips(&iface_cidrs(&opt.nic)?);
+    addresses.sort_unstable();
+    let current = (opt.nic, addresses);
+    if observed.as_ref() != Some(&current) {
+        program_first_boot_nft(&current.0, &current.1)?;
+        *observed = Some(current);
+    }
+    Ok(())
 }
 
 fn handle_client(mut stream: UnixStream) -> Result<(), String> {
@@ -847,7 +891,7 @@ fn wait_expose_cidrs(nic: &str) -> Result<Vec<String>, String> {
     let deadline = Instant::now() + Duration::from_secs(8);
     loop {
         let addrs = iface_cidrs(nic)?;
-        if !expose_ips(&addrs).is_empty() || Instant::now() >= deadline {
+        if !bootstrap_expose_ips(&addrs).is_empty() || Instant::now() >= deadline {
             return Ok(addrs);
         }
         thread::sleep(Duration::from_millis(200));
@@ -942,7 +986,7 @@ fn stop_dhclient() {
 }
 
 fn program_first_boot_nft(nic: &str, cidrs: &[String]) -> Result<(), String> {
-    let ips = expose_ips(cidrs);
+    let ips = bootstrap_expose_ips(cidrs);
     // Replace NAT and its guard in one nft transaction, without an unguarded
     // interval between removing the previous selection and publishing the next.
     nft_apply(&format!(
@@ -1037,6 +1081,19 @@ fn expose_ips(cidrs: &[String]) -> Vec<String> {
     out
 }
 
+// Bootstrap deliberately excludes link-local HTTPS. Keep permanent Desired
+// state exposure on its existing policy; it is a separate configuration path.
+fn bootstrap_expose_ips(cidrs: &[String]) -> Vec<String> {
+    expose_ips(cidrs)
+        .into_iter()
+        .filter(|ip| match ip.parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V4(address)) => address.is_private(),
+            Ok(std::net::IpAddr::V6(address)) => address.octets()[0] & 0xfe == 0xfc,
+            Err(_) => false,
+        })
+        .collect()
+}
+
 fn expose_allowed(ip: &str) -> bool {
     if let Ok(v4) = ip.parse::<std::net::Ipv4Addr>() {
         if v4.is_loopback() {
@@ -1050,13 +1107,13 @@ fn expose_allowed(ip: &str) -> bool {
         if o[0] == 169 && o[1] == 254 && o[2] == 127 {
             return false;
         }
-        return v4.is_private();
+        return v4.is_private() || v4.is_link_local();
     }
     if let Ok(v6) = ip.parse::<std::net::Ipv6Addr>() {
         if v6.is_loopback() {
             return false;
         }
-        return (v6.octets()[0] & 0xfe) == 0xfc;
+        return v6.is_unicast_link_local() || (v6.octets()[0] & 0xfe) == 0xfc;
     }
     false
 }
@@ -1197,16 +1254,16 @@ mod tests {
     }
 
     #[test]
-    fn expose_allowed_is_rfc1918_or_ula() {
+    fn expose_allowed_is_private_or_link_local() {
         assert!(expose_allowed("10.0.2.15"));
         assert!(expose_allowed("192.168.1.1"));
-        assert!(!expose_allowed("169.254.1.1"));
+        assert!(expose_allowed("169.254.1.1"));
         assert!(!expose_allowed("169.254.127.6"));
         assert!(!expose_allowed("8.8.8.8"));
         assert!(!expose_allowed("100.64.0.1"));
         assert!(!expose_allowed("2001:db8::1"));
         assert!(expose_allowed("fd53:1:1::9"));
-        assert!(!expose_allowed("fe80::1"));
+        assert!(expose_allowed("fe80::1"));
     }
 
     fn iface(name: &str, role: &str, addrs: &[&str]) -> Iface {

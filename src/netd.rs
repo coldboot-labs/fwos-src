@@ -958,9 +958,10 @@ fn program_first_boot_nft(nic: &str, cidrs: &[String]) -> Result<(), String> {
 fn first_boot_nft(nic: &str, ips: &[String]) -> String {
     let mut rules = String::new();
     rules.push_str("table inet fwos-first-boot {\n  chain forward {\n    type filter hook forward priority filter; policy accept;\n");
-    if !ips.is_empty() {
+    for ip in ips {
+        let family = if ip.contains(':') { "ip6" } else { "ip" };
         rules.push_str(&format!(
-            "    iifname \"{nic}\" oifname \"{FWD_MGMT_VETH}\" tcp dport 443 ct status dnat accept\n"
+            "    iifname \"{nic}\" oifname \"{FWD_MGMT_VETH}\" tcp dport 443 ct status dnat ct original {family} daddr {ip} accept\n"
         ));
     }
     rules.push_str(&format!("    oifname \"{FWD_MGMT_VETH}\" tcp dport 443 drop\n  }}\n}}\n"));

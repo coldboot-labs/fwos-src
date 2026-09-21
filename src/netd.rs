@@ -909,11 +909,7 @@ fn write_dhclient_script() -> Result<(), String> {
     let script = r#"#!/bin/sh
 case "${reason}" in
 BOUND|RENEW|REBIND|REBOOT)
-  pfx="${new_prefix}"
-  if [ -z "${pfx}" ]; then
-    pfx=24
-  fi
-  ip addr replace "${new_ip_address}/${pfx}" dev "${interface}"
+  ip addr replace "${new_ip_address}/${new_subnet_mask}" dev "${interface}"
   if [ -n "${new_routers}" ]; then
     gw=$(echo "${new_routers}" | awk '{print $1}')
     ip route replace default via "${gw}" dev "${interface}"
@@ -964,7 +960,9 @@ fn first_boot_nft(nic: &str, ips: &[String]) -> String {
             "    iifname \"{nic}\" oifname \"{FWD_MGMT_VETH}\" tcp dport 443 ct status dnat ct original {family} daddr {ip} accept\n"
         ));
     }
-    rules.push_str(&format!("    oifname \"{FWD_MGMT_VETH}\" tcp dport 443 drop\n  }}\n}}\n"));
+    rules.push_str(&format!(
+        "    oifname \"{FWD_MGMT_VETH}\" tcp dport 443 drop\n  }}\n}}\n"
+    ));
     let v4: Vec<&str> = ips
         .iter()
         .map(|s| s.as_str())

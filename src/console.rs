@@ -617,13 +617,13 @@ fn ui_reachable(addr: IpAddr) -> bool {
             if oct[0] == CGNAT.octets()[0] && oct[1] >= 64 && oct[1] <= 127 {
                 return false;
             }
-            v4.is_private() || v4.is_link_local()
+            v4.is_private()
         }
         IpAddr::V6(v6) => {
             if v6.is_loopback() {
                 return false;
             }
-            v6.is_unicast_link_local() || is_ula(v6)
+            is_ula(v6)
         }
     }
 }

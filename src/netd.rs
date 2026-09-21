@@ -1040,13 +1040,13 @@ fn expose_allowed(ip: &str) -> bool {
         if o[0] == 169 && o[1] == 254 && o[2] == 127 {
             return false;
         }
-        return v4.is_private() || v4.is_link_local();
+        return v4.is_private();
     }
     if let Ok(v6) = ip.parse::<std::net::Ipv6Addr>() {
         if v6.is_loopback() {
             return false;
         }
-        return v6.is_unicast_link_local() || (v6.octets()[0] & 0xfe) == 0xfc;
+        return (v6.octets()[0] & 0xfe) == 0xfc;
     }
     false
 }
@@ -1180,23 +1180,23 @@ mod tests {
         assert!(rules.contains("iifname \"enp1s0\""));
         assert!(rules.contains("ip daddr 10.0.2.15 tcp dport 443 dnat ip to 169.254.127.6"));
         assert!(!rules.contains("flush ruleset"));
-        let v6 = first_boot_nft("enp1s0", &["fe80::1".into(), "fd53:1:1::9".into()]);
-        assert!(v6.contains("ip6 daddr fe80::1 tcp dport 443 dnat ip6 to fd53:1:1::6"));
+        let v6 = first_boot_nft("enp1s0", &["fd53:1:1::9".into()]);
+        assert!(v6.contains("ip6 daddr fd53:1:1::9 tcp dport 443 dnat ip6 to fd53:1:1::6"));
         assert!(v6.contains("chain forward"));
         assert!(!v6.contains("dnat to fd53"));
     }
 
     #[test]
-    fn expose_allowed_is_non_global() {
+    fn expose_allowed_is_rfc1918_or_ula() {
         assert!(expose_allowed("10.0.2.15"));
         assert!(expose_allowed("192.168.1.1"));
-        assert!(expose_allowed("169.254.1.1"));
+        assert!(!expose_allowed("169.254.1.1"));
         assert!(!expose_allowed("169.254.127.6"));
         assert!(!expose_allowed("8.8.8.8"));
         assert!(!expose_allowed("100.64.0.1"));
         assert!(!expose_allowed("2001:db8::1"));
         assert!(expose_allowed("fd53:1:1::9"));
-        assert!(expose_allowed("fe80::1"));
+        assert!(!expose_allowed("fe80::1"));
     }
 
     fn iface(name: &str, role: &str, addrs: &[&str]) -> Iface {

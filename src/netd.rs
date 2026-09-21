@@ -859,6 +859,11 @@ fn apply_and_persist_opt(opt: FirstBootOpt) -> Result<(), String> {
 }
 
 fn apply_opt(opt: &FirstBootOpt) -> Result<(), String> {
+    // Validate the operator's target before removing the current selection.
+    // Loopback, fixed plumbing and tagged/virtual links are not Traffic NICs.
+    if !traffic_nic_names()?.iter().any(|name| name == &opt.nic) {
+        return Err(format!("{} is not a Traffic NIC", opt.nic));
+    }
     if let Some(prev) = load_opt() {
         if prev.nic != opt.nic || prev.mode != opt.mode || prev.cidr != opt.cidr {
             teardown_opt(&prev)?;

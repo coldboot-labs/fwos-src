@@ -121,8 +121,11 @@ fn run() -> Result<(), String> {
             toml::from_str(&raw).map_err(|e| format!("parse {DESIRED}: {e}"))?;
         apply(&mut state)?;
         persist(&state)?;
-    } else if let Some(opt) = load_opt() {
-        apply_opt(&opt)?;
+    } else {
+        program_first_boot_nft("", &[])?;
+        if let Some(opt) = load_opt() {
+            apply_opt(&opt)?;
+        }
     }
     loop {
         let (stream, _) = listener
@@ -861,14 +864,16 @@ fn teardown_opt(opt: &FirstBootOpt) -> Result<(), String> {
         lock_unopted(&opt.nic)?;
         let _ = run_ip(&["link", "set", &opt.nic, "up"]);
     }
-    let _ = nft_apply("destroy table ip fwos-first-boot\ndestroy table ip6 fwos-first-boot\n");
-    Ok(())
+    // Keep the UI guarded while a selection is being replaced, including any
+    // direct peer route to the internal Management namespace addresses.
+    program_first_boot_nft("", &[])
 }
 
 fn discard_opt() -> Result<(), String> {
     if let Some(opt) = load_opt() {
         teardown_opt(&opt)?;
     }
+    nft_apply("destroy table inet fwos-first-boot\n")?;
     let _ = fs::remove_file(OPT_FILE);
     Ok(())
 }
@@ -942,17 +947,23 @@ fn stop_dhclient() {
 
 fn program_first_boot_nft(nic: &str, cidrs: &[String]) -> Result<(), String> {
     let ips = expose_ips(cidrs);
-    let _ = nft_apply("destroy table ip fwos-first-boot\ndestroy table ip6 fwos-first-boot\n");
-    let rules = first_boot_nft(nic, &ips);
-    if rules.trim().is_empty() {
-        Ok(())
-    } else {
-        nft_apply(&rules)
-    }
+    // Replace NAT and its guard in one nft transaction, without an unguarded
+    // interval between removing the previous selection and publishing the next.
+    nft_apply(&format!(
+        "destroy table ip fwos-first-boot\ndestroy table ip6 fwos-first-boot\ndestroy table inet fwos-first-boot\n{}",
+        first_boot_nft(nic, &ips)
+    ))
 }
 
 fn first_boot_nft(nic: &str, ips: &[String]) -> String {
     let mut rules = String::new();
+    rules.push_str("table inet fwos-first-boot {\n  chain forward {\n    type filter hook forward priority filter; policy accept;\n");
+    if !ips.is_empty() {
+        rules.push_str(&format!(
+            "    iifname \"{nic}\" oifname \"{FWD_MGMT_VETH}\" tcp dport 443 ct status dnat accept\n"
+        ));
+    }
+    rules.push_str(&format!("    oifname \"{FWD_MGMT_VETH}\" tcp dport 443 drop\n  }}\n}}\n"));
     let v4: Vec<&str> = ips
         .iter()
         .map(|s| s.as_str())

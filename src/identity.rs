@@ -96,6 +96,13 @@ struct IdentityConfiguration {
 }
 
 impl IdentityConfiguration {
+    fn first_local_administrator_subject(&self) -> Option<&str> {
+        self.accounts
+            .iter()
+            .find(|account| account.source == LOCAL_SOURCE && account.administrator)
+            .map(|account| account.subject.as_str())
+    }
+
     fn read() -> Result<Self, String> {
         let raw =
             fs::read(IDENTITY).map_err(|_| "Identity configuration unavailable".to_string())?;
@@ -161,12 +168,16 @@ pub fn create_first_administrator(username: &str, password: &str) -> Result<(), 
 /// A Bootstrap commit requires the tentative local administrator to be
 /// readable and authorized as an administrator before ownership is recorded.
 pub fn tentative_first_administrator_exists() -> bool {
-    IdentityConfiguration::read().is_ok_and(|configuration| {
-        configuration
-            .accounts
-            .iter()
-            .any(|account| account.source == LOCAL_SOURCE && account.administrator)
-    })
+    tentative_first_administrator_subject().is_some()
+}
+
+/// Opaque, random account identity bound to the submitted Bootstrap attempt.
+/// A concurrent replacement of Identity must not be committed by netd.
+pub fn tentative_first_administrator_subject() -> Option<String> {
+    IdentityConfiguration::read()
+        .ok()?
+        .first_local_administrator_subject()
+        .map(str::to_string)
 }
 
 fn write_configuration(config: &IdentityConfiguration) -> Result<(), String> {
@@ -499,12 +510,31 @@ fn eq_ct(a: &[u8], b: &[u8]) -> bool {
 // shared module. New acceptance tests use the real appliance boundary.
 #[cfg(test)]
 mod tests {
-    use super::eq_ct;
+    use super::*;
 
     #[test]
     fn eq_ct_matches_only_same_bytes() {
         assert!(eq_ct(b"abc", b"abc"));
         assert!(!eq_ct(b"abc", b"abd"));
         assert!(!eq_ct(b"ab", b"abc"));
+    }
+
+    #[test]
+    fn bootstrap_subject_is_the_local_administrator_not_another_account() {
+        let account = |subject: &str, administrator: bool| LocalAccount {
+            subject: subject.into(),
+            source: LOCAL_SOURCE.into(),
+            username: subject.into(),
+            password_hash: "$y$placeholder".into(),
+            credential_version: 1,
+            administrator,
+        };
+        let config = IdentityConfiguration {
+            version: 1,
+            sources: vec![],
+            required_assurance: Assurance::Password,
+            accounts: vec![account("viewer", false), account("owner", true)],
+        };
+        assert_eq!(config.first_local_administrator_subject(), Some("owner"));
     }
 }

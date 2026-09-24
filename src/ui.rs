@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use fwos_fwd_setup::durable;
 use fwos_fwd_setup::identity::{self, Authentication, AuthenticationResult};
+use fwos_fwd_setup::{bootstrap_values, durable};
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
@@ -23,6 +23,7 @@ const SOCK: &str = "/var/lib/fwos/netd.sock";
 const CERT: &str = "/var/lib/fwos/ui-cert.pem";
 const KEY: &str = "/var/lib/fwos/ui-key.pem";
 const BOOTSTRAP: &str = "/var/lib/fwos/bootstrapped";
+const BOOTSTRAP_ATTEMPT: &str = "/var/lib/fwos/bootstrap-attempt.json";
 const HOSTNAME_FILE: &str = "/var/lib/fwos/hostname";
 const DESIRED: &str = "/var/lib/fwos/desired.toml";
 const STATIC_DIR: &str = "/usr/share/fwos-ui";
@@ -757,6 +758,12 @@ fn bootstrap(body: &[u8]) -> HttpResponse {
     if Path::new(BOOTSTRAP).exists() {
         return json_response(409, json!({"ok": false, "error": "already bootstrapped"}));
     }
+    if Path::new(BOOTSTRAP_ATTEMPT).exists() {
+        return json_response(
+            409,
+            json!({"ok": false, "error": "Bootstrap apply is already in progress"}),
+        );
+    }
     let req: Bootstrap = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(err) => {
@@ -792,6 +799,14 @@ fn bootstrap(body: &[u8]) -> HttpResponse {
         let _ = durable::remove(Path::new("/var/lib/fwos/identity.json"));
         return json_response(502, json!({"ok": false, "error": err}));
     }
+    let Some(admin_subject) = identity::tentative_first_administrator_subject() else {
+        let _ = durable::remove(Path::new(HOSTNAME_FILE));
+        let _ = durable::remove(Path::new("/var/lib/fwos/identity.json"));
+        return json_response(
+            502,
+            json!({"ok": false, "error": "first administrator is not durable"}),
+        );
+    };
     let mut desired = json!({
         "hostname": hostname,
         "interfaces": req.interfaces,
@@ -806,7 +821,7 @@ fn bootstrap(body: &[u8]) -> HttpResponse {
     if !req.wan_pd.trim().is_empty() {
         desired["wan_pd"] = json!(req.wan_pd.trim());
     }
-    match netd_bootstrap(&desired) {
+    match netd_bootstrap(&desired, &admin_subject) {
         Ok(reply) => {
             let ok = reply.get("ok").and_then(Value::as_bool).unwrap_or(false);
             if ok {
@@ -841,6 +856,12 @@ fn bootstrap(body: &[u8]) -> HttpResponse {
 
 fn validate_bootstrap(req: &Bootstrap) -> Result<(), String> {
     for iface in &req.interfaces {
+        bootstrap_values::interface(
+            &iface.name,
+            iface.parent.as_deref(),
+            iface.vlan,
+            &iface.addresses,
+        )?;
         if iface.name.trim().is_empty() {
             return Err("missing NIC name".into());
         }
@@ -931,6 +952,11 @@ fn validate_bootstrap(req: &Bootstrap) -> Result<(), String> {
             return Err("Management NIC must be in ui_exposure".into());
         }
     }
+    bootstrap_values::addressing(
+        Some(req.lan_prefix.trim()),
+        Some(req.dhcp_pool.trim()),
+        Some(req.wan_pd.trim()),
+    )?;
     Ok(())
 }
 
@@ -956,9 +982,11 @@ fn set_hostname(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn netd_bootstrap(body: &Value) -> Result<Value, String> {
-    let raw = serde_json::to_vec(&json!({"op": "bootstrap_apply", "desired": body}))
-        .map_err(|e| format!("encode desired: {e}"))?;
+fn netd_bootstrap(body: &Value, admin_subject: &str) -> Result<Value, String> {
+    let raw = serde_json::to_vec(
+        &json!({"op": "bootstrap_apply", "desired": body, "admin_subject": admin_subject}),
+    )
+    .map_err(|e| format!("encode desired: {e}"))?;
     let mut stream = UnixStream::connect(SOCK).map_err(|e| format!("connect {SOCK}: {e}"))?;
     let _ = stream.set_read_timeout(Some(Duration::from_secs(60)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(60)));
@@ -1261,6 +1289,22 @@ mod tests {
                 || err.to_ascii_lowercase().contains("management"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn bootstrap_rejects_out_of_range_vlan_before_tentative_identity() {
+        let req = parse_boot(
+            r#"{"hostname":"fwos-box","admin":"alice","password":"secret12","interfaces":[{"name":"enp1s0.4095","role":"lan","parent":"enp1s0","vlan":4095},{"name":"enp2s0","role":"wan","addresses":["192.0.2.1/24"]}],"ui_exposure":["enp1s0.4095"],"lan_prefix":"192.168.1.0/24"}"#,
+        );
+        assert!(validate_bootstrap(&req).unwrap_err().contains("VLAN"));
+    }
+
+    #[test]
+    fn bootstrap_rejects_malformed_lan_prefix_before_tentative_identity() {
+        let req = parse_boot(
+            r#"{"hostname":"fwos-box","admin":"alice","password":"secret12","interfaces":[{"name":"enp1s0","role":"lan"},{"name":"enp2s0","role":"wan","addresses":["192.0.2.1/24"]}],"ui_exposure":["enp1s0"],"lan_prefix":"invalid-prefix"}"#,
+        );
+        assert!(validate_bootstrap(&req).unwrap_err().contains("lan_prefix"));
     }
 
     #[test]

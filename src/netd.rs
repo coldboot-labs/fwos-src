@@ -15,7 +15,7 @@ use std::process::{self, Command};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use fwos_fwd_setup::{durable, identity};
+use fwos_fwd_setup::{bootstrap_values, durable, identity};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -104,6 +104,24 @@ struct FirstBootOpt {
 #[derive(Serialize, Deserialize)]
 struct BootstrapAttempt {
     vlan_links: Vec<String>,
+}
+
+enum BootstrapFailure {
+    Incomplete(String),
+    Owned(String),
+    Indeterminate(String),
+}
+
+impl From<String> for BootstrapFailure {
+    fn from(error: String) -> Self {
+        Self::Incomplete(error)
+    }
+}
+
+impl From<&str> for BootstrapFailure {
+    fn from(error: &str) -> Self {
+        Self::Incomplete(error.to_string())
+    }
 }
 
 fn main() {
@@ -238,14 +256,24 @@ fn handle_cmd(v: &Value) -> String {
         },
         "bootstrap_apply" => match bootstrap_apply(v) {
             Ok(()) => json!({"ok": true}).to_string(),
-            Err(err) if Path::new(BOOTSTRAPPED).exists() => json!({
+            Err(BootstrapFailure::Owned(err)) => json!({
                 "ok": false,
                 "bootstrapped": true,
                 "error": err,
                 "next_action": "sign in to review and repair configuration"
             })
             .to_string(),
-            Err(err) => json!({"ok": false, "bootstrapped": false, "error": err}).to_string(),
+            Err(BootstrapFailure::Indeterminate(err)) => json!({
+                "ok": false,
+                "bootstrapped": Value::Null,
+                "outcome": "indeterminate",
+                "error": err,
+                "next_action": "do not retry; reboot and check Appliance status or console"
+            })
+            .to_string(),
+            Err(BootstrapFailure::Incomplete(err)) => {
+                json!({"ok": false, "bootstrapped": false, "error": err}).to_string()
+            }
         },
         other => json!({"ok": false, "error": format!("unknown op {other}")}).to_string(),
     }
@@ -286,20 +314,27 @@ fn persist(state: &DesiredState) -> Result<(), String> {
     durable::write(Path::new(DESIRED), raw.as_bytes())
 }
 
-fn bootstrap_apply(request: &Value) -> Result<(), String> {
+fn bootstrap_apply(request: &Value) -> Result<(), BootstrapFailure> {
     if Path::new(BOOTSTRAPPED).exists() {
-        return Err("already bootstrapped".into());
+        return Err(BootstrapFailure::Owned("already bootstrapped".into()));
     }
     match bootstrap_apply_inner(request) {
         Ok(()) => Ok(()),
-        Err(error) if Path::new(BOOTSTRAPPED).exists() => {
-            Err(format!("Bootstrap ownership is recorded; {error}"))
+        Err(BootstrapFailure::Incomplete(error)) if Path::new(BOOTSTRAPPED).exists() => Err(
+            BootstrapFailure::Owned(format!("Bootstrap ownership is recorded; {error}")),
+        ),
+        Err(BootstrapFailure::Incomplete(error)) => {
+            Err(BootstrapFailure::Incomplete(fail_bootstrap_attempt(error)))
         }
-        Err(error) => Err(fail_bootstrap_attempt(error)),
+        Err(other) => Err(other),
     }
 }
 
-fn bootstrap_apply_inner(request: &Value) -> Result<(), String> {
+fn bootstrap_apply_inner(request: &Value) -> Result<(), BootstrapFailure> {
+    let admin_subject = request
+        .get("admin_subject")
+        .and_then(Value::as_str)
+        .ok_or("missing Bootstrap administrator binding")?;
     let mut state: DesiredState = serde_json::from_value(
         request
             .get("desired")
@@ -308,18 +343,28 @@ fn bootstrap_apply_inner(request: &Value) -> Result<(), String> {
     )
     .map_err(|error| format!("invalid Bootstrap Desired state: {error}"))?;
     validate(&state)?;
-    if !identity::tentative_first_administrator_exists() {
-        return Err("first administrator is not durable".into());
+    for iface in &state.interfaces {
+        bootstrap_values::interface(
+            &iface.name,
+            iface.parent.as_deref(),
+            iface.vlan,
+            &iface.addresses,
+        )?;
     }
-    let hostname = state
-        .hostname
-        .as_deref()
-        .ok_or("missing Bootstrap hostname")?;
+    bootstrap_values::addressing(
+        state.lan_prefix.as_deref(),
+        state.dhcp_pool.as_deref(),
+        state.wan_pd.as_deref(),
+    )?;
+    if identity::tentative_first_administrator_subject().as_deref() != Some(admin_subject) {
+        return Err("Bootstrap administrator changed before apply".into());
+    }
+    let hostname = state.hostname.clone().ok_or("missing Bootstrap hostname")?;
     if fs::read_to_string(HOSTNAME)
         .map(|name| name.trim().to_string())
         .ok()
         .as_deref()
-        != Some(hostname)
+        != Some(hostname.as_str())
     {
         return Err("Bootstrap hostname is not durable".into());
     }
@@ -335,10 +380,18 @@ fn bootstrap_apply_inner(request: &Value) -> Result<(), String> {
         .map_err(|error| format!("encode Bootstrap attempt: {error}"))?;
     durable::write(Path::new(BOOTSTRAP_ATTEMPT), &raw)?;
     apply(&mut state)?;
-    if !identity::tentative_first_administrator_exists() {
-        return Err("first administrator disappeared during apply".into());
+    if identity::tentative_first_administrator_subject().as_deref() != Some(admin_subject) {
+        return Err("Bootstrap administrator changed during apply".into());
     }
-    durable::write(Path::new(BOOTSTRAPPED), b"ok\n")?;
+    if fs::read_to_string(HOSTNAME)
+        .map(|name| name.trim().to_string())
+        .ok()
+        .as_deref()
+        != Some(hostname.as_str())
+    {
+        return Err("Bootstrap hostname changed during apply".into());
+    }
+    commit_bootstrap_marker()?;
     // The Host path units watch these files. Incomplete attempts must not
     // start LAN services; next boot replays Desired if publication fails.
     program_lan_services(&state, true)?;
@@ -348,6 +401,32 @@ fn bootstrap_apply_inner(request: &Value) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn commit_bootstrap_marker() -> Result<(), BootstrapFailure> {
+    let marker = Path::new(BOOTSTRAPPED);
+    let Err(error) = durable::write(marker, b"ok\n") else {
+        return Ok(());
+    };
+    // A failed directory fsync can follow a successful rename. Confirm it on
+    // retry if possible; otherwise durably remove the visible marker before
+    // considering this attempt incomplete.
+    if marker.exists()
+        && marker
+            .parent()
+            .and_then(|parent| File::open(parent).ok())
+            .is_some_and(|directory| directory.sync_all().is_ok())
+    {
+        return Ok(());
+    }
+    match durable::remove(marker) {
+        Ok(()) => Err(BootstrapFailure::Incomplete(format!(
+            "Bootstrap marker was not durable: {error}"
+        ))),
+        Err(cleanup) => Err(BootstrapFailure::Indeterminate(format!(
+            "Bootstrap marker durability is uncertain: {error}; cleanup: {cleanup}"
+        ))),
+    }
 }
 
 fn fail_bootstrap_attempt(error: String) -> String {
@@ -763,18 +842,16 @@ fn first_v4_host(cidr: &str) -> Option<String> {
 }
 
 fn pd_lan_addr(pd: &str) -> Option<String> {
-    let base = pd.split('/').next()?.trim_end_matches(':');
-    Some(format!("{base}::1/64"))
+    Some(bootstrap_values::delegated_lan(pd)?.address_cidr)
 }
 
 fn pd_subnet64(pd: &str) -> Option<String> {
-    let base = pd.split('/').next()?.trim_end_matches(':');
-    Some(format!("{base}::/64"))
+    Some(bootstrap_values::delegated_lan(pd)?.subnet_cidr)
 }
 
 fn pd_pool(pd: &str) -> Option<(String, String)> {
-    let base = pd.split('/').next()?.trim_end_matches(':');
-    Some((format!("{base}::100"), format!("{base}::1ff")))
+    let lan = bootstrap_values::delegated_lan(pd)?;
+    Some((lan.pool_start, lan.pool_end))
 }
 
 fn program_nft(state: &DesiredState) -> Result<(), String> {

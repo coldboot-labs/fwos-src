@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 const IDENTITY: &str = "/var/lib/fwos/identity.json";
 const BOOTSTRAPPED: &str = "/var/lib/fwos/bootstrapped";
 pub const LOCAL_SOURCE: &str = "local";
+static ACCOUNT_WRITE_LOCK: Mutex<()> = Mutex::new(());
 // libxcrypt's CRYPT_MAX_PASSPHRASE_SIZE is 512, including the terminating NUL.
 pub const MAX_PASSWORD_BYTES: usize = 511;
 
@@ -154,7 +155,11 @@ pub fn create_first_administrator(username: &str, password: &str) -> Result<(), 
             administrator: true,
         }],
     };
-    let raw = serde_json::to_vec(&config).map_err(|_| "encode Identity configuration")?;
+    write_configuration(&config)
+}
+
+fn write_configuration(config: &IdentityConfiguration) -> Result<(), String> {
+    let raw = serde_json::to_vec(config).map_err(|_| "encode Identity configuration")?;
     let parent = Path::new(IDENTITY).parent().ok_or("Identity directory")?;
     fs::create_dir_all(parent).map_err(|_| "create Identity directory")?;
     let temporary = parent.join(format!(".identity-{}.tmp", random_token()?));
@@ -246,6 +251,10 @@ pub fn authorize_administrator(authentication: &Authentication) -> bool {
     let Ok(config) = IdentityConfiguration::read() else {
         return false;
     };
+    authorized_in(&config, authentication)
+}
+
+fn authorized_in(config: &IdentityConfiguration, authentication: &Authentication) -> bool {
     authentication.assurance >= config.required_assurance
         && config
             .sources
@@ -258,6 +267,143 @@ pub fn authorize_administrator(authentication: &Authentication) -> bool {
                 && account.credential_version == authentication.credential_version
                 && account.administrator
         })
+}
+
+#[derive(Debug)]
+pub enum AccountError {
+    Forbidden,
+    InvalidCredentials,
+    AlreadyExists,
+    NotFound,
+    LastAdministrator,
+    Storage,
+}
+
+pub fn list_local_administrators(
+    authentication: &Authentication,
+) -> Result<Vec<String>, AccountError> {
+    if !Path::new(BOOTSTRAPPED).exists() {
+        return Err(AccountError::Forbidden);
+    }
+    let config = IdentityConfiguration::read().map_err(|_| AccountError::Storage)?;
+    if !authorized_in(&config, authentication) {
+        return Err(AccountError::Forbidden);
+    }
+    let mut names: Vec<_> = config
+        .accounts
+        .iter()
+        .filter(|account| account.source == LOCAL_SOURCE && account.administrator)
+        .map(|account| account.username.clone())
+        .collect();
+    names.sort();
+    Ok(names)
+}
+
+pub fn create_local_administrator(
+    authentication: &Authentication,
+    username: &str,
+    password: &str,
+) -> Result<(), AccountError> {
+    if !valid_username(username) || !valid_password(password) {
+        return Err(AccountError::InvalidCredentials);
+    }
+    let _guard = ACCOUNT_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !Path::new(BOOTSTRAPPED).exists() {
+        return Err(AccountError::Forbidden);
+    }
+    let mut config = IdentityConfiguration::read().map_err(|_| AccountError::Storage)?;
+    if !authorized_in(&config, authentication) {
+        return Err(AccountError::Forbidden);
+    }
+    if !config
+        .sources
+        .iter()
+        .any(|source| source.id == LOCAL_SOURCE && matches!(source.kind, SourceKind::LocalPassword))
+    {
+        return Err(AccountError::Storage);
+    }
+    if config
+        .accounts
+        .iter()
+        .any(|account| account.source == LOCAL_SOURCE && account.username == username)
+    {
+        return Err(AccountError::AlreadyExists);
+    }
+    config.accounts.push(LocalAccount {
+        source: LOCAL_SOURCE.into(),
+        subject: random_token().map_err(|_| AccountError::Storage)?,
+        username: username.into(),
+        password_hash: hash_password(password).map_err(|_| AccountError::Storage)?,
+        credential_version: 1,
+        administrator: true,
+    });
+    write_configuration(&config).map_err(|_| AccountError::Storage)
+}
+
+pub fn change_local_administrator_password(
+    authentication: &Authentication,
+    username: &str,
+    password: &str,
+) -> Result<(), AccountError> {
+    if !valid_password(password) {
+        return Err(AccountError::InvalidCredentials);
+    }
+    let _guard = ACCOUNT_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !Path::new(BOOTSTRAPPED).exists() {
+        return Err(AccountError::Forbidden);
+    }
+    let mut config = IdentityConfiguration::read().map_err(|_| AccountError::Storage)?;
+    if !authorized_in(&config, authentication) {
+        return Err(AccountError::Forbidden);
+    }
+    let Some(account) = config.accounts.iter_mut().find(|account| {
+        account.source == LOCAL_SOURCE && account.username == username && account.administrator
+    }) else {
+        return Err(AccountError::NotFound);
+    };
+    let next_version = account
+        .credential_version
+        .checked_add(1)
+        .ok_or(AccountError::Storage)?;
+    account.password_hash = hash_password(password).map_err(|_| AccountError::Storage)?;
+    account.credential_version = next_version;
+    write_configuration(&config).map_err(|_| AccountError::Storage)
+}
+
+pub fn remove_local_administrator(
+    authentication: &Authentication,
+    username: &str,
+) -> Result<(), AccountError> {
+    let _guard = ACCOUNT_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !Path::new(BOOTSTRAPPED).exists() {
+        return Err(AccountError::Forbidden);
+    }
+    let mut config = IdentityConfiguration::read().map_err(|_| AccountError::Storage)?;
+    if !authorized_in(&config, authentication) {
+        return Err(AccountError::Forbidden);
+    }
+    let Some(index) = config.accounts.iter().position(|account| {
+        account.source == LOCAL_SOURCE && account.username == username && account.administrator
+    }) else {
+        return Err(AccountError::NotFound);
+    };
+    if config
+        .accounts
+        .iter()
+        .filter(|account| account.source == LOCAL_SOURCE && account.administrator)
+        .count()
+        <= 1
+    {
+        return Err(AccountError::LastAdministrator);
+    }
+    config.accounts.remove(index);
+    write_configuration(&config).map_err(|_| AccountError::Storage)
 }
 
 pub fn valid_username(name: &str) -> bool {

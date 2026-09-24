@@ -384,6 +384,14 @@ fn dispatch(req: &HttpRequest) -> HttpResponse {
         }
         ("POST", "/api/login") => login(req),
         ("POST", "/api/logout") => logout(req),
+        ("GET", "/api/administrators") => administrators(authentication.as_ref()),
+        ("POST", "/api/administrators") => create_administrator(req, authentication.as_ref()),
+        ("POST", "/api/administrators/password") => {
+            change_administrator_password(req, authentication.as_ref())
+        }
+        ("POST", "/api/administrators/remove") => {
+            remove_administrator(req, authentication.as_ref())
+        }
         ("POST", "/api/bootstrap") => bootstrap(&req.body),
         ("GET", _) if path.starts_with("/api/") => {
             json_response(404, json!({"ok": false, "error": "not found"}))
@@ -582,6 +590,115 @@ fn logout(req: &HttpRequest) -> HttpResponse {
         format!("{SESSION_COOKIE}=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0"),
     ));
     response
+}
+
+fn account_error(error: identity::AccountError) -> HttpResponse {
+    let (status, message) = match error {
+        identity::AccountError::Forbidden => (403, "administrator access required"),
+        identity::AccountError::InvalidCredentials => (400, "invalid administrator credentials"),
+        identity::AccountError::AlreadyExists => (409, "administrator already exists"),
+        identity::AccountError::NotFound => (404, "administrator not found"),
+        identity::AccountError::LastAdministrator => (409, "cannot remove the final administrator"),
+        identity::AccountError::Storage => (503, "Identity configuration unavailable"),
+    };
+    json_response(status, json!({"ok": false, "error": message}))
+}
+
+fn administrators(authentication: Option<&Authentication>) -> HttpResponse {
+    let Some(authentication) = authentication else {
+        return account_error(identity::AccountError::Forbidden);
+    };
+    match identity::list_local_administrators(authentication) {
+        Ok(administrators) => {
+            json_response(200, json!({"ok": true, "administrators": administrators}))
+        }
+        Err(error) => account_error(error),
+    }
+}
+
+fn create_administrator(
+    req: &HttpRequest,
+    authentication: Option<&Authentication>,
+) -> HttpResponse {
+    #[derive(Deserialize)]
+    struct NewAdministrator {
+        username: String,
+        password: String,
+    }
+    let Some(authentication) = authentication else {
+        return account_error(identity::AccountError::Forbidden);
+    };
+    let details: NewAdministrator = match serde_json::from_slice(&req.body) {
+        Ok(details) => details,
+        Err(_) => {
+            return json_response(
+                400,
+                json!({"ok": false, "error": "invalid administrator request"}),
+            )
+        }
+    };
+    match identity::create_local_administrator(authentication, &details.username, &details.password)
+    {
+        Ok(()) => json_response(200, json!({"ok": true})),
+        Err(error) => account_error(error),
+    }
+}
+
+fn change_administrator_password(
+    req: &HttpRequest,
+    authentication: Option<&Authentication>,
+) -> HttpResponse {
+    #[derive(Deserialize)]
+    struct PasswordChange {
+        username: String,
+        password: String,
+    }
+    let Some(authentication) = authentication else {
+        return account_error(identity::AccountError::Forbidden);
+    };
+    let details: PasswordChange = match serde_json::from_slice(&req.body) {
+        Ok(details) => details,
+        Err(_) => {
+            return json_response(
+                400,
+                json!({"ok": false, "error": "invalid password-change request"}),
+            )
+        }
+    };
+    match identity::change_local_administrator_password(
+        authentication,
+        &details.username,
+        &details.password,
+    ) {
+        Ok(()) => json_response(200, json!({"ok": true})),
+        Err(error) => account_error(error),
+    }
+}
+
+fn remove_administrator(
+    req: &HttpRequest,
+    authentication: Option<&Authentication>,
+) -> HttpResponse {
+    #[derive(Deserialize)]
+    struct RemoveAdministrator {
+        username: String,
+    }
+    let Some(authentication) = authentication else {
+        return account_error(identity::AccountError::Forbidden);
+    };
+    let details: RemoveAdministrator = match serde_json::from_slice(&req.body) {
+        Ok(details) => details,
+        Err(_) => {
+            return json_response(
+                400,
+                json!({"ok": false, "error": "invalid administrator-removal request"}),
+            )
+        }
+    };
+    match identity::remove_local_administrator(authentication, &details.username) {
+        Ok(()) => json_response(200, json!({"ok": true})),
+        Err(error) => account_error(error),
+    }
 }
 
 #[derive(Deserialize)]

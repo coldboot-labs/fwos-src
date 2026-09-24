@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use fwos_fwd_setup::durable;
 use fwos_fwd_setup::identity::{self, Authentication, AuthenticationResult};
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -50,6 +51,7 @@ fn run() -> Result<(), String> {
         .map_err(|_| "install rustls ring provider".to_string())?;
     ensure_cert()?;
     let cfg = tls_config()?;
+    wait_netd_ready()?;
     let addrs = wildcard_bind_addrs()?;
     let mut joins = Vec::new();
     for addr in addrs {
@@ -70,6 +72,19 @@ fn run() -> Result<(), String> {
         Ok(()) => Ok(()),
         Err(_) => Err("listener thread panicked".into()),
     }
+}
+
+fn wait_netd_ready() -> Result<(), String> {
+    if Path::new(BOOTSTRAP).exists() {
+        return Ok(());
+    }
+    for _ in 0..480 {
+        if UnixStream::connect(SOCK).is_ok() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    Err("netd did not finish Bootstrap recovery".into())
 }
 
 fn tls_config() -> Result<Arc<ServerConfig>, String> {
@@ -222,11 +237,6 @@ fn handle_conn(tcp: TcpStream, cfg: Arc<ServerConfig>) -> Result<(), String> {
     write_response(&mut tls, &resp)?;
     tls.conn.send_close_notify();
     let _ = tls.flush();
-    if resp.stamp {
-        if let Err(err) = stamp_bootstrap() {
-            eprintln!("fwos-ui: stamp: {err}");
-        }
-    }
     Ok(())
 }
 
@@ -241,7 +251,6 @@ struct HttpResponse {
     status: u16,
     ctype: &'static str,
     body: Vec<u8>,
-    stamp: bool,
     headers: Vec<(String, String)>,
 }
 
@@ -352,6 +361,16 @@ fn write_response(stream: &mut impl Write, response: &HttpResponse) -> Result<()
 
 fn dispatch(req: &HttpRequest) -> HttpResponse {
     let path = req.path.split('?').next().unwrap_or("/");
+    let bootstrap_route = matches!(
+        path,
+        "/" | "/index.html" | "/app.js" | "/api/status" | "/api/bootstrap"
+    );
+    if bootstrap_route && !Path::new(BOOTSTRAP).exists() && UnixStream::connect(SOCK).is_err() {
+        return json_response(
+            503,
+            json!({"ok": false, "bootstrapped": false, "error": "Bootstrap recovery in progress"}),
+        );
+    }
     if req.method == "POST" && path.starts_with("/api/") {
         if !same_origin_json(req) {
             return json_response(
@@ -401,14 +420,12 @@ fn dispatch(req: &HttpRequest) -> HttpResponse {
             status: 404,
             ctype: "text/plain; charset=utf-8",
             body: b"not found".to_vec(),
-            stamp: false,
             headers: Vec::new(),
         },
         _ => HttpResponse {
             status: 405,
             ctype: "text/plain; charset=utf-8",
             body: b"method not allowed".to_vec(),
-            stamp: false,
             headers: Vec::new(),
         },
     }
@@ -420,14 +437,12 @@ fn static_response(name: &str) -> HttpResponse {
             status: 200,
             ctype: mime(name),
             body,
-            stamp: false,
             headers: Vec::new(),
         },
         Err(_) => HttpResponse {
             status: 404,
             ctype: "text/plain; charset=utf-8",
             body: b"not found".to_vec(),
-            stamp: false,
             headers: Vec::new(),
         },
     }
@@ -454,7 +469,6 @@ fn json_response(status: u16, value: Value) -> HttpResponse {
         status,
         ctype: "application/json; charset=utf-8",
         body: value.to_string().into_bytes(),
-        stamp: false,
         headers: Vec::new(),
     }
 }
@@ -770,9 +784,12 @@ fn bootstrap(body: &[u8]) -> HttpResponse {
         return json_response(400, json!({"ok": false, "error": err}));
     }
     if let Err(err) = set_hostname(hostname) {
+        let _ = durable::remove(Path::new(HOSTNAME_FILE));
         return json_response(502, json!({"ok": false, "error": err}));
     }
     if let Err(err) = identity::create_first_administrator(admin, &req.password) {
+        let _ = durable::remove(Path::new(HOSTNAME_FILE));
+        let _ = durable::remove(Path::new("/var/lib/fwos/identity.json"));
         return json_response(502, json!({"ok": false, "error": err}));
     }
     let mut desired = json!({
@@ -789,7 +806,7 @@ fn bootstrap(body: &[u8]) -> HttpResponse {
     if !req.wan_pd.trim().is_empty() {
         desired["wan_pd"] = json!(req.wan_pd.trim());
     }
-    match netd_apply(&desired) {
+    match netd_bootstrap(&desired) {
         Ok(reply) => {
             let ok = reply.get("ok").and_then(Value::as_bool).unwrap_or(false);
             if ok {
@@ -797,14 +814,28 @@ fn bootstrap(body: &[u8]) -> HttpResponse {
                     status: 200,
                     ctype: "application/json; charset=utf-8",
                     body: json!({"ok": true}).to_string().into_bytes(),
-                    stamp: true,
                     headers: Vec::new(),
                 }
             } else {
                 json_response(502, reply)
             }
         }
-        Err(err) => json_response(502, json!({"ok": false, "error": err})),
+        Err(err) if Path::new(BOOTSTRAP).exists() => json_response(
+            502,
+            json!({
+                "ok": false,
+                "bootstrapped": true,
+                "error": err,
+                "next_action": "sign in to review and repair configuration"
+            }),
+        ),
+        Err(err) => json_response(
+            502,
+            json!({
+                "ok": false,
+                "error": format!("Bootstrap outcome not confirmed: {err}; check status or the Appliance console before retrying")
+            }),
+        ),
     }
 }
 
@@ -918,26 +949,16 @@ fn boot_l2_key(iface: &BootIface) -> (String, Option<u16>) {
     (parent, iface.vlan)
 }
 
-fn stamp_bootstrap() -> Result<(), String> {
-    if let Some(dir) = Path::new(BOOTSTRAP).parent() {
-        fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
-    }
-    fs::write(BOOTSTRAP, "ok\n").map_err(|e| format!("write {BOOTSTRAP}: {e}"))
-}
-
 fn set_hostname(name: &str) -> Result<(), String> {
-    if let Some(dir) = Path::new(HOSTNAME_FILE).parent() {
-        fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
-    }
-    fs::write(HOSTNAME_FILE, format!("{name}\n"))
-        .map_err(|e| format!("write {HOSTNAME_FILE}: {e}"))?;
+    durable::write(Path::new(HOSTNAME_FILE), format!("{name}\n").as_bytes())?;
     // The Host hostname program consumes this file. The UI does not need a
     // writable Host /etc mount or privileges for OS account administration.
     Ok(())
 }
 
-fn netd_apply(body: &Value) -> Result<Value, String> {
-    let raw = serde_json::to_vec(body).map_err(|e| format!("encode desired: {e}"))?;
+fn netd_bootstrap(body: &Value) -> Result<Value, String> {
+    let raw = serde_json::to_vec(&json!({"op": "bootstrap_apply", "desired": body}))
+        .map_err(|e| format!("encode desired: {e}"))?;
     let mut stream = UnixStream::connect(SOCK).map_err(|e| format!("connect {SOCK}: {e}"))?;
     let _ = stream.set_read_timeout(Some(Duration::from_secs(60)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(60)));

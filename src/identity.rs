@@ -158,6 +158,17 @@ pub fn create_first_administrator(username: &str, password: &str) -> Result<(), 
     write_configuration(&config)
 }
 
+/// A Bootstrap commit requires the tentative local administrator to be
+/// readable and authorized as an administrator before ownership is recorded.
+pub fn tentative_first_administrator_exists() -> bool {
+    IdentityConfiguration::read().is_ok_and(|configuration| {
+        configuration
+            .accounts
+            .iter()
+            .any(|account| account.source == LOCAL_SOURCE && account.administrator)
+    })
+}
+
 fn write_configuration(config: &IdentityConfiguration) -> Result<(), String> {
     let raw = serde_json::to_vec(config).map_err(|_| "encode Identity configuration")?;
     let parent = Path::new(IDENTITY).parent().ok_or("Identity directory")?;

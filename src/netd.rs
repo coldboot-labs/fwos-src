@@ -15,6 +15,7 @@ use std::process::{self, Command};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use fwos_fwd_setup::{durable, identity};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -22,6 +23,9 @@ const SOCK: &str = "/var/lib/fwos/netd.sock";
 const DESIRED: &str = "/var/lib/fwos/desired.toml";
 const OPT_FILE: &str = "/var/lib/fwos/first-boot-opt.json";
 const BOOTSTRAPPED: &str = "/var/lib/fwos/bootstrapped";
+const BOOTSTRAP_ATTEMPT: &str = "/var/lib/fwos/bootstrap-attempt.json";
+const IDENTITY: &str = "/var/lib/fwos/identity.json";
+const HOSTNAME: &str = "/var/lib/fwos/hostname";
 const CGNAT: [u8; 2] = [100, 64];
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -97,6 +101,11 @@ struct FirstBootOpt {
     cidr: Option<String>,
 }
 
+#[derive(Serialize, Deserialize)]
+struct BootstrapAttempt {
+    vlan_links: Vec<String>,
+}
+
 fn main() {
     if let Err(err) = run() {
         eprintln!("netd: {err}");
@@ -105,17 +114,10 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    let path = Path::new(SOCK);
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-    }
-    let _ = fs::remove_file(path);
-    let listener = UnixListener::bind(path).map_err(|e| format!("bind {SOCK}: {e}"))?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o660))
-        .map_err(|e| format!("chmod {SOCK}: {e}"))?;
-    let gid = wheel_gid().unwrap_or(10);
-    chown(path, Some(0), Some(gid)).map_err(|e| format!("chown {SOCK}: {e}"))?;
     program_host_pull()?;
+    if !Path::new(BOOTSTRAPPED).exists() {
+        recover_incomplete_bootstrap()?;
+    }
     if Path::new(DESIRED).exists() {
         let raw = fs::read_to_string(DESIRED).map_err(|e| format!("read {DESIRED}: {e}"))?;
         let mut state: DesiredState =
@@ -128,6 +130,16 @@ fn run() -> Result<(), String> {
             apply_opt(&opt)?;
         }
     }
+    let path = Path::new(SOCK);
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    }
+    let _ = fs::remove_file(path);
+    let listener = UnixListener::bind(path).map_err(|e| format!("bind {SOCK}: {e}"))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o660))
+        .map_err(|e| format!("chmod {SOCK}: {e}"))?;
+    let gid = wheel_gid().unwrap_or(10);
+    chown(path, Some(0), Some(gid)).map_err(|e| format!("chown {SOCK}: {e}"))?;
     let mut observed_exposure = None;
     let mut refresh_at = Instant::now();
     loop {
@@ -186,21 +198,28 @@ fn handle_client(mut stream: UnixStream) -> Result<(), String> {
     stream
         .read_to_end(&mut buf)
         .map_err(|e| format!("read socket: {e}"))?;
+    if buf.is_empty() {
+        return Ok(());
+    }
     let reply = match serde_json::from_slice::<Value>(&buf) {
         Ok(v) if v.get("op").and_then(Value::as_str).is_some() => handle_cmd(&v),
-        Ok(v) => match serde_json::from_value::<DesiredState>(v) {
-            Ok(mut state) => match apply(&mut state) {
-                Ok(()) => {
-                    if let Err(err) = persist(&state) {
-                        json!({"ok": false, "error": err}).to_string()
-                    } else {
-                        json!({"ok": true}).to_string()
+        Ok(v) if Path::new(BOOTSTRAPPED).exists() => {
+            match serde_json::from_value::<DesiredState>(v) {
+                Ok(mut state) => match apply(&mut state) {
+                    Ok(()) => {
+                        if let Err(err) = persist(&state) {
+                            json!({"ok": false, "error": err}).to_string()
+                        } else {
+                            json!({"ok": true}).to_string()
+                        }
                     }
-                }
-                Err(err) => json!({"ok": false, "error": err}).to_string(),
-            },
-            Err(err) => json!({"ok": false, "error": err.to_string()}).to_string(),
-        },
+                    Err(err) => json!({"ok": false, "error": err}).to_string(),
+                },
+                Err(err) => json!({"ok": false, "error": err.to_string()}).to_string(),
+            }
+        }
+        Ok(_) => json!({"ok": false, "error": "complete Bootstrap before applying Desired state"})
+            .to_string(),
         Err(err) => json!({"ok": false, "error": err.to_string()}).to_string(),
     };
     stream
@@ -216,6 +235,17 @@ fn handle_cmd(v: &Value) -> String {
         "opt" => match parse_opt(v).and_then(apply_and_persist_opt) {
             Ok(()) => json!({"ok": true}).to_string(),
             Err(err) => json!({"ok": false, "error": err}).to_string(),
+        },
+        "bootstrap_apply" => match bootstrap_apply(v) {
+            Ok(()) => json!({"ok": true}).to_string(),
+            Err(err) if Path::new(BOOTSTRAPPED).exists() => json!({
+                "ok": false,
+                "bootstrapped": true,
+                "error": err,
+                "next_action": "sign in to review and repair configuration"
+            })
+            .to_string(),
+            Err(err) => json!({"ok": false, "bootstrapped": false, "error": err}).to_string(),
         },
         other => json!({"ok": false, "error": format!("unknown op {other}")}).to_string(),
     }
@@ -253,7 +283,125 @@ fn parse_opt(v: &Value) -> Result<FirstBootOpt, String> {
 
 fn persist(state: &DesiredState) -> Result<(), String> {
     let raw = toml::to_string_pretty(state).map_err(|e| format!("encode TOML: {e}"))?;
-    fs::write(DESIRED, raw).map_err(|e| format!("write {DESIRED}: {e}"))
+    durable::write(Path::new(DESIRED), raw.as_bytes())
+}
+
+fn bootstrap_apply(request: &Value) -> Result<(), String> {
+    if Path::new(BOOTSTRAPPED).exists() {
+        return Err("already bootstrapped".into());
+    }
+    match bootstrap_apply_inner(request) {
+        Ok(()) => Ok(()),
+        Err(error) if Path::new(BOOTSTRAPPED).exists() => {
+            Err(format!("Bootstrap ownership is recorded; {error}"))
+        }
+        Err(error) => Err(fail_bootstrap_attempt(error)),
+    }
+}
+
+fn bootstrap_apply_inner(request: &Value) -> Result<(), String> {
+    let mut state: DesiredState = serde_json::from_value(
+        request
+            .get("desired")
+            .cloned()
+            .ok_or("missing Bootstrap Desired state")?,
+    )
+    .map_err(|error| format!("invalid Bootstrap Desired state: {error}"))?;
+    validate(&state)?;
+    if !identity::tentative_first_administrator_exists() {
+        return Err("first administrator is not durable".into());
+    }
+    let hostname = state
+        .hostname
+        .as_deref()
+        .ok_or("missing Bootstrap hostname")?;
+    if fs::read_to_string(HOSTNAME)
+        .map(|name| name.trim().to_string())
+        .ok()
+        .as_deref()
+        != Some(hostname)
+    {
+        return Err("Bootstrap hostname is not durable".into());
+    }
+    let attempt = BootstrapAttempt {
+        vlan_links: state
+            .interfaces
+            .iter()
+            .filter(|iface| iface.vlan.is_some())
+            .map(|iface| iface.name.clone())
+            .collect(),
+    };
+    let raw = serde_json::to_vec(&attempt)
+        .map_err(|error| format!("encode Bootstrap attempt: {error}"))?;
+    durable::write(Path::new(BOOTSTRAP_ATTEMPT), &raw)?;
+    apply(&mut state)?;
+    if !identity::tentative_first_administrator_exists() {
+        return Err("first administrator disappeared during apply".into());
+    }
+    durable::write(Path::new(BOOTSTRAPPED), b"ok\n")?;
+    // The Host path units watch these files. Incomplete attempts must not
+    // start LAN services; next boot replays Desired if publication fails.
+    program_lan_services(&state, true)?;
+    for file in [OPT_FILE, BOOTSTRAP_ATTEMPT] {
+        if let Err(error) = durable::remove(Path::new(file)) {
+            eprintln!("netd: completed Bootstrap cleanup: {error}");
+        }
+    }
+    Ok(())
+}
+
+fn fail_bootstrap_attempt(error: String) -> String {
+    match recover_incomplete_bootstrap() {
+        Ok(()) => error,
+        Err(recovery) => format!("{error}; Bootstrap recovery failed: {recovery}"),
+    }
+}
+
+fn recover_incomplete_bootstrap() -> Result<(), String> {
+    if Path::new(BOOTSTRAPPED).exists() {
+        return Ok(());
+    }
+    let attempt = match fs::read(BOOTSTRAP_ATTEMPT) {
+        Ok(raw) => Some(
+            serde_json::from_slice::<BootstrapAttempt>(&raw)
+                .map_err(|error| format!("parse Bootstrap attempt: {error}"))?,
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("read Bootstrap attempt: {error}")),
+    };
+    if let Some(attempt) = &attempt {
+        stop_dhclient();
+        for name in &attempt.vlan_links {
+            if link_exists(name)? {
+                run_ip(&["link", "delete", "dev", name])?;
+            }
+        }
+        for nic in traffic_nic_names()? {
+            lock_unopted(&nic)?;
+            run_ip(&["link", "set", &nic, "up"])?;
+        }
+        nft_apply("flush ruleset\n")?;
+        nft_apply(&host_pull_nft())?;
+    }
+    for file in [
+        DESIRED,
+        IDENTITY,
+        HOSTNAME,
+        "/var/lib/fwos/kea/kea-dhcp4.conf",
+        "/var/lib/fwos/kea/kea-dhcp6.conf",
+        "/var/lib/fwos/unbound/unbound.conf",
+        BOOTSTRAP_ATTEMPT,
+    ] {
+        durable::remove(Path::new(file))?;
+    }
+    if attempt.is_some() {
+        if let Some(opt) = load_opt() {
+            apply_opt(&opt)?;
+        } else {
+            program_first_boot_nft("", &[])?;
+        }
+    }
+    Ok(())
 }
 
 fn validate(state: &DesiredState) -> Result<(), String> {
@@ -418,7 +566,11 @@ fn apply(state: &mut DesiredState) -> Result<(), String> {
         saved.push((iface.name.clone(), addrs));
     }
     merge_lan_prefix_addr(state);
-    discard_opt()?;
+    if Path::new(BOOTSTRAPPED).exists() {
+        discard_opt()?;
+    } else {
+        suspend_opt()?;
+    }
     for iface in &state.interfaces {
         if iface.vlan.is_none() {
             require_in_fwd(&iface.name)?;
@@ -437,7 +589,7 @@ fn apply(state: &mut DesiredState) -> Result<(), String> {
     program_wg(state)?;
     program_routes(state)?;
     program_qdiscs(state)?;
-    program_lan_services(state)?;
+    program_lan_services(state, Path::new(BOOTSTRAPPED).exists())?;
     persist(state)?;
     program_nft(state)
 }
@@ -486,7 +638,7 @@ fn program_vlans(state: &DesiredState) -> Result<(), String> {
     Ok(())
 }
 
-fn program_lan_services(state: &DesiredState) -> Result<(), String> {
+fn program_lan_services(state: &DesiredState, publish: bool) -> Result<(), String> {
     let Some(lan) = lan_l2(state) else {
         return Ok(());
     };
@@ -504,6 +656,9 @@ fn program_lan_services(state: &DesiredState) -> Result<(), String> {
         if let Some(v6) = pd_lan_addr(pd) {
             add_addr(&lan.name, &v6)?;
         }
+    }
+    if !publish {
+        return Ok(());
     }
     let Some(pool) = state.dhcp_pool.as_deref() else {
         return Ok(());
@@ -918,13 +1073,16 @@ fn teardown_opt(opt: &FirstBootOpt) -> Result<(), String> {
     program_first_boot_nft("", &[])
 }
 
-fn discard_opt() -> Result<(), String> {
+fn suspend_opt() -> Result<(), String> {
     if let Some(opt) = load_opt() {
         teardown_opt(&opt)?;
     }
-    nft_apply("destroy table inet fwos-first-boot\n")?;
-    let _ = fs::remove_file(OPT_FILE);
-    Ok(())
+    nft_apply("destroy table inet fwos-first-boot\n")
+}
+
+fn discard_opt() -> Result<(), String> {
+    suspend_opt()?;
+    durable::remove(Path::new(OPT_FILE))
 }
 
 fn ephemeral_dhcp(nic: &str) -> Result<(), String> {

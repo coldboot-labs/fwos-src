@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use fwos_fwd_setup::desired::{DesiredState, StaticRoute};
 use fwos_fwd_setup::identity::{self, Authentication, AuthenticationResult};
 use fwos_fwd_setup::{bootstrap_values, durable};
 
@@ -405,6 +406,8 @@ fn dispatch(req: &HttpRequest) -> HttpResponse {
         ("POST", "/api/login") => login(req),
         ("POST", "/api/logout") => logout(req),
         ("GET", "/api/administrators") => administrators(authentication.as_ref()),
+        ("GET", "/api/routes") => routes(),
+        ("POST", "/api/routes/apply") => apply_routes(req),
         ("POST", "/api/administrators") => create_administrator(req, authentication.as_ref()),
         ("POST", "/api/administrators/password") => {
             change_administrator_password(req, authentication.as_ref())
@@ -1086,10 +1089,14 @@ fn list_nics() -> Vec<Value> {
 }
 
 fn netd_cmd(body: &Value) -> Result<Value, String> {
+    netd_cmd_with_timeout(body, Duration::from_secs(5))
+}
+
+fn netd_cmd_with_timeout(body: &Value, timeout: Duration) -> Result<Value, String> {
     let raw = serde_json::to_vec(body).map_err(|e| format!("encode netd cmd: {e}"))?;
     let mut stream = UnixStream::connect(SOCK).map_err(|e| format!("connect {SOCK}: {e}"))?;
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
     stream
         .write_all(&raw)
         .map_err(|e| format!("write socket: {e}"))?;
@@ -1101,6 +1108,99 @@ fn netd_cmd(body: &Value) -> Result<Value, String> {
         .read_to_end(&mut reply)
         .map_err(|e| format!("read socket: {e}"))?;
     serde_json::from_slice(&reply).map_err(|e| format!("parse netd reply: {e}"))
+}
+
+fn complete_desired() -> Result<DesiredState, String> {
+    let reply = netd_cmd(&json!({"op": "get_desired"}))?;
+    if reply["ok"] != true {
+        return Err(reply["error"]
+            .as_str()
+            .unwrap_or("Desired state unavailable")
+            .to_string());
+    }
+    serde_json::from_value(reply["desired"].clone())
+        .map_err(|e| format!("decode Desired state: {e}"))
+}
+
+fn routes() -> HttpResponse {
+    if !Path::new(BOOTSTRAP).exists() {
+        return json_response(
+            409,
+            json!({"ok": false, "error": "complete Bootstrap first"}),
+        );
+    }
+    match complete_desired() {
+        Ok(desired) => json_response(
+            200,
+            json!({
+                "ok": true,
+                "status": "accepted",
+                "revision": desired.revision,
+                "routes": desired.routes,
+                "interfaces": desired.interfaces.iter().map(|iface| iface.name.as_str()).collect::<Vec<_>>()
+            }),
+        ),
+        Err(error) => json_response(502, json!({"ok": false, "error": error})),
+    }
+}
+
+fn apply_routes(req: &HttpRequest) -> HttpResponse {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct RouteChange {
+        base_revision: u64,
+        routes: Vec<StaticRoute>,
+    }
+    if !Path::new(BOOTSTRAP).exists() {
+        return json_response(
+            409,
+            json!({"ok": false, "error": "complete Bootstrap first"}),
+        );
+    }
+    let change: RouteChange = match serde_json::from_slice(&req.body) {
+        Ok(change) => change,
+        Err(error) => {
+            return json_response(
+                400,
+                json!({"ok": false, "outcome": "rejected", "error": format!("invalid route change: {error}")}),
+            )
+        }
+    };
+    let mut desired = match complete_desired() {
+        Ok(desired) => desired,
+        Err(error) => return json_response(502, json!({"ok": false, "error": error})),
+    };
+    if desired.revision != change.base_revision {
+        return json_response(
+            409,
+            json!({"ok": false, "outcome": "rejected", "error": "Accepted Desired state changed; reload before applying", "revision": desired.revision}),
+        );
+    }
+    desired.routes = change.routes;
+    let reply = match netd_cmd_with_timeout(
+        &json!({
+            "op": "apply_desired",
+            "base_revision": change.base_revision,
+            "desired": desired,
+        }),
+        Duration::from_secs(60),
+    ) {
+        Ok(reply) => reply,
+        Err(error) => {
+            return json_response(
+                502,
+                json!({"ok": false, "outcome": "indeterminate", "error": format!("netd apply outcome unavailable: {error}")}),
+            )
+        }
+    };
+    let status = if reply["ok"] == true {
+        200
+    } else if reply["outcome"] == "rejected" {
+        400
+    } else {
+        502
+    };
+    json_response(status, reply)
 }
 
 fn valid_hostname(name: &str) -> bool {

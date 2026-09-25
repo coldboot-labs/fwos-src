@@ -5,8 +5,10 @@ use network::{
     FWD_MGMT_VETH, MGMT_FWD_IP, MGMT_FWD_IP6,
 };
 
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{Read, Write};
+use std::net::IpAddr;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{chown, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -15,6 +17,8 @@ use std::process::{self, Command};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use base64::Engine;
+use fwos_fwd_setup::desired::{DesiredState, Iface};
 use fwos_fwd_setup::{bootstrap_values, durable, identity};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -27,71 +31,6 @@ const BOOTSTRAP_ATTEMPT: &str = "/var/lib/fwos/bootstrap-attempt.json";
 const IDENTITY: &str = "/var/lib/fwos/identity.json";
 const HOSTNAME: &str = "/var/lib/fwos/hostname";
 const CGNAT: [u8; 2] = [100, 64];
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct DesiredState {
-    #[serde(default)]
-    interfaces: Vec<Iface>,
-    #[serde(default)]
-    wireguard: Vec<Wg>,
-    #[serde(default)]
-    routes: Vec<StaticRoute>,
-    #[serde(default)]
-    nft_extra: Vec<String>,
-    #[serde(default)]
-    qdiscs: Vec<Qdisc>,
-    #[serde(default)]
-    hostname: Option<String>,
-    #[serde(default)]
-    lan_prefix: Option<String>,
-    #[serde(default)]
-    dhcp_pool: Option<String>,
-    #[serde(default)]
-    wan_pd: Option<String>,
-    #[serde(default)]
-    ui_exposure: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Iface {
-    name: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    placement: String,
-    #[serde(default)]
-    role: Option<String>,
-    #[serde(default)]
-    addresses: Vec<String>,
-    #[serde(default)]
-    vlan: Option<u16>,
-    #[serde(default)]
-    parent: Option<String>,
-    #[serde(default)]
-    dhcp: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Wg {
-    name: String,
-    private_key: String,
-    #[serde(default)]
-    listen_port: Option<u16>,
-    #[serde(default)]
-    addresses: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct StaticRoute {
-    to: String,
-    via: String,
-    #[serde(default)]
-    dev: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Qdisc {
-    dev: String,
-    kind: String,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FirstBootOpt {
@@ -221,21 +160,10 @@ fn handle_client(mut stream: UnixStream) -> Result<(), String> {
     }
     let reply = match serde_json::from_slice::<Value>(&buf) {
         Ok(v) if v.get("op").and_then(Value::as_str).is_some() => handle_cmd(&v),
-        Ok(v) if Path::new(BOOTSTRAPPED).exists() => {
-            match serde_json::from_value::<DesiredState>(v) {
-                Ok(mut state) => match apply(&mut state) {
-                    Ok(()) => {
-                        if let Err(err) = persist(&state) {
-                            json!({"ok": false, "error": err}).to_string()
-                        } else {
-                            json!({"ok": true}).to_string()
-                        }
-                    }
-                    Err(err) => json!({"ok": false, "error": err}).to_string(),
-                },
-                Err(err) => json!({"ok": false, "error": err.to_string()}).to_string(),
-            }
-        }
+        // Older console and socket clients send bare complete Desired JSON.
+        // Their base is the current Accepted revision at receipt, on this
+        // single-threaded socket loop; they use the same validation and apply.
+        Ok(v) if Path::new(BOOTSTRAPPED).exists() => apply_desired_request(&v, None).to_string(),
         Ok(_) => json!({"ok": false, "error": "complete Bootstrap before applying Desired state"})
             .to_string(),
         Err(err) => json!({"ok": false, "error": err.to_string()}).to_string(),
@@ -275,8 +203,84 @@ fn handle_cmd(v: &Value) -> String {
                 json!({"ok": false, "bootstrapped": false, "error": err}).to_string()
             }
         },
+        "get_desired" => match accepted_desired() {
+            Ok(desired) => {
+                json!({"ok": true, "desired": desired, "revision": desired.revision}).to_string()
+            }
+            Err(error) => json!({"ok": false, "error": error}).to_string(),
+        },
+        "apply_desired" => {
+            if !Path::new(BOOTSTRAPPED).exists() {
+                return json!({"ok": false, "outcome": "rejected", "error": "complete Bootstrap before applying Desired state"}).to_string();
+            }
+            let Some(base) = v.get("base_revision").and_then(Value::as_u64) else {
+                return json!({"ok": false, "outcome": "rejected", "error": "base_revision is required"}).to_string();
+            };
+            apply_desired_request(v.get("desired").unwrap_or(&Value::Null), Some(base)).to_string()
+        }
         other => json!({"ok": false, "error": format!("unknown op {other}")}).to_string(),
     }
+}
+
+fn accepted_desired() -> Result<DesiredState, String> {
+    let raw =
+        fs::read_to_string(DESIRED).map_err(|e| format!("read Accepted Desired state: {e}"))?;
+    let mut state: DesiredState =
+        toml::from_str(&raw).map_err(|e| format!("parse Accepted Desired state: {e}"))?;
+    if state.revision == 0 {
+        state.revision = 1;
+    }
+    Ok(state)
+}
+
+fn apply_desired_request(input: &Value, base_revision: Option<u64>) -> Value {
+    let current = match accepted_desired() {
+        Ok(state) => state,
+        Err(error) => return json!({"ok": false, "outcome": "failed", "error": error}),
+    };
+    let base = base_revision.unwrap_or(current.revision);
+    if base != current.revision {
+        return json!({"ok": false, "outcome": "rejected", "revision": current.revision, "error": "Accepted Desired state changed; reload before applying"});
+    }
+    let mut proposed: DesiredState = match serde_json::from_value(input.clone()) {
+        Ok(state) => state,
+        Err(error) => {
+            return json!({"ok": false, "outcome": "rejected", "revision": current.revision, "error": format!("invalid complete Desired state: {error}")})
+        }
+    };
+    if let Err(error) = validate(&proposed) {
+        return json!({"ok": false, "outcome": "rejected", "revision": current.revision, "error": error});
+    }
+    if let Err(error) = nft_check(&nft_rules(&proposed)) {
+        return json!({"ok": false, "outcome": "rejected", "revision": current.revision, "error": error});
+    }
+    let Some(next_revision) = current.revision.checked_add(1) else {
+        return json!({"ok": false, "outcome": "rejected", "error": "revision limit reached"});
+    };
+    proposed.revision = next_revision;
+    if let Err(error) = apply(&mut proposed) {
+        return json!({"ok": false, "outcome": "failed", "revision": current.revision, "error": error});
+    }
+    if let Err(error) = remove_stale_routes(&current, &proposed) {
+        return json!({"ok": false, "outcome": "failed", "revision": current.revision, "error": error});
+    }
+    if let Err(error) = persist(&proposed) {
+        return json!({"ok": false, "outcome": "failed", "status": "applied_not_accepted", "applied": true, "accepted": false, "revision": current.revision, "error": format!("Accepted Desired state was not saved: {error}")});
+    }
+    json!({"ok": true, "outcome": "accepted", "status": "accepted", "applied": true, "accepted": true, "revision": proposed.revision, "base_revision": base})
+}
+
+fn remove_stale_routes(previous: &DesiredState, proposed: &DesiredState) -> Result<(), String> {
+    for old in &previous.routes {
+        if !proposed.routes.iter().any(|new| new.to == old.to) {
+            if old.to.contains(':') {
+                run_ip(&["-6", "route", "del", &old.to])?;
+            } else {
+                run_ip(&["-4", "route", "del", &old.to])?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn parse_opt(v: &Value) -> Result<FirstBootOpt, String> {
@@ -380,6 +384,7 @@ fn bootstrap_apply_inner(request: &Value) -> Result<(), BootstrapFailure> {
         .map_err(|error| format!("encode Bootstrap attempt: {error}"))?;
     durable::write(Path::new(BOOTSTRAP_ATTEMPT), &raw)?;
     apply(&mut state)?;
+    persist(&state)?;
     if identity::tentative_first_administrator_subject().as_deref() != Some(admin_subject) {
         return Err("Bootstrap administrator changed during apply".into());
     }
@@ -484,6 +489,100 @@ fn recover_incomplete_bootstrap() -> Result<(), String> {
 }
 
 fn validate(state: &DesiredState) -> Result<(), String> {
+    for iface in &state.interfaces {
+        bootstrap_values::interface(
+            &iface.name,
+            iface.parent.as_deref(),
+            iface.vlan,
+            &iface.addresses,
+        )?;
+    }
+    bootstrap_values::addressing(
+        state.lan_prefix.as_deref(),
+        state.dhcp_pool.as_deref(),
+        state.wan_pd.as_deref(),
+    )?;
+    for wg in &state.wireguard {
+        bootstrap_values::interface(&wg.name, None, None, &wg.addresses)?;
+        let key = base64::engine::general_purpose::STANDARD
+            .decode(&wg.private_key)
+            .map_err(|_| format!("WireGuard {} has an invalid private key", wg.name))?;
+        if key.len() != 32 {
+            return Err(format!("WireGuard {} has an invalid private key", wg.name));
+        }
+    }
+    for qdisc in &state.qdiscs {
+        let known_dev = state.interfaces.iter().any(|iface| iface.name == qdisc.dev)
+            || state.wireguard.iter().any(|wg| wg.name == qdisc.dev);
+        if !known_dev
+            || qdisc.kind.is_empty()
+            || !qdisc
+                .kind
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            return Err(format!("invalid qdisc on {}", qdisc.dev));
+        }
+    }
+    let mut destinations = HashSet::new();
+    for route in &state.routes {
+        let (address, prefix) = route
+            .to
+            .split_once('/')
+            .ok_or_else(|| format!("route destination {} must be a CIDR prefix", route.to))?;
+        let destination: IpAddr = address
+            .parse()
+            .map_err(|_| format!("invalid route destination {}", route.to))?;
+        let bits: u8 = prefix
+            .parse()
+            .map_err(|_| format!("invalid route destination {}", route.to))?;
+        let max = if destination.is_ipv4() { 32 } else { 128 };
+        if bits > max {
+            return Err(format!("invalid route destination {}", route.to));
+        }
+        let canonical = match destination {
+            IpAddr::V4(ip) => {
+                let mask = if bits == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - bits)
+                };
+                u32::from(ip) & mask == u32::from(ip)
+            }
+            IpAddr::V6(ip) => {
+                let mask = if bits == 0 {
+                    0
+                } else {
+                    u128::MAX << (128 - bits)
+                };
+                u128::from(ip) & mask == u128::from(ip)
+            }
+        };
+        if !canonical || !destinations.insert((destination, bits)) {
+            return Err(format!(
+                "invalid or duplicate route destination {}",
+                route.to
+            ));
+        }
+        let gateway: IpAddr = route
+            .via
+            .parse()
+            .map_err(|_| format!("invalid route next hop {}", route.via))?;
+        if destination.is_ipv4() != gateway.is_ipv4()
+            || gateway.is_unspecified()
+            || gateway.is_multicast()
+        {
+            return Err(format!(
+                "route {} needs a usable next hop of the same IP family",
+                route.to
+            ));
+        }
+        if let Some(dev) = route.dev.as_deref() {
+            if !state.interfaces.iter().any(|iface| iface.name == dev) {
+                return Err(format!("route {} uses unknown interface {dev}", route.to));
+            }
+        }
+    }
     for iface in &state.interfaces {
         if iface.placement == "mgmt" {
             return Err("placement=mgmt is not a contract; use roles and ui_exposure".into());
@@ -669,7 +768,6 @@ fn apply(state: &mut DesiredState) -> Result<(), String> {
     program_routes(state)?;
     program_qdiscs(state)?;
     program_lan_services(state, Path::new(BOOTSTRAPPED).exists())?;
-    persist(state)?;
     program_nft(state)
 }
 
@@ -970,6 +1068,32 @@ fn nft_apply(rules: &str) -> Result<(), String> {
     }
 }
 
+fn nft_check(rules: &str) -> Result<(), String> {
+    let mut child = Command::new("nft")
+        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+        .args(["-c", "-f", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("validate firewall rules: {e}"))?;
+    child
+        .stdin
+        .as_mut()
+        .ok_or("nft validation stdin")?
+        .write_all(rules.as_bytes())
+        .map_err(|e| format!("validate firewall rules: {e}"))?;
+    if child
+        .wait()
+        .map_err(|e| format!("validate firewall rules: {e}"))?
+        .success()
+    {
+        Ok(())
+    } else {
+        Err("invalid complete Desired state firewall rules".into())
+    }
+}
+
 fn program_wg(state: &DesiredState) -> Result<(), String> {
     for wg in &state.wireguard {
         if !link_exists(&wg.name)? {
@@ -1008,7 +1132,8 @@ fn program_wg(state: &DesiredState) -> Result<(), String> {
 
 fn program_routes(state: &DesiredState) -> Result<(), String> {
     for route in &state.routes {
-        let mut args = vec!["route", "replace", &route.to, "via", &route.via];
+        let family = if route.to.contains(':') { "-6" } else { "-4" };
+        let mut args = vec![family, "route", "replace", &route.to, "via", &route.via];
         if let Some(dev) = route.dev.as_deref() {
             args.push("dev");
             args.push(dev);
@@ -1464,7 +1589,7 @@ mod tests {
         let v: Value = serde_json::from_str(r#"{"op":"list"}"#).unwrap();
         assert!(v.get("op").and_then(Value::as_str).is_some());
         let desired = serde_json::from_value::<DesiredState>(v.clone());
-        assert!(desired.unwrap().interfaces.is_empty());
+        assert!(desired.is_err());
     }
 
     #[test]

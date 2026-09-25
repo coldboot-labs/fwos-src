@@ -515,13 +515,12 @@ fn validate(state: &DesiredState) -> Result<(), String> {
         let known_dev = state.interfaces.iter().any(|iface| iface.name == qdisc.dev)
             || state.wireguard.iter().any(|wg| wg.name == qdisc.dev);
         if !known_dev
-            || qdisc.kind.is_empty()
-            || !qdisc
-                .kind
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            || !matches!(
+                qdisc.kind.as_str(),
+                "fq_codel" | "fq" | "pfifo" | "bfifo" | "sfq" | "cake"
+            )
         {
-            return Err(format!("invalid qdisc on {}", qdisc.dev));
+            return Err(format!("unsupported qdisc {} on {}", qdisc.kind, qdisc.dev));
         }
     }
     let mut destinations = HashSet::new();
@@ -577,10 +576,24 @@ fn validate(state: &DesiredState) -> Result<(), String> {
                 route.to
             ));
         }
+        if matches!(gateway, IpAddr::V6(address) if address.is_unicast_link_local())
+            && route.dev.is_none()
+        {
+            return Err(format!(
+                "route {} needs an interface for a link-local next hop",
+                route.to
+            ));
+        }
         if let Some(dev) = route.dev.as_deref() {
             if !state.interfaces.iter().any(|iface| iface.name == dev) {
                 return Err(format!("route {} uses unknown interface {dev}", route.to));
             }
+        }
+        if !route_next_hop_on_link(state, gateway, route.dev.as_deref())? {
+            return Err(format!(
+                "route {} next hop {} is not on-link",
+                route.to, route.via
+            ));
         }
     }
     for iface in &state.interfaces {
@@ -647,6 +660,76 @@ fn validate(state: &DesiredState) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn route_next_hop_on_link(
+    state: &DesiredState,
+    gateway: IpAddr,
+    device: Option<&str>,
+) -> Result<bool, String> {
+    let first_lan = state
+        .interfaces
+        .iter()
+        .find(|iface| iface.role.as_deref() == Some("lan"));
+    for iface in &state.interfaces {
+        if device.is_some_and(|name| name != iface.name) || iface.role.as_deref() == Some("mgmt") {
+            continue;
+        }
+        let mut addresses = iface.addresses.clone();
+        if first_lan.is_some_and(|lan| lan.name == iface.name) {
+            if let Some(prefix) = state.lan_prefix.as_deref() {
+                if let Some(host) = first_v4_host(prefix) {
+                    if let Some((_, bits)) = prefix.split_once('/') {
+                        addresses.push(format!("{host}/{bits}"));
+                    }
+                }
+            }
+        }
+        // DHCP addresses are absent from Desired state. Observe only that
+        // interface, without treating addresses on a changing static interface
+        // as part of the proposal.
+        if iface.dhcp && iface.addresses.is_empty() {
+            addresses.extend(iface_cidrs(&iface.name)?);
+        }
+        if addresses
+            .iter()
+            .any(|address| gateway_in_cidr(gateway, address))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn gateway_in_cidr(gateway: IpAddr, cidr: &str) -> bool {
+    let Some((address, bits)) = cidr.split_once('/') else {
+        return false;
+    };
+    let (Ok(address), Ok(bits)) = (address.parse::<IpAddr>(), bits.parse::<u8>()) else {
+        return false;
+    };
+    if gateway == address {
+        return false;
+    }
+    match (gateway, address) {
+        (IpAddr::V4(gateway), IpAddr::V4(address)) if bits <= 32 => {
+            let mask = if bits == 0 {
+                0
+            } else {
+                u32::MAX << (32 - bits)
+            };
+            u32::from(gateway) & mask == u32::from(address) & mask
+        }
+        (IpAddr::V6(gateway), IpAddr::V6(address)) if bits <= 128 => {
+            let mask = if bits == 0 {
+                0
+            } else {
+                u128::MAX << (128 - bits)
+            };
+            u128::from(gateway) & mask == u128::from(address) & mask
+        }
+        _ => false,
+    }
 }
 
 fn validate_mgmt_iface(iface: &Iface) -> Result<(), String> {
@@ -1583,6 +1666,67 @@ fn wheel_gid() -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fwos_fwd_setup::desired::{Qdisc, StaticRoute};
+
+    #[test]
+    fn complete_desired_rejects_off_link_next_hop_before_apply() {
+        let mut state = wan_lan();
+        state.routes = vec![
+            StaticRoute {
+                to: "198.51.100.0/24".into(),
+                via: "192.0.2.2".into(),
+                dev: Some("enp2s0".into()),
+            },
+            StaticRoute {
+                to: "203.0.113.0/24".into(),
+                via: "192.0.3.2".into(),
+                dev: Some("enp2s0".into()),
+            },
+        ];
+        assert!(validate(&state).unwrap_err().contains("on-link"));
+    }
+
+    #[test]
+    fn complete_desired_rejects_unsupported_qdisc_before_apply() {
+        let mut state = wan_lan();
+        state.routes.push(StaticRoute {
+            to: "198.51.100.0/24".into(),
+            via: "192.0.2.2".into(),
+            dev: Some("enp2s0".into()),
+        });
+        state.qdiscs.push(Qdisc {
+            dev: "enp2s0".into(),
+            kind: "entirely_bogus".into(),
+        });
+        assert!(validate(&state).unwrap_err().contains("unsupported qdisc"));
+    }
+
+    #[test]
+    fn complete_desired_accepts_supported_qdisc_and_on_link_next_hop() {
+        let mut state = wan_lan();
+        state.routes.push(StaticRoute {
+            to: "198.51.100.0/24".into(),
+            via: "192.0.2.2".into(),
+            dev: Some("enp2s0".into()),
+        });
+        state.qdiscs.push(Qdisc {
+            dev: "enp2s0".into(),
+            kind: "fq_codel".into(),
+        });
+        assert!(validate(&state).is_ok());
+    }
+
+    #[test]
+    fn complete_desired_requires_interface_for_ipv6_link_local_next_hop() {
+        let mut state = wan_lan();
+        state.interfaces[1].addresses.push("fe80::1/64".into());
+        state.routes.push(StaticRoute {
+            to: "2001:db8:100::/64".into(),
+            via: "fe80::2".into(),
+            dev: None,
+        });
+        assert!(validate(&state).unwrap_err().contains("interface"));
+    }
 
     #[test]
     fn cmd_json_is_not_empty_desired() {

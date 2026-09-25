@@ -5,11 +5,14 @@ use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
+use fwos_fwd_setup::desired::DesiredState;
 use fwos_fwd_setup::identity::{self, Authentication, AuthenticationResult};
 
 const CGNAT: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 0);
 const BOOTSTRAPPED: &str = "/var/lib/fwos/bootstrapped";
 const DESIRED: &str = "/var/lib/fwos/desired.toml";
+const APPLY_OPERATION: &str = "/var/lib/fwos/apply-operation.json";
+const APPLY_PREVIOUS: &str = "/var/lib/fwos/apply-previous.toml";
 const PREVIOUS_ACCEPTED: &str = "/var/lib/fwos/previous-accepted.toml";
 const HOSTNAME_FILE: &str = "/var/lib/fwos/hostname";
 
@@ -404,16 +407,47 @@ fn print_admin_help(out: &mut impl Write) -> Result<(), String> {
 
 fn print_admin_status(out: &mut impl Write) -> Result<(), String> {
     writeln!(out, "FWOS Appliance CLI").map_err(|e| e.to_string())?;
+    let operation = fs::read_to_string(APPLY_OPERATION)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+    let accepted_phase = operation
+        .as_ref()
+        .and_then(|value| value.get("phase"))
+        .and_then(|phase| phase.as_str())
+        == Some("accepted");
+    let indeterminate = accepted_phase
+        && matches!(
+            super::netd_json(&serde_json::json!({"op": "get_desired"})),
+            Ok(reply) if reply["outcome"] == "recovery_required"
+        );
+    let recovery_required = Path::new(APPLY_PREVIOUS).exists()
+        || (Path::new(APPLY_OPERATION).exists() && !accepted_phase);
+    let recovery_target = operation
+        .as_ref()
+        .and_then(|operation| operation.get("accepted").cloned())
+        .and_then(|accepted| serde_json::from_value::<DesiredState>(accepted).ok())
+        .and_then(|accepted| toml::Value::try_from(accepted).ok())
+        .or_else(|| {
+            fs::read_to_string(APPLY_PREVIOUS)
+                .ok()
+                .and_then(|raw| raw.parse::<toml::Value>().ok())
+        });
     let desired = fs::read_to_string(DESIRED)
         .ok()
         .and_then(|raw| raw.parse::<toml::Value>().ok());
+    let shown = if indeterminate {
+        None
+    } else if recovery_required {
+        recovery_target.as_ref()
+    } else {
+        desired.as_ref()
+    };
     let hostname = fs::read_to_string(HOSTNAME_FILE)
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .or_else(|| {
-            desired
-                .as_ref()
+            shown
                 .and_then(|v| v.get("hostname"))
                 .and_then(|x| x.as_str())
                 .map(str::to_string)
@@ -424,24 +458,52 @@ fn print_admin_status(out: &mut impl Write) -> Result<(), String> {
     if bootstrapped() {
         writeln!(out, "bootstrapped").map_err(|e| e.to_string())?;
     }
-    if let Some(revision) = desired
-        .as_ref()
+    if recovery_required {
+        writeln!(out, "Recovery required: interrupted Desired state apply")
+            .map_err(|e| e.to_string())?;
+    } else if indeterminate {
+        writeln!(
+            out,
+            "Apply outcome indeterminate: reboot to resolve Accepted state"
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    if let Some(revision) = shown
         .and_then(|v| v.get("revision"))
         .and_then(|v| v.as_integer())
     {
-        writeln!(out, "Accepted network revision: {revision}").map_err(|e| e.to_string())?;
+        if recovery_required {
+            writeln!(out, "Recovery target Accepted network revision: {revision}")
+                .map_err(|e| e.to_string())?;
+        } else {
+            writeln!(out, "Accepted network revision: {revision}").map_err(|e| e.to_string())?;
+        }
     }
-    let predecessor = fs::read_to_string(PREVIOUS_ACCEPTED)
-        .ok()
-        .and_then(|raw| raw.parse::<toml::Value>().ok())
-        .and_then(|v| v.get("revision").and_then(|revision| revision.as_integer()));
-    match predecessor {
-        Some(revision) => writeln!(out, "Previous accepted network revision: {revision}"),
-        None => writeln!(out, "Previous accepted network revision: (none)"),
+    let predecessor = if recovery_required && Path::new(APPLY_OPERATION).exists() {
+        operation
+            .as_ref()
+            .and_then(|operation| operation.get("previous_accepted").cloned())
+            .and_then(|bytes| {
+                serde_json::from_value::<Option<Vec<u8>>>(bytes)
+                    .ok()
+                    .flatten()
+            })
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .and_then(|raw| raw.parse::<toml::Value>().ok())
+            .and_then(|v| v.get("revision").and_then(|revision| revision.as_integer()))
+    } else {
+        fs::read_to_string(PREVIOUS_ACCEPTED)
+            .ok()
+            .and_then(|raw| raw.parse::<toml::Value>().ok())
+            .and_then(|v| v.get("revision").and_then(|revision| revision.as_integer()))
+    };
+    match (indeterminate, predecessor) {
+        (true, _) => writeln!(out, "Previous accepted network revision: (indeterminate)"),
+        (false, Some(revision)) => writeln!(out, "Previous accepted network revision: {revision}"),
+        (false, None) => writeln!(out, "Previous accepted network revision: (none)"),
     }
     .map_err(|e| e.to_string())?;
-    if let Some(ifaces) = desired
-        .as_ref()
+    if let Some(ifaces) = shown
         .and_then(|v| v.get("interfaces"))
         .and_then(|x| x.as_array())
     {
@@ -456,8 +518,7 @@ fn print_admin_status(out: &mut impl Write) -> Result<(), String> {
             }
         }
     }
-    if let Some(exp) = desired
-        .as_ref()
+    if let Some(exp) = shown
         .and_then(|v| v.get("ui_exposure"))
         .and_then(|x| x.as_array())
     {

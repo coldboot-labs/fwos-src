@@ -26,6 +26,7 @@ use serde_json::{json, Value};
 
 const SOCK: &str = "/var/lib/fwos/netd.sock";
 const DESIRED: &str = "/var/lib/fwos/desired.toml";
+const APPLY_OPERATION: &str = "/var/lib/fwos/apply-operation.json";
 const APPLY_PREVIOUS: &str = "/var/lib/fwos/apply-previous.toml";
 const PREVIOUS_ACCEPTED: &str = "/var/lib/fwos/previous-accepted.toml";
 const LAN_SERVICES_READY: &str = "/var/lib/fwos/lan-services-ready";
@@ -39,7 +40,82 @@ const CGNAT: [u8; 2] = [100, 64];
 static RECOVERY_REQUIRED: AtomicBool = AtomicBool::new(false);
 
 fn recovery_pending() -> bool {
-    RECOVERY_REQUIRED.load(Ordering::SeqCst) || Path::new(APPLY_PREVIOUS).exists()
+    RECOVERY_REQUIRED.load(Ordering::SeqCst)
+        || operation_requires_recovery()
+        || Path::new(APPLY_PREVIOUS).exists()
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ApplyPhase {
+    Applying,
+    Accepted,
+}
+
+impl Default for ApplyPhase {
+    fn default() -> Self {
+        Self::Applying
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct ApplyOperation {
+    #[serde(default)]
+    phase: ApplyPhase,
+    accepted: DesiredState,
+    previous_accepted: Option<Vec<u8>>,
+}
+
+fn operation_requires_recovery() -> bool {
+    if !Path::new(APPLY_OPERATION).exists() {
+        return false;
+    }
+    match fs::read(APPLY_OPERATION)
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<ApplyOperation>(&raw).ok())
+    {
+        Some(operation) => operation.phase == ApplyPhase::Applying,
+        None => true,
+    }
+}
+
+struct RecoveryTarget {
+    operation: ApplyOperation,
+    marker: &'static str,
+    restore_predecessor: bool,
+}
+
+fn read_recovery_target() -> Result<RecoveryTarget, String> {
+    if Path::new(APPLY_OPERATION).exists() {
+        let raw = fs::read(APPLY_OPERATION)
+            .map_err(|error| format!("read in-flight apply operation: {error}"))?;
+        let operation: ApplyOperation = serde_json::from_slice(&raw)
+            .map_err(|error| format!("parse in-flight apply operation: {error}"))?;
+        if operation.phase == ApplyPhase::Accepted {
+            return Err(
+                "apply operation is already Accepted; reboot to finish an indeterminate commit"
+                    .into(),
+            );
+        }
+        return Ok(RecoveryTarget {
+            operation,
+            marker: APPLY_OPERATION,
+            restore_predecessor: true,
+        });
+    }
+    let raw = fs::read_to_string(APPLY_PREVIOUS)
+        .map_err(|error| format!("read legacy in-flight Accepted recovery target: {error}"))?;
+    let accepted = toml::from_str(&raw)
+        .map_err(|error| format!("parse legacy in-flight Accepted recovery target: {error}"))?;
+    Ok(RecoveryTarget {
+        operation: ApplyOperation {
+            phase: ApplyPhase::Applying,
+            accepted,
+            previous_accepted: None,
+        },
+        marker: APPLY_PREVIOUS,
+        restore_predecessor: false,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,11 +157,22 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
+    let interrupted = Path::new(BOOTSTRAPPED).exists()
+        && (operation_requires_recovery() || Path::new(APPLY_PREVIOUS).exists());
+    if interrupted {
+        require_recovery_guard()?;
+    }
     program_host_pull()?;
     if !Path::new(BOOTSTRAPPED).exists() {
         recover_incomplete_bootstrap()?;
     }
-    if Path::new(DESIRED).exists() {
+    if interrupted {
+        if let Err(error) = recover_interrupted_apply() {
+            eprintln!(
+                "netd: interrupted Desired state apply needs authenticated recovery: {error}"
+            );
+        }
+    } else if Path::new(DESIRED).exists() {
         let raw = fs::read_to_string(DESIRED).map_err(|e| format!("read {DESIRED}: {e}"))?;
         let mut state: DesiredState =
             toml::from_str(&raw).map_err(|e| format!("parse {DESIRED}: {e}"))?;
@@ -93,6 +180,11 @@ fn run() -> Result<(), String> {
         persist(&state)?;
         if Path::new(BOOTSTRAPPED).exists() && !recovery_pending() {
             set_lan_services_ready(true)?;
+        }
+        if Path::new(APPLY_OPERATION).exists() && !operation_requires_recovery() {
+            if let Err(error) = durable::remove(Path::new(APPLY_OPERATION)) {
+                eprintln!("netd: remove completed apply journal after restart: {error}");
+            }
         }
     } else {
         program_first_boot_nft("", &[])?;
@@ -258,7 +350,14 @@ fn restore_previous_request() -> Value {
         return json!({"ok": false, "outcome": "rejected", "error": "complete Bootstrap before restoring Desired state"});
     }
     if recovery_pending() {
-        return json!({"ok": false, "outcome": "failed", "restoration": "required", "error": "a previous Desired state apply still requires recovery"});
+        return match recover_interrupted_apply() {
+            Ok(revision) => {
+                json!({"ok": true, "outcome": "restored", "restoration": "restored", "revision": revision})
+            }
+            Err(error) => {
+                json!({"ok": false, "outcome": "failed", "restoration": "required", "error": error})
+            }
+        };
     }
     let current = match accepted_desired() {
         Ok(state) => state,
@@ -336,20 +435,26 @@ fn apply_desired_request(input: &Value, base_revision: Option<u64>) -> Value {
         }
     };
     let lan_ready_before = Path::new(LAN_SERVICES_READY).exists();
-    // The in-flight snapshot is distinct from the retained predecessor. A
-    // failed attempt must not replace the predecessor of the current Accepted
-    // revision, and an interrupted attempt needs a durable recovery target.
-    if let Err(error) = persist_at(Path::new(APPLY_PREVIOUS), &current) {
-        let cleanup = durable::remove(Path::new(APPLY_PREVIOUS));
-        return match cleanup {
-            Ok(()) => {
-                json!({"ok": false, "outcome": "failed", "restoration": "unchanged", "revision": current.revision, "error": format!("could not retain Accepted Desired state before apply: {error}")})
-            }
-            Err(recovery_error) => {
-                RECOVERY_REQUIRED.store(true, Ordering::SeqCst);
-                json!({"ok": false, "outcome": "failed", "restoration": "required", "revision": current.revision, "error": format!("could not retain Accepted Desired state before apply: {error}"), "recovery_error": recovery_error})
-            }
-        };
+    // One atomic operation record retains both the recovery target and its
+    // manual predecessor. B may overwrite either durable file before the
+    // operation is accepted; a restart must be able to restore both.
+    let operation = ApplyOperation {
+        phase: ApplyPhase::Applying,
+        accepted: current.clone(),
+        previous_accepted: old_predecessor.clone(),
+    };
+    let journal = match serde_json::to_vec(&operation) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return json!({"ok": false, "outcome": "failed", "restoration": "unchanged", "revision": current.revision, "error": format!("encode apply operation: {error}")})
+        }
+    };
+    if let Err(error) = durable::write(Path::new(APPLY_OPERATION), &journal) {
+        if operation_requires_recovery() {
+            let guard = require_recovery_guard();
+            return json!({"ok": false, "outcome": "failed", "restoration": "required", "revision": current.revision, "error": format!("could not retain Accepted Desired state before apply: {error}"), "recovery_error": format!("forwarding guard: {guard:?}")});
+        }
+        return json!({"ok": false, "outcome": "failed", "restoration": "unchanged", "revision": current.revision, "error": format!("could not retain Accepted Desired state before apply: {error}")});
     }
     // Host path units and service start conditions both require this marker.
     // Tentative Kea/Unbound files may be written during apply, but cannot
@@ -359,13 +464,21 @@ fn apply_desired_request(input: &Value, base_revision: Option<u64>) -> Value {
         if let Err(cause) = set_lan_services_ready(lan_ready_before) {
             failures.push(format!("restore LAN service readiness: {cause}"));
         }
-        if let Err(cause) = durable::remove(Path::new(APPLY_PREVIOUS)) {
-            failures.push(format!("clear in-flight snapshot: {cause}"));
-        }
         if failures.is_empty() {
-            return json!({"ok": false, "outcome": "failed", "restoration": "unchanged", "revision": current.revision, "error": format!("could not suspend LAN service activation: {error}")});
+            if let Err(cause) = durable::remove(Path::new(APPLY_OPERATION)) {
+                if operation_requires_recovery() {
+                    failures.push(format!("clear in-flight operation: {cause}"));
+                } else {
+                    return json!({"ok": false, "outcome": "failed", "restoration": "unchanged", "revision": current.revision, "error": format!("could not suspend LAN service activation: {error}"), "cleanup_error": cause});
+                }
+            }
+            if failures.is_empty() {
+                return json!({"ok": false, "outcome": "failed", "restoration": "unchanged", "revision": current.revision, "error": format!("could not suspend LAN service activation: {error}")});
+            }
         }
-        RECOVERY_REQUIRED.store(true, Ordering::SeqCst);
+        if let Err(cause) = require_recovery_guard() {
+            failures.push(format!("block forwarding: {cause}"));
+        }
         return json!({"ok": false, "outcome": "failed", "restoration": "required", "revision": current.revision, "error": format!("could not suspend LAN service activation: {error}"), "recovery_error": failures.join("; ")});
     }
     let result = (|| {
@@ -376,7 +489,6 @@ fn apply_desired_request(input: &Value, base_revision: Option<u64>) -> Value {
         wait_lan_services(&generation)?;
         persist(&proposed)?;
         persist_at(Path::new(PREVIOUS_ACCEPTED), &current)?;
-        durable::remove(Path::new(APPLY_PREVIOUS))?;
         Ok::<(), String>(())
     })();
     if let Err(error) = result {
@@ -389,7 +501,86 @@ fn apply_desired_request(input: &Value, base_revision: Option<u64>) -> Value {
             error,
         );
     }
+    let accepted_journal = match serde_json::to_vec(&ApplyOperation {
+        phase: ApplyPhase::Accepted,
+        accepted: current.clone(),
+        previous_accepted: old_predecessor,
+    }) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let guard = require_recovery_guard();
+            return json!({"ok": false, "outcome": "indeterminate", "restoration": "required", "error": format!("encode Accepted apply operation: {error}"), "recovery_error": format!("forwarding guard: {guard:?}")});
+        }
+    };
+    if let Err(error) = durable::write(Path::new(APPLY_OPERATION), &accepted_journal) {
+        let guard = require_recovery_guard();
+        return json!({"ok": false, "outcome": "indeterminate", "restoration": "required", "error": format!("durably accept Desired state: {error}; reboot to resolve the operation"), "recovery_error": format!("forwarding guard: {guard:?}")});
+    }
+    // The accepted phase is durable. Unlink is only cleanup; either outcome
+    // leaves B Accepted and its predecessor A durable across a power loss.
+    if let Err(error) = durable::remove(Path::new(APPLY_OPERATION)) {
+        eprintln!("netd: remove completed apply journal: {error}");
+    }
     json!({"ok": true, "outcome": "accepted", "status": "accepted", "applied": true, "accepted": true, "revision": proposed.revision, "base_revision": base, "predecessor_revision": current.revision})
+}
+
+fn require_recovery_guard() -> Result<(), String> {
+    RECOVERY_REQUIRED.store(true, Ordering::SeqCst);
+    // Retain the prior Accepted input policy while the unconditional forward
+    // drop in nft_rules blocks v4 and v6 transit. A forwarding-only fallback
+    // would open WAN input after the ruleset flush.
+    if let Ok(target) = read_recovery_target() {
+        if nft_apply(&nft_rules(&target.operation.accepted)).is_ok() {
+            return Ok(());
+        }
+    }
+    // A missing, unreadable, or indeterminate journal cannot authorize any
+    // network input. Serial authentication remains available for recovery.
+    nft_apply(&format!(
+        "flush ruleset\n{}table inet fwos-recovery {{\n  chain input {{\n    type filter hook input priority filter; policy drop;\n    iifname \"lo\" accept\n  }}\n  chain forward {{\n    type filter hook forward priority filter; policy drop;\n  }}\n}}\n",
+        host_pull_nft()
+    ))
+}
+
+fn recover_interrupted_apply() -> Result<u64, String> {
+    require_recovery_guard()?;
+    let target = read_recovery_target()?;
+    let mut previous = target.operation.accepted;
+    let tentative = accepted_desired().ok();
+    set_lan_services_ready(false)?;
+    apply(&mut previous)?;
+    if let Some(tentative) = tentative.as_ref() {
+        remove_stale_routes(tentative, &previous)?;
+    }
+    persist(&previous)?;
+    if target.restore_predecessor {
+        match target.operation.previous_accepted.as_deref() {
+            Some(bytes) => durable::write(Path::new(PREVIOUS_ACCEPTED), bytes)?,
+            None => durable::remove(Path::new(PREVIOUS_ACCEPTED))?,
+        }
+    }
+    let generation = set_lan_services_ready(true)?
+        .ok_or("LAN service generation was not published during recovery")?;
+    wait_lan_services(&generation)?;
+    finish_recovery(&previous, target.marker)?;
+    Ok(previous.revision)
+}
+
+fn finish_recovery(previous: &DesiredState, marker: &str) -> Result<(), String> {
+    // Reopen forwarding only after the prior Accepted state and its Host
+    // services are live and durable. The marker still prevents other applies.
+    RECOVERY_REQUIRED.store(false, Ordering::SeqCst);
+    if let Err(error) = program_nft(previous) {
+        let _ = require_recovery_guard();
+        return Err(format!("reopen restored forwarding: {error}"));
+    }
+    if let Err(error) = durable::remove(Path::new(marker)) {
+        let guard = require_recovery_guard();
+        return Err(format!(
+            "complete interrupted apply recovery: {error}; guard: {guard:?}"
+        ));
+    }
+    Ok(())
 }
 
 fn restore_failed_apply(
@@ -401,6 +592,9 @@ fn restore_failed_apply(
     error: String,
 ) -> Value {
     let mut failures = Vec::new();
+    if let Err(cause) = require_recovery_guard() {
+        failures.push(format!("block forwarding during recovery: {cause}"));
+    }
     if let Err(cause) = set_lan_services_ready(false) {
         failures.push(format!("suspend tentative LAN services: {cause}"));
     }
@@ -434,7 +628,7 @@ fn restore_failed_apply(
         }
     }
     if failures.is_empty() {
-        if let Err(cause) = durable::remove(Path::new(APPLY_PREVIOUS)) {
+        if let Err(cause) = finish_recovery(current, APPLY_OPERATION) {
             failures.push(format!("complete recovery: {cause}"));
         }
     }
@@ -1620,6 +1814,9 @@ fn nft_rules(state: &DesiredState) -> String {
     rules.push_str("  }\n");
     rules.push_str("  chain forward {\n");
     rules.push_str("    type filter hook forward priority filter; policy drop;\n");
+    if RECOVERY_REQUIRED.load(Ordering::SeqCst) {
+        rules.push_str("    drop\n");
+    }
     rules.push_str("    ct state established,related accept\n");
     // Host-netns pulls and DNATed UI replies arrive from mgmt on this veth.
     rules.push_str(&format!("    iifname \"{FWD_MGMT_VETH}\" accept\n"));

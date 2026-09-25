@@ -12,7 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use fwos_fwd_setup::desired::{DesiredState, StaticRoute};
-use fwos_fwd_setup::identity::{self, Authentication, AuthenticationResult};
+use fwos_fwd_setup::identity::{self, Authentication, AuthenticationResult, Principal};
 use fwos_fwd_setup::{bootstrap_values, durable};
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -27,6 +27,7 @@ const BOOTSTRAP: &str = "/var/lib/fwos/bootstrapped";
 const BOOTSTRAP_ATTEMPT: &str = "/var/lib/fwos/bootstrap-attempt.json";
 const HOSTNAME_FILE: &str = "/var/lib/fwos/hostname";
 const DESIRED: &str = "/var/lib/fwos/desired.toml";
+const DRAFT_DIR: &str = "/var/lib/fwos/drafts";
 const STATIC_DIR: &str = "/usr/share/fwos-ui";
 const SESSION_COOKIE: &str = "__Host-fwos";
 const SESSION_LIFETIME: Duration = Duration::from_secs(30 * 60);
@@ -39,6 +40,60 @@ struct Session {
 fn sessions() -> &'static Mutex<HashMap<String, Session>> {
     static SESSIONS: OnceLock<Mutex<HashMap<String, Session>>> = OnceLock::new();
     SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Draft {
+    base_revision: u64,
+    version: String,
+    desired: DesiredState,
+}
+
+fn draft_locks() -> &'static Mutex<HashMap<PathBuf, Arc<Mutex<()>>>> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+    LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn draft_lock(path: &Path) -> Arc<Mutex<()>> {
+    let mut locks = draft_locks()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks.entry(path.to_owned()).or_default().clone()
+}
+
+fn hex_component(value: &str) -> String {
+    value
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn draft_path(principal: &Principal) -> PathBuf {
+    Path::new(DRAFT_DIR)
+        .join(hex_component(&principal.source))
+        .join(format!("{}.json", hex_component(&principal.subject)))
+}
+
+fn read_draft(path: &Path) -> Result<Option<Draft>, String> {
+    match fs::read(path) {
+        Ok(raw) => serde_json::from_slice(&raw)
+            .map(Some)
+            .map_err(|_| "saved Draft Desired state is invalid".to_string()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err("saved Draft Desired state is unavailable".into()),
+    }
+}
+
+fn write_draft(path: &Path, draft: &Draft) -> Result<(), String> {
+    let directory = path.parent().ok_or("draft directory missing")?;
+    fs::create_dir_all(directory).map_err(|_| "create private draft directory")?;
+    fs::set_permissions(Path::new(DRAFT_DIR), fs::Permissions::from_mode(0o700))
+        .map_err(|_| "protect draft directory")?;
+    fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+        .map_err(|_| "protect owner draft directory")?;
+    let bytes = serde_json::to_vec(draft).map_err(|_| "encode Draft Desired state")?;
+    durable::write(path, &bytes)
 }
 fn main() {
     if let Err(err) = run() {
@@ -407,7 +462,11 @@ fn dispatch(req: &HttpRequest) -> HttpResponse {
         ("POST", "/api/logout") => logout(req),
         ("GET", "/api/administrators") => administrators(authentication.as_ref()),
         ("GET", "/api/routes") => routes(),
-        ("POST", "/api/routes/apply") => apply_routes(req),
+        ("GET", "/api/draft") => draft_status(authentication.as_ref()),
+        ("POST", "/api/draft/save") => save_draft(req, authentication.as_ref()),
+        ("POST", "/api/draft/apply") => apply_draft(req, authentication.as_ref()),
+        ("POST", "/api/draft/reconcile") => reconcile_draft(req, authentication.as_ref()),
+        ("POST", "/api/routes/apply") => apply_routes(req, authentication.as_ref()),
         ("POST", "/api/administrators") => create_administrator(req, authentication.as_ref()),
         ("POST", "/api/administrators/password") => {
             change_administrator_password(req, authentication.as_ref())
@@ -1122,6 +1181,20 @@ fn complete_desired() -> Result<DesiredState, String> {
         .map_err(|e| format!("decode Desired state: {e}"))
 }
 
+// netd is the only writer and applies from the same atomic Accepted file.
+// A draft may begin from the last durable Accepted snapshot even while a
+// different administrator's apply is occupying netd's serialized socket loop.
+fn accepted_snapshot_for_drafting() -> Result<DesiredState, String> {
+    let raw = fs::read_to_string(DESIRED)
+        .map_err(|_| "Accepted Desired state is unavailable".to_string())?;
+    let mut state: DesiredState =
+        toml::from_str(&raw).map_err(|_| "Accepted Desired state is invalid".to_string())?;
+    if state.revision == 0 {
+        state.revision = 1;
+    }
+    Ok(state)
+}
+
 fn routes() -> HttpResponse {
     if !Path::new(BOOTSTRAP).exists() {
         return json_response(
@@ -1144,13 +1217,302 @@ fn routes() -> HttpResponse {
     }
 }
 
-fn apply_routes(req: &HttpRequest) -> HttpResponse {
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct RouteChange {
-        base_revision: u64,
-        routes: Vec<StaticRoute>,
+fn draft_status(authentication: Option<&Authentication>) -> HttpResponse {
+    let Some(authentication) = authentication else {
+        return json_response(401, json!({"ok": false, "error": "sign in required"}));
+    };
+    if !Path::new(BOOTSTRAP).exists() {
+        return json_response(
+            409,
+            json!({"ok": false, "error": "complete Bootstrap first"}),
+        );
     }
+    let path = draft_path(&authentication.principal);
+    let lock = draft_lock(&path);
+    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let draft = match read_draft(&path) {
+        Ok(draft) => draft,
+        Err(error) => return json_response(502, json!({"ok": false, "error": error})),
+    };
+    let accepted = match accepted_snapshot_for_drafting() {
+        Ok(desired) => desired,
+        Err(error) => return json_response(502, json!({"ok": false, "error": error})),
+    };
+    match draft {
+        Some(draft) => json_response(
+            200,
+            json!({
+                "ok": true, "status": "pending", "base_revision": draft.base_revision,
+                "accepted_revision": accepted.revision, "stale": draft.base_revision != accepted.revision,
+                "version": draft.version, "routes": draft.desired.routes,
+            }),
+        ),
+        None => json_response(
+            200,
+            json!({
+                "ok": true, "status": "none", "accepted_revision": accepted.revision,
+            }),
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RouteChange {
+    base_revision: u64,
+    routes: Vec<StaticRoute>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DraftChange {
+    base_revision: u64,
+    version: Option<String>,
+    routes: Vec<StaticRoute>,
+}
+
+fn save_draft(req: &HttpRequest, authentication: Option<&Authentication>) -> HttpResponse {
+    let Some(authentication) = authentication else {
+        return json_response(401, json!({"ok": false, "error": "sign in required"}));
+    };
+    if !Path::new(BOOTSTRAP).exists() {
+        return json_response(
+            409,
+            json!({"ok": false, "error": "complete Bootstrap first"}),
+        );
+    }
+    let change: DraftChange = match serde_json::from_slice(&req.body) {
+        Ok(change) => change,
+        Err(_) => return json_response(400, json!({"ok": false, "error": "invalid draft change"})),
+    };
+    let path = draft_path(&authentication.principal);
+    let lock = draft_lock(&path);
+    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let existing = match read_draft(&path) {
+        Ok(draft) => draft,
+        Err(error) => return json_response(502, json!({"ok": false, "error": error})),
+    };
+    let (base_revision, mut desired) = match existing {
+        Some(draft) if change.version.as_deref() == Some(draft.version.as_str()) => {
+            (draft.base_revision, draft.desired)
+        }
+        Some(_) => {
+            return json_response(
+                409,
+                json!({"ok": false, "error": "Draft changed; review it again"}),
+            )
+        }
+        None if change.version.is_some() => {
+            return json_response(
+                409,
+                json!({"ok": false, "error": "Draft no longer exists; reload before saving"}),
+            );
+        }
+        None => match accepted_snapshot_for_drafting() {
+            Ok(desired) => (desired.revision, desired),
+            Err(error) => return json_response(502, json!({"ok": false, "error": error})),
+        },
+    };
+    if change.base_revision != base_revision {
+        return json_response(
+            409,
+            json!({"ok": false, "error": "Draft base changed; reload before saving"}),
+        );
+    }
+    desired.routes = change.routes;
+    let version = match identity::random_token() {
+        Ok(version) => version,
+        Err(error) => return json_response(502, json!({"ok": false, "error": error})),
+    };
+    let draft = Draft {
+        base_revision,
+        version,
+        desired,
+    };
+    if let Err(error) = write_draft(&path, &draft) {
+        return json_response(502, json!({"ok": false, "error": error}));
+    }
+    json_response(
+        200,
+        json!({"ok": true, "status": "pending", "base_revision": base_revision, "version": draft.version}),
+    )
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DraftReference {
+    base_revision: u64,
+    version: String,
+}
+
+fn apply_draft(req: &HttpRequest, authentication: Option<&Authentication>) -> HttpResponse {
+    let Some(authentication) = authentication else {
+        return json_response(401, json!({"ok": false, "error": "sign in required"}));
+    };
+    if !Path::new(BOOTSTRAP).exists() {
+        return json_response(
+            409,
+            json!({"ok": false, "error": "complete Bootstrap first"}),
+        );
+    }
+    let reference: DraftReference = match serde_json::from_slice(&req.body) {
+        Ok(reference) => reference,
+        Err(_) => {
+            return json_response(
+                400,
+                json!({"ok": false, "error": "invalid draft reference"}),
+            )
+        }
+    };
+    let path = draft_path(&authentication.principal);
+    let lock = draft_lock(&path);
+    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let draft = match read_draft(&path) {
+        Ok(Some(draft)) => draft,
+        Ok(None) => {
+            return json_response(
+                404,
+                json!({"ok": false, "error": "no private pending draft"}),
+            )
+        }
+        Err(error) => return json_response(502, json!({"ok": false, "error": error})),
+    };
+    if draft.base_revision != reference.base_revision || draft.version != reference.version {
+        return json_response(
+            409,
+            json!({"ok": false, "outcome": "rejected", "error": "Draft changed; review it again"}),
+        );
+    }
+    let accepted = match complete_desired() {
+        Ok(desired) => desired,
+        Err(error) => return json_response(502, json!({"ok": false, "error": error})),
+    };
+    if accepted.revision != draft.base_revision {
+        return json_response(
+            409,
+            json!({
+                "ok": false, "outcome": "rejected", "status": "stale", "revision": accepted.revision,
+                "error": "Accepted Desired state changed; private draft retained for reconciliation"
+            }),
+        );
+    }
+    let reply = match netd_cmd_with_timeout(
+        &json!({"op": "apply_desired", "base_revision": draft.base_revision, "desired": draft.desired}),
+        Duration::from_secs(60),
+    ) {
+        Ok(reply) => reply,
+        Err(error) => {
+            return json_response(
+                502,
+                json!({"ok": false, "outcome": "indeterminate", "error": format!("netd apply outcome unavailable; draft retained: {error}")}),
+            )
+        }
+    };
+    if reply["ok"] != true {
+        let stale = reply["revision"]
+            .as_u64()
+            .is_some_and(|revision| revision != draft.base_revision);
+        return json_response(
+            if stale {
+                409
+            } else if reply["outcome"] == "rejected" {
+                400
+            } else {
+                502
+            },
+            reply,
+        );
+    }
+    if let Err(error) = durable::remove(&path) {
+        return json_response(
+            200,
+            json!({
+                "ok": true, "outcome": "accepted", "status": "accepted", "revision": reply["revision"],
+                "warning": format!("Accepted, but private draft cleanup failed: {error}")
+            }),
+        );
+    }
+    json_response(200, reply)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DraftReconciliation {
+    base_revision: u64,
+    version: String,
+    accepted_revision: u64,
+    routes: Vec<StaticRoute>,
+}
+
+fn reconcile_draft(req: &HttpRequest, authentication: Option<&Authentication>) -> HttpResponse {
+    let Some(authentication) = authentication else {
+        return json_response(401, json!({"ok": false, "error": "sign in required"}));
+    };
+    if !Path::new(BOOTSTRAP).exists() {
+        return json_response(
+            409,
+            json!({"ok": false, "error": "complete Bootstrap first"}),
+        );
+    }
+    let request: DraftReconciliation = match serde_json::from_slice(&req.body) {
+        Ok(request) => request,
+        Err(_) => {
+            return json_response(400, json!({"ok": false, "error": "invalid reconciliation"}))
+        }
+    };
+    let path = draft_path(&authentication.principal);
+    let lock = draft_lock(&path);
+    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let previous = match read_draft(&path) {
+        Ok(Some(draft)) => draft,
+        Ok(None) => {
+            return json_response(
+                404,
+                json!({"ok": false, "error": "no private pending draft"}),
+            )
+        }
+        Err(error) => return json_response(502, json!({"ok": false, "error": error})),
+    };
+    if request.base_revision != previous.base_revision || request.version != previous.version {
+        return json_response(
+            409,
+            json!({"ok": false, "error": "Draft changed; review it again"}),
+        );
+    }
+    let mut accepted = match accepted_snapshot_for_drafting() {
+        Ok(desired) => desired,
+        Err(error) => return json_response(502, json!({"ok": false, "error": error})),
+    };
+    if request.accepted_revision != accepted.revision || request.base_revision == accepted.revision
+    {
+        return json_response(
+            409,
+            json!({"ok": false, "error": "Accepted revision changed; review reconciliation again"}),
+        );
+    }
+    accepted.routes = request.routes;
+    let version = match identity::random_token() {
+        Ok(version) => version,
+        Err(error) => return json_response(502, json!({"ok": false, "error": error})),
+    };
+    let draft = Draft {
+        base_revision: accepted.revision,
+        version,
+        desired: accepted,
+    };
+    if let Err(error) = write_draft(&path, &draft) {
+        return json_response(502, json!({"ok": false, "error": error}));
+    }
+    json_response(
+        200,
+        json!({"ok": true, "status": "pending", "base_revision": draft.base_revision, "version": draft.version}),
+    )
+}
+
+fn apply_routes(req: &HttpRequest, authentication: Option<&Authentication>) -> HttpResponse {
+    let Some(authentication) = authentication else {
+        return json_response(401, json!({"ok": false, "error": "sign in required"}));
+    };
     if !Path::new(BOOTSTRAP).exists() {
         return json_response(
             409,
@@ -1166,6 +1528,22 @@ fn apply_routes(req: &HttpRequest) -> HttpResponse {
             )
         }
     };
+    let path = draft_path(&authentication.principal);
+    let lock = draft_lock(&path);
+    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    match read_draft(&path) {
+        Ok(Some(_)) => {
+            return json_response(
+                409,
+                json!({
+                    "ok": false, "outcome": "rejected",
+                    "error": "Private pending draft exists; review and apply or reconcile it first"
+                }),
+            )
+        }
+        Ok(None) => (),
+        Err(error) => return json_response(502, json!({"ok": false, "error": error})),
+    }
     let mut desired = match complete_desired() {
         Ok(desired) => desired,
         Err(error) => return json_response(502, json!({"ok": false, "error": error})),

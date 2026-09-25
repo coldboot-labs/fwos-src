@@ -1387,6 +1387,9 @@ fn program_vlans(state: &DesiredState) -> Result<(), String> {
 
 fn program_lan_services(state: &DesiredState, publish: bool) -> Result<(), String> {
     let Some(lan) = lan_l2(state) else {
+        if publish {
+            remove_lan_service_configs()?;
+        }
         return Ok(());
     };
     let prefix = state
@@ -1394,6 +1397,9 @@ fn program_lan_services(state: &DesiredState, publish: bool) -> Result<(), Strin
         .clone()
         .or_else(|| state.dhcp_pool.as_deref().and_then(prefix_from_pool));
     let Some(prefix) = prefix else {
+        if publish {
+            remove_lan_service_configs()?;
+        }
         return Ok(());
     };
     let lan_v4 = first_v4_host(&prefix).ok_or_else(|| "lan_prefix has no v4 host".to_string())?;
@@ -1408,13 +1414,7 @@ fn program_lan_services(state: &DesiredState, publish: bool) -> Result<(), Strin
         return Ok(());
     }
     let Some(pool) = state.dhcp_pool.as_deref() else {
-        for path in [
-            "/var/lib/fwos/kea/kea-dhcp4.conf",
-            "/var/lib/fwos/kea/kea-dhcp6.conf",
-            "/var/lib/fwos/unbound/unbound.conf",
-        ] {
-            durable::remove(Path::new(path))?;
-        }
+        remove_lan_service_configs()?;
         return Ok(());
     };
     fs::create_dir_all("/var/lib/fwos/kea").map_err(|e| format!("mkdir kea: {e}"))?;
@@ -1440,11 +1440,22 @@ fn program_lan_services(state: &DesiredState, publish: bool) -> Result<(), Strin
     Ok(())
 }
 
+fn remove_lan_service_configs() -> Result<(), String> {
+    for path in [
+        "/var/lib/fwos/kea/kea-dhcp4.conf",
+        "/var/lib/fwos/kea/kea-dhcp6.conf",
+        "/var/lib/fwos/unbound/unbound.conf",
+    ] {
+        durable::remove(Path::new(path))?;
+    }
+    Ok(())
+}
+
 fn kea_dhcp4_conf(dev: &str, prefix: &str, p1: &str, p2: &str, lan_v4: &str) -> String {
     format!(
         r#"{{
   "Dhcp4": {{
-    "interfaces-config": {{ "interfaces": [ "{dev}" ], "re-detect": true }},
+    "interfaces-config": {{ "interfaces": [ "{dev}" ], "re-detect": true, "service-sockets-require-all": true }},
     "lease-database": {{ "type": "memfile", "persist": false, "name": "/tmp/dhcp4.leases" }},
     "valid-lifetime": 3600,
     "subnet4": [ {{
@@ -1468,7 +1479,7 @@ fn kea_dhcp6_conf(dev: &str, subnet: &str, p1: &str, p2: &str) -> String {
     format!(
         r#"{{
   "Dhcp6": {{
-    "interfaces-config": {{ "interfaces": [ "{dev}" ], "re-detect": true }},
+    "interfaces-config": {{ "interfaces": [ "{dev}" ], "re-detect": true, "service-sockets-require-all": true }},
     "lease-database": {{ "type": "memfile", "persist": false, "name": "/tmp/dhcp6.leases" }},
     "server-id": {{ "type": "LLT", "persist": false }},
     "subnet6": [ {{
@@ -2492,9 +2503,17 @@ mod tests {
         );
         assert!(kea4.contains("\"interfaces\": [ \"enp1s0\" ]"), "{kea4}");
         assert!(kea4.contains("\"interface\": \"enp1s0\""), "{kea4}");
+        assert!(
+            kea4.contains("\"service-sockets-require-all\": true"),
+            "{kea4}"
+        );
         assert!(!kea4.contains("lan0"), "{kea4}");
         let kea6 = kea_dhcp6_conf(&lan.name, "2001:db8::/64", "2001:db8::100", "2001:db8::1ff");
         assert!(kea6.contains("enp1s0"), "{kea6}");
+        assert!(
+            kea6.contains("\"service-sockets-require-all\": true"),
+            "{kea6}"
+        );
         assert!(!kea6.contains("lan0"), "{kea6}");
         let unbound = unbound_conf("192.168.1.1", "192.168.1.0/24");
         assert!(unbound.contains("interface: 192.168.1.1"), "{unbound}");

@@ -589,9 +589,9 @@ fn validate(state: &DesiredState) -> Result<(), String> {
                 return Err(format!("route {} uses unknown interface {dev}", route.to));
             }
         }
-        if !route_next_hop_on_link(state, gateway, route.dev.as_deref())? {
+        if !route_next_hop_on_link(state, gateway, route.dev.as_deref()) {
             return Err(format!(
-                "route {} next hop {} is not on-link",
+                "route {} next hop {} needs a configured on-link interface address",
                 route.to, route.via
             ));
         }
@@ -662,11 +662,7 @@ fn validate(state: &DesiredState) -> Result<(), String> {
     Ok(())
 }
 
-fn route_next_hop_on_link(
-    state: &DesiredState,
-    gateway: IpAddr,
-    device: Option<&str>,
-) -> Result<bool, String> {
+fn route_next_hop_on_link(state: &DesiredState, gateway: IpAddr, device: Option<&str>) -> bool {
     let first_lan = state
         .interfaces
         .iter()
@@ -685,20 +681,14 @@ fn route_next_hop_on_link(
                 }
             }
         }
-        // DHCP addresses are absent from Desired state. Observe only that
-        // interface, without treating addresses on a changing static interface
-        // as part of the proposal.
-        if iface.dhcp && iface.addresses.is_empty() {
-            addresses.extend(iface_cidrs(&iface.name)?);
-        }
         if addresses
             .iter()
             .any(|address| gateway_in_cidr(gateway, address))
         {
-            return Ok(true);
+            return true;
         }
     }
-    Ok(false)
+    false
 }
 
 fn gateway_in_cidr(gateway: IpAddr, cidr: &str) -> bool {
@@ -1726,6 +1716,20 @@ mod tests {
             dev: None,
         });
         assert!(validate(&state).unwrap_err().contains("interface"));
+    }
+
+    #[test]
+    fn complete_desired_rejects_next_hop_reachable_only_by_live_dhcp_address() {
+        let mut state = wan_lan();
+        state.interfaces[1].name = "lo".into();
+        state.interfaces[1].addresses.clear();
+        state.interfaces[1].dhcp = true;
+        state.routes.push(StaticRoute {
+            to: "198.51.100.0/24".into(),
+            via: "127.0.0.2".into(),
+            dev: Some("lo".into()),
+        });
+        assert!(validate(&state).unwrap_err().contains("configured on-link"));
     }
 
     #[test]

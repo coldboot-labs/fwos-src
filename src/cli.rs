@@ -75,6 +75,13 @@ fn show_desired() -> Result<String, String> {
     fs::read_to_string(DESIRED).map_err(|e| format!("read {DESIRED}: {e}"))
 }
 
+fn restore_previous_client() -> Result<String, String> {
+    let body = serde_json::json!({"op": "restore_previous"}).to_string();
+    // Manual recovery uses the same bounded Host activation and rollback as
+    // a normal Desired state apply; keep the socket open for its outcome.
+    socket_roundtrip_for(SOCK, body.as_bytes(), Duration::from_secs(120))
+}
+
 fn update_client(image: &str) -> Result<String, String> {
     if image.is_empty() {
         return Err("usage: update <image>".into());

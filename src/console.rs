@@ -10,6 +10,7 @@ use fwos_fwd_setup::identity::{self, Authentication, AuthenticationResult};
 const CGNAT: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 0);
 const BOOTSTRAPPED: &str = "/var/lib/fwos/bootstrapped";
 const DESIRED: &str = "/var/lib/fwos/desired.toml";
+const PREVIOUS_ACCEPTED: &str = "/var/lib/fwos/previous-accepted.toml";
 const HOSTNAME_FILE: &str = "/var/lib/fwos/hostname";
 
 pub fn run() -> Result<(), String> {
@@ -336,6 +337,17 @@ fn admin_handle(out: &mut impl Write, line: &str) -> Result<AdminAct, String> {
             Ok(AdminAct::Continue)
         }
         "logout" => Ok(AdminAct::Logout),
+        "restore-previous" => {
+            if !rest.is_empty() {
+                writeln!(out, "usage: restore-previous").map_err(|e| e.to_string())?;
+                out.flush().map_err(|e| e.to_string())?;
+                return Ok(AdminAct::Continue);
+            }
+            write_cmd(out, super::restore_previous_client())?;
+            Ok(AdminAct::Continue)
+        }
+        // Existing full-CLI callers remain available until the console
+        // retirement slice, but are no longer advertised in the v1 menu.
         "show" => {
             write_cmd(out, super::show_desired())?;
             Ok(AdminAct::Continue)
@@ -386,11 +398,7 @@ fn write_cmd(out: &mut impl Write, result: Result<String, String>) -> Result<(),
 }
 
 fn print_admin_help(out: &mut impl Write) -> Result<(), String> {
-    writeln!(
-        out,
-        "status\nshow\napply <json|toml|path>\nupdate <image>\nreboot\nrollback\nhelp\nlogout"
-    )
-    .map_err(|e| e.to_string())?;
+    writeln!(out, "status\nrestore-previous\nreboot\nhelp\nlogout").map_err(|e| e.to_string())?;
     out.flush().map_err(|e| e.to_string())
 }
 
@@ -416,6 +424,22 @@ fn print_admin_status(out: &mut impl Write) -> Result<(), String> {
     if bootstrapped() {
         writeln!(out, "bootstrapped").map_err(|e| e.to_string())?;
     }
+    if let Some(revision) = desired
+        .as_ref()
+        .and_then(|v| v.get("revision"))
+        .and_then(|v| v.as_integer())
+    {
+        writeln!(out, "Accepted network revision: {revision}").map_err(|e| e.to_string())?;
+    }
+    let predecessor = fs::read_to_string(PREVIOUS_ACCEPTED)
+        .ok()
+        .and_then(|raw| raw.parse::<toml::Value>().ok())
+        .and_then(|v| v.get("revision").and_then(|revision| revision.as_integer()));
+    match predecessor {
+        Some(revision) => writeln!(out, "Previous accepted network revision: {revision}"),
+        None => writeln!(out, "Previous accepted network revision: (none)"),
+    }
+    .map_err(|e| e.to_string())?;
     if let Some(ifaces) = desired
         .as_ref()
         .and_then(|v| v.get("interfaces"))
@@ -712,15 +736,36 @@ mod tests {
     }
 
     #[test]
-    fn admin_help_lists_apply_show_update() {
+    fn admin_help_offers_limited_recovery_without_full_configuration_cli() {
         let mut out = Vec::new();
         print_admin_help(&mut out).unwrap();
         let s = String::from_utf8(out).unwrap();
-        assert!(s.contains("apply"));
-        assert!(s.contains("show"));
-        assert!(s.contains("update <image>"));
+        assert!(s.contains("status"));
+        assert!(s.contains("restore-previous"));
         assert!(s.contains("reboot"));
-        assert!(s.contains("rollback"));
+        assert!(!s.contains("apply <"));
+        assert!(!s.contains("show"));
+        assert!(!s.contains("update <image>"));
+        assert!(!s.contains("rollback"));
+    }
+
+    #[test]
+    fn admin_restore_previous_is_a_netd_client_not_host_image_rollback() {
+        let mut out = Vec::new();
+        assert_eq!(
+            admin_handle(&mut out, "restore-previous").unwrap(),
+            AdminAct::Continue
+        );
+        let s = String::from_utf8(out).unwrap();
+        assert!(!s.contains("unknown command"));
+        assert!(
+            s.contains("netd.sock"),
+            "network recovery must go through netd: {s}"
+        );
+        assert!(
+            !s.contains("update.sock"),
+            "Host-image rollback is distinct: {s}"
+        );
     }
 
     #[test]

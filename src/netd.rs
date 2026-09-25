@@ -228,6 +228,7 @@ fn handle_cmd(v: &Value) -> String {
             }
             Err(error) => json!({"ok": false, "error": error}).to_string(),
         },
+        "restore_previous" => restore_previous_request().to_string(),
         "apply_desired" => {
             if !Path::new(BOOTSTRAPPED).exists() {
                 return json!({"ok": false, "outcome": "rejected", "error": "complete Bootstrap before applying Desired state"}).to_string();
@@ -250,6 +251,47 @@ fn accepted_desired() -> Result<DesiredState, String> {
         state.revision = 1;
     }
     Ok(state)
+}
+
+fn restore_previous_request() -> Value {
+    if !Path::new(BOOTSTRAPPED).exists() {
+        return json!({"ok": false, "outcome": "rejected", "error": "complete Bootstrap before restoring Desired state"});
+    }
+    if recovery_pending() {
+        return json!({"ok": false, "outcome": "failed", "restoration": "required", "error": "a previous Desired state apply still requires recovery"});
+    }
+    let current = match accepted_desired() {
+        Ok(state) => state,
+        Err(error) => return json!({"ok": false, "outcome": "failed", "error": error}),
+    };
+    let raw = match fs::read_to_string(PREVIOUS_ACCEPTED) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return json!({"ok": false, "outcome": "rejected", "revision": current.revision, "error": "no previous Accepted network revision is available"});
+        }
+        Err(error) => {
+            return json!({"ok": false, "outcome": "failed", "revision": current.revision, "error": format!("read previous Accepted network revision: {error}")});
+        }
+    };
+    let previous: DesiredState = match toml::from_str(&raw) {
+        Ok(state) => state,
+        Err(error) => {
+            return json!({"ok": false, "outcome": "failed", "revision": current.revision, "error": format!("parse previous Accepted network revision: {error}")});
+        }
+    };
+    if previous.revision == 0 || previous.revision >= current.revision {
+        return json!({"ok": false, "outcome": "failed", "revision": current.revision, "error": "previous Accepted network revision is not older than the current revision"});
+    }
+    let input = match serde_json::to_value(previous) {
+        Ok(input) => input,
+        Err(error) => {
+            return json!({"ok": false, "outcome": "failed", "revision": current.revision, "error": format!("encode previous Accepted network revision: {error}")});
+        }
+    };
+    // A manual restoration is a new Accepted revision, not a file copy. The
+    // normal apply transaction retains the displaced current state as its
+    // predecessor and restores that state if this attempt fails.
+    apply_desired_request(&input, Some(current.revision))
 }
 
 fn apply_desired_request(input: &Value, base_revision: Option<u64>) -> Value {
@@ -2176,6 +2218,17 @@ fn wheel_gid() -> Option<u32> {
 mod tests {
     use super::*;
     use fwos_fwd_setup::desired::{Qdisc, StaticRoute};
+
+    #[test]
+    fn network_restoration_is_a_netd_operation_and_requires_bootstrap() {
+        let reply: Value = serde_json::from_str(&handle_cmd(&json!({"op": "restore_previous"})))
+            .expect("netd response");
+        assert_eq!(reply["outcome"], "rejected");
+        assert_eq!(
+            reply["error"],
+            "complete Bootstrap before restoring Desired state"
+        );
+    }
 
     #[test]
     fn complete_desired_rejects_off_link_next_hop_before_apply() {

@@ -14,6 +14,7 @@ use std::os::unix::fs::{chown, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::process::{self, Command};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -27,12 +28,18 @@ const SOCK: &str = "/var/lib/fwos/netd.sock";
 const DESIRED: &str = "/var/lib/fwos/desired.toml";
 const APPLY_PREVIOUS: &str = "/var/lib/fwos/apply-previous.toml";
 const PREVIOUS_ACCEPTED: &str = "/var/lib/fwos/previous-accepted.toml";
+const LAN_SERVICES_READY: &str = "/var/lib/fwos/lan-services-ready";
 const OPT_FILE: &str = "/var/lib/fwos/first-boot-opt.json";
 const BOOTSTRAPPED: &str = "/var/lib/fwos/bootstrapped";
 const BOOTSTRAP_ATTEMPT: &str = "/var/lib/fwos/bootstrap-attempt.json";
 const IDENTITY: &str = "/var/lib/fwos/identity.json";
 const HOSTNAME: &str = "/var/lib/fwos/hostname";
 const CGNAT: [u8; 2] = [100, 64];
+static RECOVERY_REQUIRED: AtomicBool = AtomicBool::new(false);
+
+fn recovery_pending() -> bool {
+    RECOVERY_REQUIRED.load(Ordering::SeqCst) || Path::new(APPLY_PREVIOUS).exists()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FirstBootOpt {
@@ -83,6 +90,9 @@ fn run() -> Result<(), String> {
             toml::from_str(&raw).map_err(|e| format!("parse {DESIRED}: {e}"))?;
         apply(&mut state)?;
         persist(&state)?;
+        if Path::new(BOOTSTRAPPED).exists() && !recovery_pending() {
+            set_lan_services_ready(true)?;
+        }
     } else {
         program_first_boot_nft("", &[])?;
         if let Some(opt) = load_opt() {
@@ -205,7 +215,7 @@ fn handle_cmd(v: &Value) -> String {
                 json!({"ok": false, "bootstrapped": false, "error": err}).to_string()
             }
         },
-        "get_desired" if Path::new(APPLY_PREVIOUS).exists() => json!({
+        "get_desired" if recovery_pending() => json!({
             "ok": false,
             "outcome": "recovery_required",
             "error": "the previous Desired state apply needs recovery before Accepted state is available"
@@ -242,7 +252,7 @@ fn accepted_desired() -> Result<DesiredState, String> {
 }
 
 fn apply_desired_request(input: &Value, base_revision: Option<u64>) -> Value {
-    if Path::new(APPLY_PREVIOUS).exists() {
+    if recovery_pending() {
         return json!({"ok": false, "outcome": "failed", "restoration": "required", "error": "a previous Desired state apply still requires recovery"});
     }
     let current = match accepted_desired() {
@@ -282,6 +292,7 @@ fn apply_desired_request(input: &Value, base_revision: Option<u64>) -> Value {
             return json!({"ok": false, "outcome": "failed", "revision": current.revision, "error": format!("read retained predecessor: {error}")});
         }
     };
+    let lan_ready_before = Path::new(LAN_SERVICES_READY).exists();
     // The in-flight snapshot is distinct from the retained predecessor. A
     // failed attempt must not replace the predecessor of the current Accepted
     // revision, and an interrupted attempt needs a durable recovery target.
@@ -292,9 +303,27 @@ fn apply_desired_request(input: &Value, base_revision: Option<u64>) -> Value {
                 json!({"ok": false, "outcome": "failed", "restoration": "unchanged", "revision": current.revision, "error": format!("could not retain Accepted Desired state before apply: {error}")})
             }
             Err(recovery_error) => {
+                RECOVERY_REQUIRED.store(true, Ordering::SeqCst);
                 json!({"ok": false, "outcome": "failed", "restoration": "required", "revision": current.revision, "error": format!("could not retain Accepted Desired state before apply: {error}"), "recovery_error": recovery_error})
             }
         };
+    }
+    // Host path units and service start conditions both require this marker.
+    // Tentative Kea/Unbound files may be written during apply, but cannot
+    // launch a new service until the replacement is accepted below.
+    if let Err(error) = set_lan_services_ready(false) {
+        let mut failures = Vec::new();
+        if let Err(cause) = set_lan_services_ready(lan_ready_before) {
+            failures.push(format!("restore LAN service readiness: {cause}"));
+        }
+        if let Err(cause) = durable::remove(Path::new(APPLY_PREVIOUS)) {
+            failures.push(format!("clear in-flight snapshot: {cause}"));
+        }
+        if failures.is_empty() {
+            return json!({"ok": false, "outcome": "failed", "restoration": "unchanged", "revision": current.revision, "error": format!("could not suspend LAN service activation: {error}")});
+        }
+        RECOVERY_REQUIRED.store(true, Ordering::SeqCst);
+        return json!({"ok": false, "outcome": "failed", "restoration": "required", "revision": current.revision, "error": format!("could not suspend LAN service activation: {error}"), "recovery_error": failures.join("; ")});
     }
     let result = (|| {
         apply(&mut proposed)?;
@@ -309,8 +338,19 @@ fn apply_desired_request(input: &Value, base_revision: Option<u64>) -> Value {
             &current,
             &proposed,
             &footprint,
+            lan_ready_before,
             old_predecessor.as_deref(),
             error,
+        );
+    }
+    if let Err(error) = set_lan_services_ready(true) {
+        return restore_failed_apply(
+            &current,
+            &proposed,
+            &footprint,
+            lan_ready_before,
+            old_predecessor.as_deref(),
+            format!("publish Accepted LAN services: {error}"),
         );
     }
     json!({"ok": true, "outcome": "accepted", "status": "accepted", "applied": true, "accepted": true, "revision": proposed.revision, "base_revision": base, "predecessor_revision": current.revision})
@@ -320,6 +360,7 @@ fn restore_failed_apply(
     current: &DesiredState,
     proposed: &DesiredState,
     footprint: &RollbackFootprint,
+    lan_ready_before: bool,
     old_predecessor: Option<&[u8]>,
     error: String,
 ) -> Value {
@@ -348,9 +389,39 @@ fn restore_failed_apply(
         }
     }
     if failures.is_empty() {
+        if let Err(cause) = set_lan_services_ready(lan_ready_before) {
+            failures.push(format!("restore LAN service readiness: {cause}"));
+        }
+    }
+    if failures.is_empty() {
         json!({"ok": false, "outcome": "failed", "status": "restored", "restoration": "restored", "applied": false, "accepted": false, "revision": current.revision, "error": error})
     } else {
+        RECOVERY_REQUIRED.store(true, Ordering::SeqCst);
         json!({"ok": false, "outcome": "failed", "status": "recovery_required", "restoration": "failed", "applied": false, "accepted": false, "revision": current.revision, "error": error, "recovery_error": failures.join("; ")})
+    }
+}
+
+fn set_lan_services_ready(ready: bool) -> Result<(), String> {
+    let path = Path::new(LAN_SERVICES_READY);
+    let result = if ready {
+        durable::write(path, b"ready\n")
+    } else {
+        durable::remove(path)
+    };
+    // A parent-directory fsync can fail after the rename/unlink. This marker
+    // is derived from durable Accepted state and recreated at startup, so its
+    // observed presence is decisive for live Host service activation.
+    let observed = match fs::metadata(path) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(format!("inspect LAN service readiness: {error}")),
+    };
+    if observed == ready {
+        Ok(())
+    } else {
+        Err(result
+            .err()
+            .unwrap_or_else(|| "LAN service readiness did not reach requested state".into()))
     }
 }
 
@@ -359,6 +430,7 @@ struct RollbackFootprint {
     addresses: Vec<(String, String)>,
     links: Vec<String>,
     qdiscs: Vec<(String, Option<RootQdisc>, bool)>,
+    wireguard_ports: Vec<(String, u16)>,
     lan_files: Vec<(&'static str, Option<Vec<u8>>)>,
 }
 
@@ -389,6 +461,12 @@ impl RollbackFootprint {
                 links.push(wg.name.clone());
             }
         }
+        let mut wireguard_ports = Vec::new();
+        for wg in &old.wireguard {
+            if link_exists(&wg.name)? {
+                wireguard_ports.push((wg.name.clone(), wireguard_listen_port(&wg.name)?));
+            }
+        }
         let mut qdiscs = Vec::new();
         for qdisc in &next.qdiscs {
             if link_exists(&qdisc.dev)? {
@@ -417,6 +495,7 @@ impl RollbackFootprint {
             addresses,
             links,
             qdiscs,
+            wireguard_ports,
             lan_files,
         })
     }
@@ -443,6 +522,36 @@ impl RollbackFootprint {
                 }
                 Ok(false) => (),
                 Err(error) => failures.push(format!("inspect tentative link {name}: {error}")),
+            }
+        }
+        for (name, prior_port) in &self.wireguard_ports {
+            match wireguard_listen_port(name) {
+                Ok(port) if port == *prior_port => (),
+                Ok(_) => {
+                    let output = Command::new("wg")
+                        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+                        .args(["set", name, "listen-port", &prior_port.to_string()])
+                        .output();
+                    match output {
+                        Ok(output) if output.status.success() => (),
+                        Ok(output) => failures.push(format!(
+                            "restore WireGuard listen port on {name}: {}",
+                            String::from_utf8_lossy(&output.stderr).trim()
+                        )),
+                        Err(error) => failures
+                            .push(format!("restore WireGuard listen port on {name}: {error}")),
+                    }
+                    match wireguard_listen_port(name) {
+                        Ok(restored) if restored == *prior_port => (),
+                        Ok(_) => failures
+                            .push(format!("WireGuard listen port on {name} was not restored")),
+                        Err(error) => failures
+                            .push(format!("verify WireGuard listen port on {name}: {error}")),
+                    }
+                }
+                Err(error) => {
+                    failures.push(format!("inspect WireGuard listen port on {name}: {error}"))
+                }
             }
         }
         for (dev, prior, restore_unconfigured) in &self.qdiscs {
@@ -494,6 +603,21 @@ impl RollbackFootprint {
         }
         failures
     }
+}
+
+fn wireguard_listen_port(name: &str) -> Result<u16, String> {
+    let output = Command::new("wg")
+        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+        .args(["show", name, "listen-port"])
+        .output()
+        .map_err(|error| format!("inspect WireGuard listen port on {name}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!("inspect WireGuard listen port on {name} failed"));
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .map_err(|error| format!("decode WireGuard listen port on {name}: {error}"))
 }
 
 #[derive(PartialEq)]
@@ -723,9 +847,11 @@ fn bootstrap_apply_inner(request: &Value) -> Result<(), BootstrapFailure> {
         return Err("Bootstrap hostname changed during apply".into());
     }
     commit_bootstrap_marker()?;
-    // The Host path units watch these files. Incomplete attempts must not
-    // start LAN services; next boot replays Desired if publication fails.
+    // Host path units watch the readiness marker, and services require both
+    // that marker and their config file. Incomplete attempts must not start
+    // LAN services; next boot replays Desired if publication fails.
     program_lan_services(&state, true)?;
+    set_lan_services_ready(true)?;
     for file in [OPT_FILE, BOOTSTRAP_ATTEMPT] {
         if let Err(error) = durable::remove(Path::new(file)) {
             eprintln!("netd: completed Bootstrap cleanup: {error}");

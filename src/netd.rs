@@ -29,6 +29,7 @@ const DESIRED: &str = "/var/lib/fwos/desired.toml";
 const APPLY_PREVIOUS: &str = "/var/lib/fwos/apply-previous.toml";
 const PREVIOUS_ACCEPTED: &str = "/var/lib/fwos/previous-accepted.toml";
 const LAN_SERVICES_READY: &str = "/var/lib/fwos/lan-services-ready";
+const LAN_SERVICES_RESULT: &str = "/var/lib/fwos/lan-services-result";
 const OPT_FILE: &str = "/var/lib/fwos/first-boot-opt.json";
 const BOOTSTRAPPED: &str = "/var/lib/fwos/bootstrapped";
 const BOOTSTRAP_ATTEMPT: &str = "/var/lib/fwos/bootstrap-attempt.json";
@@ -328,6 +329,9 @@ fn apply_desired_request(input: &Value, base_revision: Option<u64>) -> Value {
     let result = (|| {
         apply(&mut proposed)?;
         remove_stale_routes(&current, &proposed)?;
+        let generation =
+            set_lan_services_ready(true)?.ok_or("LAN service generation was not published")?;
+        wait_lan_services(&generation)?;
         persist(&proposed)?;
         persist_at(Path::new(PREVIOUS_ACCEPTED), &current)?;
         durable::remove(Path::new(APPLY_PREVIOUS))?;
@@ -343,16 +347,6 @@ fn apply_desired_request(input: &Value, base_revision: Option<u64>) -> Value {
             error,
         );
     }
-    if let Err(error) = set_lan_services_ready(true) {
-        return restore_failed_apply(
-            &current,
-            &proposed,
-            &footprint,
-            lan_ready_before,
-            old_predecessor.as_deref(),
-            format!("publish Accepted LAN services: {error}"),
-        );
-    }
     json!({"ok": true, "outcome": "accepted", "status": "accepted", "applied": true, "accepted": true, "revision": proposed.revision, "base_revision": base, "predecessor_revision": current.revision})
 }
 
@@ -365,6 +359,9 @@ fn restore_failed_apply(
     error: String,
 ) -> Value {
     let mut failures = Vec::new();
+    if let Err(cause) = set_lan_services_ready(false) {
+        failures.push(format!("suspend tentative LAN services: {cause}"));
+    }
     let mut previous = current.clone();
     if let Err(cause) = apply(&mut previous) {
         failures.push(format!("restore live Accepted state: {cause}"));
@@ -384,13 +381,19 @@ fn restore_failed_apply(
         failures.push(format!("restore retained predecessor: {cause}"));
     }
     if failures.is_empty() {
-        if let Err(cause) = durable::remove(Path::new(APPLY_PREVIOUS)) {
-            failures.push(format!("complete recovery: {cause}"));
+        match set_lan_services_ready(lan_ready_before) {
+            Ok(Some(generation)) => {
+                if let Err(cause) = wait_lan_services(&generation) {
+                    failures.push(format!("restore Host LAN services: {cause}"));
+                }
+            }
+            Ok(None) => (),
+            Err(cause) => failures.push(format!("restore LAN service readiness: {cause}")),
         }
     }
     if failures.is_empty() {
-        if let Err(cause) = set_lan_services_ready(lan_ready_before) {
-            failures.push(format!("restore LAN service readiness: {cause}"));
+        if let Err(cause) = durable::remove(Path::new(APPLY_PREVIOUS)) {
+            failures.push(format!("complete recovery: {cause}"));
         }
     }
     if failures.is_empty() {
@@ -401,28 +404,70 @@ fn restore_failed_apply(
     }
 }
 
-fn set_lan_services_ready(ready: bool) -> Result<(), String> {
+fn set_lan_services_ready(ready: bool) -> Result<Option<String>, String> {
     let path = Path::new(LAN_SERVICES_READY);
-    let result = if ready {
-        durable::write(path, b"ready\n")
+    let generation = if ready {
+        Some(identity::random_token()?)
     } else {
-        durable::remove(path)
+        None
     };
-    // A parent-directory fsync can fail after the rename/unlink. This marker
-    // is derived from durable Accepted state and recreated at startup, so its
-    // observed presence is decisive for live Host service activation.
-    let observed = match fs::metadata(path) {
-        Ok(_) => true,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+    let result = match &generation {
+        Some(generation) => durable::write(path, generation.as_bytes()),
+        None => durable::remove(path),
+    };
+    // A parent-directory fsync can fail after the rename/unlink. Verify the
+    // exact generation, not just existence: an earlier marker might remain.
+    let observed = match fs::read_to_string(path) {
+        Ok(contents) => Some(contents),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(format!("inspect LAN service readiness: {error}")),
     };
-    if observed == ready {
-        Ok(())
+    if observed.as_deref() == generation.as_deref() {
+        Ok(generation)
     } else {
         Err(result
             .err()
             .unwrap_or_else(|| "LAN service readiness did not reach requested state".into()))
     }
+}
+
+fn wait_lan_services(generation: &str) -> Result<(), String> {
+    wait_lan_services_at(
+        Path::new(LAN_SERVICES_RESULT),
+        generation,
+        Duration::from_secs(24),
+    )
+}
+
+fn wait_lan_services_at(path: &Path, generation: &str, timeout: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match fs::read_to_string(path) {
+            Ok(result) => {
+                if let Some(outcome) = parse_lan_services_result(&result, generation) {
+                    return outcome;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+            Err(error) => return Err(format!("read Host LAN service result: {error}")),
+        }
+        if Instant::now() >= deadline {
+            return Err("Host LAN service reconciliation timed out".into());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn parse_lan_services_result(result: &str, generation: &str) -> Option<Result<(), String>> {
+    let (observed, status) = result.trim().split_once(' ')?;
+    if observed != generation {
+        return None;
+    }
+    Some(if status == "ok" {
+        Ok(())
+    } else {
+        Err(format!("Host LAN service reconciliation failed: {status}"))
+    })
 }
 
 struct RollbackFootprint {
@@ -1363,6 +1408,13 @@ fn program_lan_services(state: &DesiredState, publish: bool) -> Result<(), Strin
         return Ok(());
     }
     let Some(pool) = state.dhcp_pool.as_deref() else {
+        for path in [
+            "/var/lib/fwos/kea/kea-dhcp4.conf",
+            "/var/lib/fwos/kea/kea-dhcp6.conf",
+            "/var/lib/fwos/unbound/unbound.conf",
+        ] {
+            durable::remove(Path::new(path))?;
+        }
         return Ok(());
     };
     fs::create_dir_all("/var/lib/fwos/kea").map_err(|e| format!("mkdir kea: {e}"))?;
@@ -1376,7 +1428,11 @@ fn program_lan_services(state: &DesiredState, publish: bool) -> Result<(), Strin
             let kea6 = kea_dhcp6_conf(&lan.name, &v6_sub, &v6p1, &v6p2);
             fs::write("/var/lib/fwos/kea/kea-dhcp6.conf", kea6)
                 .map_err(|e| format!("write kea-dhcp6: {e}"))?;
+        } else {
+            durable::remove(Path::new("/var/lib/fwos/kea/kea-dhcp6.conf"))?;
         }
+    } else {
+        durable::remove(Path::new("/var/lib/fwos/kea/kea-dhcp6.conf"))?;
     }
     let unbound = unbound_conf(&lan_v4, &prefix);
     fs::write("/var/lib/fwos/unbound/unbound.conf", unbound)
@@ -2678,5 +2734,25 @@ mod tests {
             rules.contains("iifname \"enp3s0\" oifname \"f0mgmt\" tcp dport 443 accept"),
             "HTTPS to the UI veth is not LAN/WAN forward:\n{rules}"
         );
+    }
+
+    #[test]
+    fn host_service_result_requires_the_current_generation() {
+        assert!(parse_lan_services_result("old ok\n", "current").is_none());
+        assert!(parse_lan_services_result("current ok\n", "current")
+            .unwrap()
+            .is_ok());
+        assert!(
+            parse_lan_services_result("current failed:fwos-kea-dhcp4\n", "current")
+                .unwrap()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn missing_host_service_result_times_out_without_acceptance() {
+        let error = wait_lan_services_at(Path::new("/dev/null"), "current", Duration::ZERO)
+            .expect_err("no current-generation acknowledgement");
+        assert!(error.contains("timed out"), "{error}");
     }
 }

@@ -1398,7 +1398,8 @@ fn apply_draft(req: &HttpRequest, authentication: Option<&Authentication>) -> Ht
     }
     let reply = match netd_cmd_with_timeout(
         &json!({"op": "apply_desired", "base_revision": draft.base_revision, "desired": draft.desired}),
-        Duration::from_secs(60),
+        // Allow both bounded Host activation and rollback before reporting.
+        Duration::from_secs(120),
     ) {
         Ok(reply) => reply,
         Err(error) => {
@@ -1561,7 +1562,8 @@ fn apply_routes(req: &HttpRequest, authentication: Option<&Authentication>) -> H
             "base_revision": change.base_revision,
             "desired": desired,
         }),
-        Duration::from_secs(60),
+        // Allow both bounded Host activation and rollback before reporting.
+        Duration::from_secs(120),
     ) {
         Ok(reply) => reply,
         Err(error) => {

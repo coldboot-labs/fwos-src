@@ -61,7 +61,8 @@ fn run() -> Result<(), String> {
 
 fn apply_desired(raw: &str) -> Result<String, String> {
     let json = to_json(raw)?;
-    socket_roundtrip(SOCK, json.as_bytes())
+    // netd may wait for Host service activation and then a bounded rollback.
+    socket_roundtrip_for(SOCK, json.as_bytes(), Duration::from_secs(120))
 }
 
 fn netd_json(body: &serde_json::Value) -> Result<serde_json::Value, String> {

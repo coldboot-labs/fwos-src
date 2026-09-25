@@ -25,6 +25,8 @@ use serde_json::{json, Value};
 
 const SOCK: &str = "/var/lib/fwos/netd.sock";
 const DESIRED: &str = "/var/lib/fwos/desired.toml";
+const APPLY_PREVIOUS: &str = "/var/lib/fwos/apply-previous.toml";
+const PREVIOUS_ACCEPTED: &str = "/var/lib/fwos/previous-accepted.toml";
 const OPT_FILE: &str = "/var/lib/fwos/first-boot-opt.json";
 const BOOTSTRAPPED: &str = "/var/lib/fwos/bootstrapped";
 const BOOTSTRAP_ATTEMPT: &str = "/var/lib/fwos/bootstrap-attempt.json";
@@ -203,6 +205,12 @@ fn handle_cmd(v: &Value) -> String {
                 json!({"ok": false, "bootstrapped": false, "error": err}).to_string()
             }
         },
+        "get_desired" if Path::new(APPLY_PREVIOUS).exists() => json!({
+            "ok": false,
+            "outcome": "recovery_required",
+            "error": "the previous Desired state apply needs recovery before Accepted state is available"
+        })
+        .to_string(),
         "get_desired" => match accepted_desired() {
             Ok(desired) => {
                 json!({"ok": true, "desired": desired, "revision": desired.revision}).to_string()
@@ -234,6 +242,9 @@ fn accepted_desired() -> Result<DesiredState, String> {
 }
 
 fn apply_desired_request(input: &Value, base_revision: Option<u64>) -> Value {
+    if Path::new(APPLY_PREVIOUS).exists() {
+        return json!({"ok": false, "outcome": "failed", "restoration": "required", "error": "a previous Desired state apply still requires recovery"});
+    }
     let current = match accepted_desired() {
         Ok(state) => state,
         Err(error) => return json!({"ok": false, "outcome": "failed", "error": error}),
@@ -258,25 +269,336 @@ fn apply_desired_request(input: &Value, base_revision: Option<u64>) -> Value {
         return json!({"ok": false, "outcome": "rejected", "error": "revision limit reached"});
     };
     proposed.revision = next_revision;
-    if let Err(error) = apply(&mut proposed) {
-        return json!({"ok": false, "outcome": "failed", "revision": current.revision, "error": error});
+    let footprint = match RollbackFootprint::capture(&current, &proposed) {
+        Ok(footprint) => footprint,
+        Err(error) => {
+            return json!({"ok": false, "outcome": "failed", "restoration": "unchanged", "revision": current.revision, "error": format!("could not inspect live network before apply: {error}")})
+        }
+    };
+    let old_predecessor = match fs::read(PREVIOUS_ACCEPTED) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return json!({"ok": false, "outcome": "failed", "revision": current.revision, "error": format!("read retained predecessor: {error}")});
+        }
+    };
+    // The in-flight snapshot is distinct from the retained predecessor. A
+    // failed attempt must not replace the predecessor of the current Accepted
+    // revision, and an interrupted attempt needs a durable recovery target.
+    if let Err(error) = persist_at(Path::new(APPLY_PREVIOUS), &current) {
+        let cleanup = durable::remove(Path::new(APPLY_PREVIOUS));
+        return match cleanup {
+            Ok(()) => {
+                json!({"ok": false, "outcome": "failed", "restoration": "unchanged", "revision": current.revision, "error": format!("could not retain Accepted Desired state before apply: {error}")})
+            }
+            Err(recovery_error) => {
+                json!({"ok": false, "outcome": "failed", "restoration": "required", "revision": current.revision, "error": format!("could not retain Accepted Desired state before apply: {error}"), "recovery_error": recovery_error})
+            }
+        };
     }
-    if let Err(error) = remove_stale_routes(&current, &proposed) {
-        return json!({"ok": false, "outcome": "failed", "revision": current.revision, "error": error});
+    let result = (|| {
+        apply(&mut proposed)?;
+        remove_stale_routes(&current, &proposed)?;
+        persist(&proposed)?;
+        persist_at(Path::new(PREVIOUS_ACCEPTED), &current)?;
+        durable::remove(Path::new(APPLY_PREVIOUS))?;
+        Ok::<(), String>(())
+    })();
+    if let Err(error) = result {
+        return restore_failed_apply(
+            &current,
+            &proposed,
+            &footprint,
+            old_predecessor.as_deref(),
+            error,
+        );
     }
-    if let Err(error) = persist(&proposed) {
-        return json!({"ok": false, "outcome": "failed", "status": "applied_not_accepted", "applied": true, "accepted": false, "revision": current.revision, "error": format!("Accepted Desired state was not saved: {error}")});
+    json!({"ok": true, "outcome": "accepted", "status": "accepted", "applied": true, "accepted": true, "revision": proposed.revision, "base_revision": base, "predecessor_revision": current.revision})
+}
+
+fn restore_failed_apply(
+    current: &DesiredState,
+    proposed: &DesiredState,
+    footprint: &RollbackFootprint,
+    old_predecessor: Option<&[u8]>,
+    error: String,
+) -> Value {
+    let mut failures = Vec::new();
+    let mut previous = current.clone();
+    if let Err(cause) = apply(&mut previous) {
+        failures.push(format!("restore live Accepted state: {cause}"));
     }
-    json!({"ok": true, "outcome": "accepted", "status": "accepted", "applied": true, "accepted": true, "revision": proposed.revision, "base_revision": base})
+    if let Err(cause) = remove_stale_routes(proposed, current) {
+        failures.push(format!("remove tentative routes: {cause}"));
+    }
+    failures.extend(footprint.remove_tentative_state());
+    if let Err(cause) = persist(current) {
+        failures.push(format!("restore durable Accepted state: {cause}"));
+    }
+    let predecessor_result = match old_predecessor {
+        Some(bytes) => durable::write(Path::new(PREVIOUS_ACCEPTED), bytes),
+        None => durable::remove(Path::new(PREVIOUS_ACCEPTED)),
+    };
+    if let Err(cause) = predecessor_result {
+        failures.push(format!("restore retained predecessor: {cause}"));
+    }
+    if failures.is_empty() {
+        if let Err(cause) = durable::remove(Path::new(APPLY_PREVIOUS)) {
+            failures.push(format!("complete recovery: {cause}"));
+        }
+    }
+    if failures.is_empty() {
+        json!({"ok": false, "outcome": "failed", "status": "restored", "restoration": "restored", "applied": false, "accepted": false, "revision": current.revision, "error": error})
+    } else {
+        json!({"ok": false, "outcome": "failed", "status": "recovery_required", "restoration": "failed", "applied": false, "accepted": false, "revision": current.revision, "error": error, "recovery_error": failures.join("; ")})
+    }
+}
+
+struct RollbackFootprint {
+    // Only additions that were absent before the attempt are ours to undo.
+    addresses: Vec<(String, String)>,
+    links: Vec<String>,
+    qdiscs: Vec<(String, Option<RootQdisc>, bool)>,
+    lan_files: Vec<(&'static str, Option<Vec<u8>>)>,
+}
+
+impl RollbackFootprint {
+    fn capture(current: &DesiredState, proposed: &DesiredState) -> Result<Self, String> {
+        let mut old = current.clone();
+        let mut next = proposed.clone();
+        merge_lan_prefix_addr(&mut old);
+        merge_lan_prefix_addr(&mut next);
+        let old_addresses = desired_addresses(&old);
+        let mut addresses = Vec::new();
+        for (dev, cidr) in desired_addresses(&next) {
+            if old_addresses.contains(&(dev.clone(), cidr.clone())) {
+                continue;
+            }
+            if link_exists(&dev)? && !live_address(&dev, &cidr)? {
+                addresses.push((dev, cidr));
+            }
+        }
+        let mut links = Vec::new();
+        for iface in &next.interfaces {
+            if iface.vlan.is_some() && !link_exists(&iface.name)? {
+                links.push(iface.name.clone());
+            }
+        }
+        for wg in &next.wireguard {
+            if !link_exists(&wg.name)? {
+                links.push(wg.name.clone());
+            }
+        }
+        let mut qdiscs = Vec::new();
+        for qdisc in &next.qdiscs {
+            if link_exists(&qdisc.dev)? {
+                let configured_before = old.qdiscs.iter().any(|previous| previous.dev == qdisc.dev);
+                qdiscs.push((
+                    qdisc.dev.clone(),
+                    root_qdisc(&qdisc.dev)?,
+                    !configured_before,
+                ));
+            }
+        }
+        let mut lan_files = Vec::new();
+        for path in [
+            "/var/lib/fwos/kea/kea-dhcp4.conf",
+            "/var/lib/fwos/kea/kea-dhcp6.conf",
+            "/var/lib/fwos/unbound/unbound.conf",
+        ] {
+            let contents = match fs::read(path) {
+                Ok(contents) => Some(contents),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(format!("inspect LAN service configuration: {error}")),
+            };
+            lan_files.push((path, contents));
+        }
+        Ok(Self {
+            addresses,
+            links,
+            qdiscs,
+            lan_files,
+        })
+    }
+
+    fn remove_tentative_state(&self) -> Vec<String> {
+        let mut failures = Vec::new();
+        for (dev, cidr) in &self.addresses {
+            match live_address(dev, cidr) {
+                Ok(true) => {
+                    if let Err(error) = run_ip(&["addr", "del", cidr, "dev", dev]) {
+                        failures.push(format!("remove tentative address on {dev}: {error}"));
+                    }
+                }
+                Ok(false) => (),
+                Err(error) => failures.push(format!("inspect tentative address on {dev}: {error}")),
+            }
+        }
+        for name in &self.links {
+            match link_exists(name) {
+                Ok(true) => {
+                    if let Err(error) = run_ip(&["link", "delete", "dev", name]) {
+                        failures.push(format!("remove tentative link {name}: {error}"));
+                    }
+                }
+                Ok(false) => (),
+                Err(error) => failures.push(format!("inspect tentative link {name}: {error}")),
+            }
+        }
+        for (dev, prior, restore_unconfigured) in &self.qdiscs {
+            let now = match root_qdisc(dev) {
+                Ok(qdisc) => qdisc,
+                Err(error) => {
+                    failures.push(format!("inspect tentative qdisc on {dev}: {error}"));
+                    continue;
+                }
+            };
+            if &now == prior {
+                continue;
+            }
+            if *restore_unconfigured {
+                let mut command = Command::new("tc");
+                command.env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin");
+                match prior {
+                    Some(qdisc) if qdisc.kind != "noqueue" && qdisc.kind != "mq" => {
+                        command.args(["qdisc", "replace", "dev", dev, "root", &qdisc.kind]);
+                    }
+                    _ => {
+                        command.args(["qdisc", "delete", "dev", dev, "root"]);
+                    }
+                }
+                match command.output() {
+                    Ok(output) if output.status.success() => (),
+                    Ok(output) => failures.push(format!(
+                        "restore qdisc on {dev}: {}",
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    )),
+                    Err(error) => failures.push(format!("restore qdisc on {dev}: {error}")),
+                }
+            }
+            match root_qdisc(dev) {
+                Ok(restored) if &restored == prior => (),
+                Ok(_) => failures.push(format!("qdisc options on {dev} were not restored")),
+                Err(error) => failures.push(format!("verify restored qdisc on {dev}: {error}")),
+            }
+        }
+        for (path, contents) in &self.lan_files {
+            let result = match contents {
+                Some(contents) => fs::write(path, contents)
+                    .map_err(|error| format!("restore LAN service configuration: {error}")),
+                None => durable::remove(Path::new(path)),
+            };
+            if let Err(error) = result {
+                failures.push(error);
+            }
+        }
+        failures
+    }
+}
+
+#[derive(PartialEq)]
+struct RootQdisc {
+    kind: String,
+    options: Value,
+}
+
+fn root_qdisc(dev: &str) -> Result<Option<RootQdisc>, String> {
+    let output = Command::new("tc")
+        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+        .args(["-j", "qdisc", "show", "dev", dev])
+        .output()
+        .map_err(|error| format!("inspect qdisc on {dev}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!("inspect qdisc on {dev} failed"));
+    }
+    let qdiscs: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("decode qdisc on {dev}: {error}"))?;
+    Ok(qdiscs.as_array().and_then(|qdiscs| {
+        qdiscs
+            .iter()
+            .find(|qdisc| qdisc["root"] == true)
+            .and_then(|qdisc| {
+                qdisc["kind"].as_str().map(|kind| RootQdisc {
+                    kind: kind.to_owned(),
+                    options: qdisc["options"].clone(),
+                })
+            })
+    }))
+}
+
+fn desired_addresses(state: &DesiredState) -> Vec<(String, String)> {
+    let mut addresses: Vec<(String, String)> = state
+        .interfaces
+        .iter()
+        .flat_map(|iface| {
+            iface
+                .addresses
+                .iter()
+                .map(|cidr| (iface.name.clone(), cidr.clone()))
+        })
+        .chain(state.wireguard.iter().flat_map(|wg| {
+            wg.addresses
+                .iter()
+                .map(|cidr| (wg.name.clone(), cidr.clone()))
+        }))
+        .collect();
+    if let Some(lan) = lan_l2(state) {
+        if let Some(pd) = state.wan_pd.as_deref().and_then(pd_lan_addr) {
+            addresses.push((lan.name.clone(), pd));
+        }
+    }
+    addresses
+}
+
+fn live_address(dev: &str, cidr: &str) -> Result<bool, String> {
+    let (address, bits) = cidr
+        .split_once('/')
+        .ok_or_else(|| format!("invalid address prefix on {dev}"))?;
+    let address: IpAddr = address
+        .parse()
+        .map_err(|_| format!("invalid address prefix on {dev}"))?;
+    let bits: u8 = bits
+        .parse()
+        .map_err(|_| format!("invalid address prefix on {dev}"))?;
+    let output = ip_cmd()
+        .args(["-j", "address", "show", "dev", dev])
+        .output()
+        .map_err(|error| format!("inspect addresses on {dev}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!("inspect addresses on {dev} failed"));
+    }
+    let links: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("decode addresses on {dev}: {error}"))?;
+    Ok(links.as_array().is_some_and(|links| {
+        links.iter().any(|link| {
+            link["addr_info"].as_array().is_some_and(|addresses| {
+                addresses.iter().any(|live| {
+                    live["local"]
+                        .as_str()
+                        .and_then(|local| local.parse::<IpAddr>().ok())
+                        == Some(address)
+                        && live["prefixlen"].as_u64() == Some(u64::from(bits))
+                })
+            })
+        })
+    }))
 }
 
 fn remove_stale_routes(previous: &DesiredState, proposed: &DesiredState) -> Result<(), String> {
     for old in &previous.routes {
         if !proposed.routes.iter().any(|new| new.to == old.to) {
-            if old.to.contains(':') {
-                run_ip(&["-6", "route", "del", &old.to])?;
-            } else {
-                run_ip(&["-4", "route", "del", &old.to])?;
+            let family = if old.to.contains(':') { "-6" } else { "-4" };
+            let mut args = vec![family, "route", "del", &old.to, "via", &old.via];
+            if let Some(dev) = old.dev.as_deref() {
+                args.push("dev");
+                args.push(dev);
+            }
+            if let Err(error) = run_ip(&args) {
+                // A failed apply may stop before a later proposed route was
+                // installed. Only that exact route is ours to remove.
+                if !error.contains("No such process") {
+                    return Err(error);
+                }
             }
         }
     }
@@ -314,8 +636,12 @@ fn parse_opt(v: &Value) -> Result<FirstBootOpt, String> {
 }
 
 fn persist(state: &DesiredState) -> Result<(), String> {
+    persist_at(Path::new(DESIRED), state)
+}
+
+fn persist_at(path: &Path, state: &DesiredState) -> Result<(), String> {
     let raw = toml::to_string_pretty(state).map_err(|e| format!("encode TOML: {e}"))?;
-    durable::write(Path::new(DESIRED), raw.as_bytes())
+    durable::write(path, raw.as_bytes())
 }
 
 fn bootstrap_apply(request: &Value) -> Result<(), BootstrapFailure> {

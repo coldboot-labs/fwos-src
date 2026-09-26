@@ -78,6 +78,8 @@ struct ApplyOperation {
     #[serde(default)]
     proposed: Option<DesiredState>,
     #[serde(default)]
+    confirmation_id: Option<String>,
+    #[serde(default)]
     applying: Option<Principal>,
     #[serde(default)]
     deadline_boot_ns: Option<u64>,
@@ -191,6 +193,7 @@ fn read_recovery_target() -> Result<RecoveryTarget, String> {
             previous_accepted: None,
             previous_attribution: None,
             proposed: None,
+            confirmation_id: None,
             applying: None,
             deadline_boot_ns: None,
             expires_at_unix_ms: None,
@@ -485,6 +488,7 @@ fn apply_confirmation_status() -> Value {
             };
             json!({
                 "revision": proposed.revision,
+                "confirmation_id": operation.confirmation_id,
                 "base_revision": operation.accepted.revision,
                 "routes": proposed.routes,
                 "applying": operation.applying,
@@ -529,6 +533,9 @@ fn confirm_apply(request: &Value) -> Value {
     let Some(revision) = request.get("revision").and_then(Value::as_u64) else {
         return json!({"ok": false, "outcome": "rejected", "error": "pending revision is required"});
     };
+    let Some(confirmation_id) = request.get("confirmation_id").and_then(Value::as_str) else {
+        return json!({"ok": false, "outcome": "rejected", "error": "Apply confirmation ID is required"});
+    };
     let Some(confirming) = request
         .get("confirming")
         .cloned()
@@ -550,8 +557,10 @@ fn confirm_apply(request: &Value) -> Value {
         let _ = require_recovery_guard();
         return json!({"ok": false, "outcome": "failed", "error": "pending Apply revision is missing"});
     };
-    if revision != proposed.revision {
-        return json!({"ok": false, "outcome": "rejected", "error": "pending Apply revision changed"});
+    if revision != proposed.revision
+        || operation.confirmation_id.as_deref() != Some(confirmation_id)
+    {
+        return json!({"ok": false, "outcome": "rejected", "error": "pending Apply operation changed"});
     }
     if pending_expired(&operation).unwrap_or(true) {
         let recovered = recover_interrupted_apply();
@@ -571,6 +580,7 @@ fn confirm_apply(request: &Value) -> Value {
             previous_accepted: operation.previous_accepted.clone(),
             previous_attribution: operation.previous_attribution.clone(),
             proposed: None,
+            confirmation_id: None,
             applying: operation.applying.clone(),
             deadline_boot_ns: None,
             expires_at_unix_ms: None,
@@ -712,6 +722,7 @@ fn apply_desired_request(
         previous_accepted: old_predecessor.clone(),
         previous_attribution: old_attribution.clone(),
         proposed: None,
+        confirmation_id: None,
         applying: actor.clone(),
         deadline_boot_ns: None,
         expires_at_unix_ms: None,
@@ -783,6 +794,20 @@ fn apply_desired_request(
         );
     }
     if current.apply_confirmation && intent == ApplyIntent::Ordinary {
+        let confirmation_id = match identity::random_token() {
+            Ok(id) => id,
+            Err(error) => {
+                return restore_failed_apply(
+                    &current,
+                    &proposed,
+                    &footprint,
+                    lan_ready_before,
+                    old_predecessor.as_deref(),
+                    old_attribution.as_deref(),
+                    error,
+                )
+            }
+        };
         let now_boot = match boot_time_ns() {
             Ok(now) => now,
             Err(error) => {
@@ -808,6 +833,7 @@ fn apply_desired_request(
             previous_accepted: old_predecessor,
             previous_attribution: old_attribution,
             proposed: Some(proposed.clone()),
+            confirmation_id: Some(confirmation_id),
             applying: actor.clone(),
             deadline_boot_ns: Some(now_boot.saturating_add(120_000_000_000)),
             expires_at_unix_ms: Some(expires_at_unix_ms),
@@ -837,6 +863,7 @@ fn apply_desired_request(
         previous_accepted: old_predecessor,
         previous_attribution: old_attribution,
         proposed: None,
+        confirmation_id: None,
         applying: actor.clone(),
         deadline_boot_ns: None,
         expires_at_unix_ms: None,

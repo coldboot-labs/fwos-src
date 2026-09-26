@@ -85,6 +85,43 @@ fn read_draft(path: &Path) -> Result<Option<Draft>, String> {
     }
 }
 
+fn same_desired_content(left: &DesiredState, right: &DesiredState) -> Result<bool, String> {
+    let mut left = left.clone();
+    left.revision = right.revision;
+    let left = serde_json::to_value(left).map_err(|_| "compare Draft Desired state")?;
+    let right = serde_json::to_value(right).map_err(|_| "compare Accepted Desired state")?;
+    Ok(left == right)
+}
+
+// Called under the owner's draft lock. A matching on-disk snapshot is only a
+// candidate: during recovery desired.toml could be tentative. Ask netd for a
+// stable Accepted revision before durably clearing a confirmed proposal.
+// If netd is unavailable, keep the draft so private editing can continue.
+fn read_draft_reconciled(
+    path: &Path,
+    snapshot: Option<&DesiredState>,
+) -> Result<Option<Draft>, String> {
+    let Some(draft) = read_draft(path)? else {
+        return Ok(None);
+    };
+    let Some(snapshot) = snapshot else {
+        return Ok(Some(draft));
+    };
+    if snapshot.revision == draft.base_revision || !same_desired_content(&draft.desired, snapshot)?
+    {
+        return Ok(Some(draft));
+    }
+    let stable = match complete_desired() {
+        Ok(stable) => stable,
+        Err(_) => return Ok(Some(draft)),
+    };
+    if stable.revision != snapshot.revision || !same_desired_content(&draft.desired, &stable)? {
+        return Ok(Some(draft));
+    }
+    durable::remove(path)?;
+    Ok(None)
+}
+
 fn write_draft(path: &Path, draft: &Draft) -> Result<(), String> {
     let directory = path.parent().ok_or("draft directory missing")?;
     fs::create_dir_all(directory).map_err(|_| "create private draft directory")?;
@@ -1258,6 +1295,23 @@ fn configure_apply_confirmation(
             )
         }
     };
+    let path = draft_path(&authentication.principal);
+    let lock = draft_lock(&path);
+    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let snapshot = accepted_snapshot_for_drafting().ok();
+    match read_draft_reconciled(&path, snapshot.as_ref()) {
+        Ok(Some(_)) => {
+            return json_response(
+                409,
+                json!({
+                    "ok": false, "outcome": "rejected",
+                    "error": "Private pending draft exists; review and apply or reconcile it first"
+                }),
+            )
+        }
+        Ok(None) => (),
+        Err(error) => return json_response(502, json!({"ok": false, "error": error})),
+    }
     let mut desired = match complete_desired() {
         Ok(desired) => desired,
         Err(error) => return json_response(502, json!({"ok": false, "error": error})),
@@ -1302,19 +1356,21 @@ fn confirm_apply(req: &HttpRequest, authentication: Option<&Authentication>) -> 
     #[serde(deny_unknown_fields)]
     struct Confirmation {
         revision: u64,
+        confirmation_id: String,
     }
     let confirmation: Confirmation = match serde_json::from_slice(&req.body) {
         Ok(confirmation) => confirmation,
         Err(_) => {
             return json_response(
                 400,
-                json!({"ok": false, "error": "pending revision is required"}),
+                json!({"ok": false, "error": "pending revision and confirmation ID are required"}),
             )
         }
     };
     let reply = match netd_cmd_with_timeout(
         &json!({
             "op": "confirm_apply", "revision": confirmation.revision,
+            "confirmation_id": confirmation.confirmation_id,
             "confirming": authentication.principal,
         }),
         Duration::from_secs(120),
@@ -1352,12 +1408,12 @@ fn draft_status(authentication: Option<&Authentication>) -> HttpResponse {
     let path = draft_path(&authentication.principal);
     let lock = draft_lock(&path);
     let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let draft = match read_draft(&path) {
-        Ok(draft) => draft,
-        Err(error) => return json_response(502, json!({"ok": false, "error": error})),
-    };
     let accepted = match accepted_snapshot_for_drafting() {
         Ok(desired) => desired,
+        Err(error) => return json_response(502, json!({"ok": false, "error": error})),
+    };
+    let draft = match read_draft_reconciled(&path, Some(&accepted)) {
+        Ok(draft) => draft,
         Err(error) => return json_response(502, json!({"ok": false, "error": error})),
     };
     match draft {
@@ -1410,7 +1466,8 @@ fn save_draft(req: &HttpRequest, authentication: Option<&Authentication>) -> Htt
     let path = draft_path(&authentication.principal);
     let lock = draft_lock(&path);
     let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let existing = match read_draft(&path) {
+    let snapshot = accepted_snapshot_for_drafting();
+    let existing = match read_draft_reconciled(&path, snapshot.as_ref().ok()) {
         Ok(draft) => draft,
         Err(error) => return json_response(502, json!({"ok": false, "error": error})),
     };
@@ -1430,7 +1487,7 @@ fn save_draft(req: &HttpRequest, authentication: Option<&Authentication>) -> Htt
                 json!({"ok": false, "error": "Draft no longer exists; reload before saving"}),
             );
         }
-        None => match accepted_snapshot_for_drafting() {
+        None => match snapshot {
             Ok(desired) => (desired.revision, desired),
             Err(error) => return json_response(502, json!({"ok": false, "error": error})),
         },
@@ -1489,7 +1546,8 @@ fn apply_draft(req: &HttpRequest, authentication: Option<&Authentication>) -> Ht
     let path = draft_path(&authentication.principal);
     let lock = draft_lock(&path);
     let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let draft = match read_draft(&path) {
+    let snapshot = accepted_snapshot_for_drafting().ok();
+    let draft = match read_draft_reconciled(&path, snapshot.as_ref()) {
         Ok(Some(draft)) => draft,
         Ok(None) => {
             return json_response(
@@ -1592,7 +1650,8 @@ fn reconcile_draft(req: &HttpRequest, authentication: Option<&Authentication>) -
     let path = draft_path(&authentication.principal);
     let lock = draft_lock(&path);
     let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let previous = match read_draft(&path) {
+    let snapshot = accepted_snapshot_for_drafting();
+    let previous = match read_draft_reconciled(&path, snapshot.as_ref().ok()) {
         Ok(Some(draft)) => draft,
         Ok(None) => {
             return json_response(
@@ -1608,7 +1667,7 @@ fn reconcile_draft(req: &HttpRequest, authentication: Option<&Authentication>) -
             json!({"ok": false, "error": "Draft changed; review it again"}),
         );
     }
-    let mut accepted = match accepted_snapshot_for_drafting() {
+    let mut accepted = match snapshot {
         Ok(desired) => desired,
         Err(error) => return json_response(502, json!({"ok": false, "error": error})),
     };
@@ -1660,7 +1719,8 @@ fn apply_routes(req: &HttpRequest, authentication: Option<&Authentication>) -> H
     let path = draft_path(&authentication.principal);
     let lock = draft_lock(&path);
     let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    match read_draft(&path) {
+    let snapshot = accepted_snapshot_for_drafting().ok();
+    match read_draft_reconciled(&path, snapshot.as_ref()) {
         Ok(Some(_)) => {
             return json_response(
                 409,

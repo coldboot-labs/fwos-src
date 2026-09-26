@@ -94,8 +94,71 @@ struct ApplyAttribution {
     revision: u64,
     applying: Option<Principal>,
     confirming: Option<Principal>,
+    // v1 attribution written before receipts existed; migrate its latest
+    // draft into draft_receipts when the next revision is accepted.
     #[serde(default)]
     draft_version: Option<String>,
+    #[serde(default)]
+    draft_receipts: Vec<DraftReceipt>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct DraftReceipt {
+    owner: Principal,
+    version: String,
+    accepted_revision: u64,
+}
+
+fn same_owner(left: &Principal, right: &Principal) -> bool {
+    left.source == right.source && left.subject == right.subject
+}
+
+fn upsert_draft_receipt(receipts: &mut Vec<DraftReceipt>, receipt: DraftReceipt) {
+    receipts.retain(|prior| !same_owner(&prior.owner, &receipt.owner));
+    receipts.push(receipt);
+}
+
+fn accepted_draft_receipts(
+    previous: Option<&[u8]>,
+    accepted_revision: u64,
+    applying: Option<&Principal>,
+    draft_version: Option<&str>,
+    next_revision: u64,
+) -> Result<Vec<DraftReceipt>, String> {
+    let mut receipts = match previous {
+        Some(raw) => {
+            let prior: ApplyAttribution = serde_json::from_slice(raw)
+                .map_err(|error| format!("parse prior Apply actors: {error}"))?;
+            if prior.revision != accepted_revision {
+                Vec::new()
+            } else {
+                let mut receipts = prior.draft_receipts;
+                if let (Some(owner), Some(version)) = (prior.applying, prior.draft_version) {
+                    upsert_draft_receipt(
+                        &mut receipts,
+                        DraftReceipt {
+                            owner,
+                            version,
+                            accepted_revision: prior.revision,
+                        },
+                    );
+                }
+                receipts
+            }
+        }
+        None => Vec::new(),
+    };
+    if let (Some(owner), Some(version)) = (applying, draft_version) {
+        upsert_draft_receipt(
+            &mut receipts,
+            DraftReceipt {
+                owner: owner.clone(),
+                version: version.to_owned(),
+                accepted_revision: next_revision,
+            },
+        );
+    }
+    Ok(receipts)
 }
 
 fn boot_time_ns() -> Result<u64, String> {
@@ -541,10 +604,15 @@ fn was_draft_accepted(request: &Value) -> Value {
     };
     let matches = accepted.revision == revision
         && accepted_attribution(revision).is_some_and(|record| {
-            record.draft_version.as_deref() == Some(version)
-                && record.applying.as_ref().is_some_and(|actor| {
-                    actor.source == owner.source && actor.subject == owner.subject
-                })
+            record.draft_receipts.iter().any(|receipt| {
+                same_owner(&receipt.owner, &owner)
+                    && receipt.version == version
+                    && receipt.accepted_revision <= accepted.revision
+            }) || (record.draft_version.as_deref() == Some(version)
+                && record
+                    .applying
+                    .as_ref()
+                    .is_some_and(|actor| same_owner(actor, &owner)))
         });
     json!({"ok": true, "accepted": matches})
 }
@@ -612,11 +680,19 @@ fn confirm_apply(request: &Value) -> Value {
         return json!({"ok": false, "outcome": "rejected", "error": "Apply confirmation expired", "restoration": if recovered.is_ok() {"restored"} else {"required"}});
     }
     let result = (|| {
+        let draft_receipts = accepted_draft_receipts(
+            operation.previous_attribution.as_deref(),
+            operation.accepted.revision,
+            operation.applying.as_ref(),
+            operation.draft_version.as_deref(),
+            revision,
+        )?;
         write_attribution(&ApplyAttribution {
             revision,
             applying: operation.applying.clone(),
             confirming: Some(confirming.clone()),
-            draft_version: operation.draft_version.clone(),
+            draft_version: None,
+            draft_receipts,
         })?;
         persist(proposed)?;
         persist_at(Path::new(PREVIOUS_ACCEPTED), &operation.accepted)?;
@@ -822,13 +898,21 @@ fn apply_desired_request(
             set_lan_services_ready(true)?.ok_or("LAN service generation was not published")?;
         wait_lan_services(&generation)?;
         if !current.apply_confirmation || intent == ApplyIntent::RecoveryRestore {
+            let draft_receipts = accepted_draft_receipts(
+                old_attribution.as_deref(),
+                current.revision,
+                actor.as_ref(),
+                draft_version.as_deref(),
+                proposed.revision,
+            )?;
             persist(&proposed)?;
             persist_at(Path::new(PREVIOUS_ACCEPTED), &current)?;
             write_attribution(&ApplyAttribution {
                 revision: proposed.revision,
                 applying: actor.clone(),
                 confirming: None,
-                draft_version: draft_version.clone(),
+                draft_version: None,
+                draft_receipts,
             })?;
         }
         Ok::<(), String>(())

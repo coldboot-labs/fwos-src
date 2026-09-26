@@ -85,18 +85,10 @@ fn read_draft(path: &Path) -> Result<Option<Draft>, String> {
     }
 }
 
-fn same_desired_content(left: &DesiredState, right: &DesiredState) -> Result<bool, String> {
-    let mut left = left.clone();
-    left.revision = right.revision;
-    let left = serde_json::to_value(left).map_err(|_| "compare Draft Desired state")?;
-    let right = serde_json::to_value(right).map_err(|_| "compare Accepted Desired state")?;
-    Ok(left == right)
-}
-
-// Called under the owner's draft lock. A matching on-disk snapshot is only a
+// Called under the owner's draft lock. A newer on-disk revision is only a
 // candidate: during recovery desired.toml could be tentative. Ask netd for a
-// stable Accepted revision and exact owner/draft version before durably
-// clearing a confirmed proposal. Equal content from another Apply is not ours.
+// stable Accepted revision and exact owner/draft-version receipt before
+// clearing a confirmed proposal, even when later Applies changed its content.
 // If netd is unavailable, keep the draft so private editing can continue.
 fn read_draft_reconciled(
     path: &Path,
@@ -109,15 +101,14 @@ fn read_draft_reconciled(
     let Some(snapshot) = snapshot else {
         return Ok(Some(draft));
     };
-    if snapshot.revision == draft.base_revision || !same_desired_content(&draft.desired, snapshot)?
-    {
+    if snapshot.revision == draft.base_revision {
         return Ok(Some(draft));
     }
     let stable = match complete_desired() {
         Ok(stable) => stable,
         Err(_) => return Ok(Some(draft)),
     };
-    if stable.revision != snapshot.revision || !same_desired_content(&draft.desired, &stable)? {
+    if stable.revision != snapshot.revision {
         return Ok(Some(draft));
     }
     let accepted = match netd_cmd(&json!({

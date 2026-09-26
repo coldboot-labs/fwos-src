@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use fwos_fwd_setup::desired::{DesiredState, Iface};
+use fwos_fwd_setup::identity::Principal;
 use fwos_fwd_setup::{bootstrap_values, durable, identity};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -28,6 +29,7 @@ const SOCK: &str = "/var/lib/fwos/netd.sock";
 const DESIRED: &str = "/var/lib/fwos/desired.toml";
 const APPLY_OPERATION: &str = "/var/lib/fwos/apply-operation.json";
 const APPLY_PREVIOUS: &str = "/var/lib/fwos/apply-previous.toml";
+const APPLY_ATTRIBUTION: &str = "/var/lib/fwos/apply-attribution.json";
 const PREVIOUS_ACCEPTED: &str = "/var/lib/fwos/previous-accepted.toml";
 const LAN_SERVICES_READY: &str = "/var/lib/fwos/lan-services-ready";
 const LAN_SERVICES_RESULT: &str = "/var/lib/fwos/lan-services-result";
@@ -49,7 +51,14 @@ fn recovery_pending() -> bool {
 #[serde(rename_all = "snake_case")]
 enum ApplyPhase {
     Applying,
+    PendingConfirmation,
     Accepted,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ApplyIntent {
+    Ordinary,
+    RecoveryRestore,
 }
 
 impl Default for ApplyPhase {
@@ -64,6 +73,74 @@ struct ApplyOperation {
     phase: ApplyPhase,
     accepted: DesiredState,
     previous_accepted: Option<Vec<u8>>,
+    #[serde(default)]
+    previous_attribution: Option<Vec<u8>>,
+    #[serde(default)]
+    proposed: Option<DesiredState>,
+    #[serde(default)]
+    applying: Option<Principal>,
+    #[serde(default)]
+    deadline_boot_ns: Option<u64>,
+    #[serde(default)]
+    expires_at_unix_ms: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ApplyAttribution {
+    revision: u64,
+    applying: Option<Principal>,
+    confirming: Option<Principal>,
+}
+
+fn boot_time_ns() -> Result<u64, String> {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut time) } != 0 {
+        return Err(format!(
+            "read monotonic Apply confirmation clock: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok((time.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(time.tv_nsec as u64))
+}
+
+fn pending_operation() -> Result<Option<ApplyOperation>, String> {
+    let raw = match fs::read(APPLY_OPERATION) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("read Apply confirmation: {error}")),
+    };
+    let operation: ApplyOperation = serde_json::from_slice(&raw)
+        .map_err(|error| format!("parse Apply confirmation: {error}"))?;
+    Ok((operation.phase == ApplyPhase::PendingConfirmation).then_some(operation))
+}
+
+fn apply_busy() -> bool {
+    recovery_pending() || matches!(pending_operation(), Ok(Some(_)) | Err(_))
+}
+
+fn accepted_attribution(revision: u64) -> Option<ApplyAttribution> {
+    fs::read(APPLY_ATTRIBUTION)
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<ApplyAttribution>(&raw).ok())
+        .filter(|record| record.revision == revision)
+}
+
+fn write_attribution(record: &ApplyAttribution) -> Result<(), String> {
+    let raw =
+        serde_json::to_vec(record).map_err(|error| format!("encode Apply actors: {error}"))?;
+    durable::write(Path::new(APPLY_ATTRIBUTION), &raw)
+}
+
+fn restore_attribution(previous: Option<&[u8]>) -> Result<(), String> {
+    match previous {
+        Some(raw) => durable::write(Path::new(APPLY_ATTRIBUTION), raw),
+        None => durable::remove(Path::new(APPLY_ATTRIBUTION)),
+    }
 }
 
 fn operation_requires_recovery() -> bool {
@@ -112,6 +189,11 @@ fn read_recovery_target() -> Result<RecoveryTarget, String> {
             phase: ApplyPhase::Applying,
             accepted,
             previous_accepted: None,
+            previous_attribution: None,
+            proposed: None,
+            applying: None,
+            deadline_boot_ns: None,
+            expires_at_unix_ms: None,
         },
         marker: APPLY_PREVIOUS,
         restore_predecessor: false,
@@ -158,7 +240,9 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let interrupted = Path::new(BOOTSTRAPPED).exists()
-        && (operation_requires_recovery() || Path::new(APPLY_PREVIOUS).exists());
+        && (operation_requires_recovery()
+            || matches!(pending_operation(), Ok(Some(_)) | Err(_))
+            || Path::new(APPLY_PREVIOUS).exists());
     if interrupted {
         require_recovery_guard()?;
     }
@@ -205,6 +289,7 @@ fn run() -> Result<(), String> {
     let mut observed_exposure = None;
     let mut refresh_at = Instant::now();
     loop {
+        expire_pending_confirmation();
         if Instant::now() >= refresh_at {
             refresh_bootstrap_exposure(&mut observed_exposure)?;
             refresh_at = Instant::now() + Duration::from_secs(1);
@@ -257,9 +342,23 @@ fn refresh_bootstrap_exposure(observed: &mut Option<(String, Vec<String>)>) -> R
 
 fn handle_client(mut stream: UnixStream) -> Result<(), String> {
     let mut buf = Vec::new();
-    stream
-        .read_to_end(&mut buf)
-        .map_err(|e| format!("read socket: {e}"))?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("socket request read timed out".into());
+        }
+        stream
+            .set_read_timeout(Some(remaining))
+            .map_err(|e| format!("bound socket request read: {e}"))?;
+        let mut chunk = [0u8; 8192];
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(count) => buf.extend_from_slice(&chunk[..count]),
+            Err(error) => return Err(format!("read socket: {error}")),
+        }
+    }
+    expire_pending_confirmation();
     if buf.is_empty() {
         return Ok(());
     }
@@ -268,7 +367,9 @@ fn handle_client(mut stream: UnixStream) -> Result<(), String> {
         // Older console and socket clients send bare complete Desired JSON.
         // Their base is the current Accepted revision at receipt, on this
         // single-threaded socket loop; they use the same validation and apply.
-        Ok(v) if Path::new(BOOTSTRAPPED).exists() => apply_desired_request(&v, None).to_string(),
+        Ok(v) if Path::new(BOOTSTRAPPED).exists() => {
+            apply_desired_request(&v, None, None, ApplyIntent::Ordinary).to_string()
+        }
         Ok(_) => json!({"ok": false, "error": "complete Bootstrap before applying Desired state"})
             .to_string(),
         Err(err) => json!({"ok": false, "error": err.to_string()}).to_string(),
@@ -320,7 +421,13 @@ fn handle_cmd(v: &Value) -> String {
             }
             Err(error) => json!({"ok": false, "error": error}).to_string(),
         },
-        "restore_previous" => restore_previous_request().to_string(),
+        "get_apply_confirmation" => apply_confirmation_status().to_string(),
+        "confirm_apply" => confirm_apply(v).to_string(),
+        "restore_previous" => {
+            let actor = v.get("applying").cloned()
+                .and_then(|value| serde_json::from_value::<Principal>(value).ok());
+            restore_previous_request(actor).to_string()
+        }
         "apply_desired" => {
             if !Path::new(BOOTSTRAPPED).exists() {
                 return json!({"ok": false, "outcome": "rejected", "error": "complete Bootstrap before applying Desired state"}).to_string();
@@ -328,7 +435,8 @@ fn handle_cmd(v: &Value) -> String {
             let Some(base) = v.get("base_revision").and_then(Value::as_u64) else {
                 return json!({"ok": false, "outcome": "rejected", "error": "base_revision is required"}).to_string();
             };
-            apply_desired_request(v.get("desired").unwrap_or(&Value::Null), Some(base)).to_string()
+            let actor = v.get("applying").cloned().and_then(|actor| serde_json::from_value::<Principal>(actor).ok());
+            apply_desired_request(v.get("desired").unwrap_or(&Value::Null), Some(base), actor, ApplyIntent::Ordinary).to_string()
         }
         other => json!({"ok": false, "error": format!("unknown op {other}")}).to_string(),
     }
@@ -345,7 +453,147 @@ fn accepted_desired() -> Result<DesiredState, String> {
     Ok(state)
 }
 
-fn restore_previous_request() -> Value {
+fn review_projection(state: &DesiredState) -> Value {
+    json!({
+        "apply_confirmation": state.apply_confirmation,
+        "hostname": state.hostname,
+        "interfaces": state.interfaces,
+        "routes": state.routes,
+        "ui_exposure": state.ui_exposure,
+        "lan_prefix": state.lan_prefix,
+        "dhcp_pool": state.dhcp_pool,
+        "wan_pd": state.wan_pd,
+        "nft_extra": state.nft_extra,
+        "qdiscs": state.qdiscs,
+        "wireguard": state.wireguard.iter().map(|tunnel| json!({
+            "name": tunnel.name,
+            "listen_port": tunnel.listen_port,
+            "addresses": tunnel.addresses,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+fn apply_confirmation_status() -> Value {
+    let accepted = match accepted_desired() {
+        Ok(accepted) => accepted,
+        Err(error) => return json!({"ok": false, "error": error}),
+    };
+    let pending = match pending_operation() {
+        Ok(Some(operation)) => {
+            let Some(proposed) = operation.proposed else {
+                return json!({"ok": false, "error": "pending Apply revision is missing"});
+            };
+            json!({
+                "revision": proposed.revision,
+                "base_revision": operation.accepted.revision,
+                "routes": proposed.routes,
+                "applying": operation.applying,
+                "expires_at_unix_ms": operation.expires_at_unix_ms,
+                "accepted_review": review_projection(&operation.accepted),
+                "proposed_review": review_projection(&proposed),
+            })
+        }
+        Ok(None) => Value::Null,
+        Err(error) => return json!({"ok": false, "error": error}),
+    };
+    json!({"ok": true, "enabled": accepted.apply_confirmation, "accepted_revision": accepted.revision,
+        "pending": pending, "last_accepted": accepted_attribution(accepted.revision)})
+}
+
+fn pending_expired(operation: &ApplyOperation) -> Result<bool, String> {
+    let deadline = operation
+        .deadline_boot_ns
+        .ok_or("pending Apply deadline is missing")?;
+    Ok(boot_time_ns()? >= deadline)
+}
+
+fn expire_pending_confirmation() {
+    let pending = match pending_operation() {
+        Ok(pending) => pending,
+        Err(error) => {
+            eprintln!("netd: inspect pending Apply confirmation: {error}");
+            let _ = require_recovery_guard();
+            return;
+        }
+    };
+    if let Some(operation) = pending {
+        if pending_expired(&operation).unwrap_or(true) {
+            if let Err(error) = recover_interrupted_apply() {
+                eprintln!("netd: expired Apply confirmation recovery failed: {error}");
+            }
+        }
+    }
+}
+
+fn confirm_apply(request: &Value) -> Value {
+    let Some(revision) = request.get("revision").and_then(Value::as_u64) else {
+        return json!({"ok": false, "outcome": "rejected", "error": "pending revision is required"});
+    };
+    let Some(confirming) = request
+        .get("confirming")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<Principal>(value).ok())
+    else {
+        return json!({"ok": false, "outcome": "rejected", "error": "current administrator identity is required"});
+    };
+    if recovery_pending() {
+        return json!({"ok": false, "outcome": "rejected", "error": "Apply recovery is in progress"});
+    }
+    let operation = match pending_operation() {
+        Ok(Some(operation)) => operation,
+        Ok(None) => {
+            return json!({"ok": false, "outcome": "rejected", "error": "no Apply confirmation is pending"})
+        }
+        Err(error) => return json!({"ok": false, "outcome": "failed", "error": error}),
+    };
+    let Some(proposed) = operation.proposed.as_ref() else {
+        let _ = require_recovery_guard();
+        return json!({"ok": false, "outcome": "failed", "error": "pending Apply revision is missing"});
+    };
+    if revision != proposed.revision {
+        return json!({"ok": false, "outcome": "rejected", "error": "pending Apply revision changed"});
+    }
+    if pending_expired(&operation).unwrap_or(true) {
+        let recovered = recover_interrupted_apply();
+        return json!({"ok": false, "outcome": "rejected", "error": "Apply confirmation expired", "restoration": if recovered.is_ok() {"restored"} else {"required"}});
+    }
+    let result = (|| {
+        write_attribution(&ApplyAttribution {
+            revision,
+            applying: operation.applying.clone(),
+            confirming: Some(confirming.clone()),
+        })?;
+        persist(proposed)?;
+        persist_at(Path::new(PREVIOUS_ACCEPTED), &operation.accepted)?;
+        let accepted_journal = ApplyOperation {
+            phase: ApplyPhase::Accepted,
+            accepted: operation.accepted.clone(),
+            previous_accepted: operation.previous_accepted.clone(),
+            previous_attribution: operation.previous_attribution.clone(),
+            proposed: None,
+            applying: operation.applying.clone(),
+            deadline_boot_ns: None,
+            expires_at_unix_ms: None,
+        };
+        let raw = serde_json::to_vec(&accepted_journal)
+            .map_err(|error| format!("encode accepted Apply: {error}"))?;
+        durable::write(Path::new(APPLY_OPERATION), &raw)?;
+        Ok::<(), String>(())
+    })();
+    if let Err(error) = result {
+        let recovery = recover_interrupted_apply();
+        return json!({"ok": false, "outcome": "failed", "error": error,
+            "restoration": if recovery.is_ok() {"restored"} else {"required"},
+            "recovery_error": recovery.err()});
+    }
+    if let Err(error) = durable::remove(Path::new(APPLY_OPERATION)) {
+        eprintln!("netd: remove confirmed Apply journal: {error}");
+    }
+    json!({"ok": true, "outcome": "accepted", "status": "accepted", "revision": revision,
+        "applying": operation.applying, "confirming": confirming})
+}
+
+fn restore_previous_request(actor: Option<Principal>) -> Value {
     if !Path::new(BOOTSTRAPPED).exists() {
         return json!({"ok": false, "outcome": "rejected", "error": "complete Bootstrap before restoring Desired state"});
     }
@@ -358,6 +606,9 @@ fn restore_previous_request() -> Value {
                 json!({"ok": false, "outcome": "failed", "restoration": "required", "error": error})
             }
         };
+    }
+    if matches!(pending_operation(), Ok(Some(_)) | Err(_)) {
+        return json!({"ok": false, "outcome": "rejected", "error": "Apply confirmation is pending"});
     }
     let current = match accepted_desired() {
         Ok(state) => state,
@@ -390,12 +641,22 @@ fn restore_previous_request() -> Value {
     // A manual restoration is a new Accepted revision, not a file copy. The
     // normal apply transaction retains the displaced current state as its
     // predecessor and restores that state if this attempt fails.
-    apply_desired_request(&input, Some(current.revision))
+    apply_desired_request(
+        &input,
+        Some(current.revision),
+        actor,
+        ApplyIntent::RecoveryRestore,
+    )
 }
 
-fn apply_desired_request(input: &Value, base_revision: Option<u64>) -> Value {
-    if recovery_pending() {
-        return json!({"ok": false, "outcome": "failed", "restoration": "required", "error": "a previous Desired state apply still requires recovery"});
+fn apply_desired_request(
+    input: &Value,
+    base_revision: Option<u64>,
+    actor: Option<Principal>,
+    intent: ApplyIntent,
+) -> Value {
+    if apply_busy() {
+        return json!({"ok": false, "outcome": "busy", "error": "another Desired state apply or recovery is in progress"});
     }
     let current = match accepted_desired() {
         Ok(state) => state,
@@ -434,6 +695,13 @@ fn apply_desired_request(input: &Value, base_revision: Option<u64>) -> Value {
             return json!({"ok": false, "outcome": "failed", "revision": current.revision, "error": format!("read retained predecessor: {error}")});
         }
     };
+    let old_attribution = match fs::read(APPLY_ATTRIBUTION) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return json!({"ok": false, "outcome": "failed", "error": format!("read prior Apply actors: {error}")})
+        }
+    };
     let lan_ready_before = Path::new(LAN_SERVICES_READY).exists();
     // One atomic operation record retains both the recovery target and its
     // manual predecessor. B may overwrite either durable file before the
@@ -442,6 +710,11 @@ fn apply_desired_request(input: &Value, base_revision: Option<u64>) -> Value {
         phase: ApplyPhase::Applying,
         accepted: current.clone(),
         previous_accepted: old_predecessor.clone(),
+        previous_attribution: old_attribution.clone(),
+        proposed: None,
+        applying: actor.clone(),
+        deadline_boot_ns: None,
+        expires_at_unix_ms: None,
     };
     let journal = match serde_json::to_vec(&operation) {
         Ok(bytes) => bytes,
@@ -487,8 +760,15 @@ fn apply_desired_request(input: &Value, base_revision: Option<u64>) -> Value {
         let generation =
             set_lan_services_ready(true)?.ok_or("LAN service generation was not published")?;
         wait_lan_services(&generation)?;
-        persist(&proposed)?;
-        persist_at(Path::new(PREVIOUS_ACCEPTED), &current)?;
+        if !current.apply_confirmation || intent == ApplyIntent::RecoveryRestore {
+            persist(&proposed)?;
+            persist_at(Path::new(PREVIOUS_ACCEPTED), &current)?;
+            write_attribution(&ApplyAttribution {
+                revision: proposed.revision,
+                applying: actor.clone(),
+                confirming: None,
+            })?;
+        }
         Ok::<(), String>(())
     })();
     if let Err(error) = result {
@@ -498,13 +778,68 @@ fn apply_desired_request(input: &Value, base_revision: Option<u64>) -> Value {
             &footprint,
             lan_ready_before,
             old_predecessor.as_deref(),
+            old_attribution.as_deref(),
             error,
         );
+    }
+    if current.apply_confirmation && intent == ApplyIntent::Ordinary {
+        let now_boot = match boot_time_ns() {
+            Ok(now) => now,
+            Err(error) => {
+                return restore_failed_apply(
+                    &current,
+                    &proposed,
+                    &footprint,
+                    lan_ready_before,
+                    old_predecessor.as_deref(),
+                    old_attribution.as_deref(),
+                    error,
+                )
+            }
+        };
+        let expires_at_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .saturating_add(120_000) as u64;
+        let pending = ApplyOperation {
+            phase: ApplyPhase::PendingConfirmation,
+            accepted: current.clone(),
+            previous_accepted: old_predecessor,
+            previous_attribution: old_attribution,
+            proposed: Some(proposed.clone()),
+            applying: actor.clone(),
+            deadline_boot_ns: Some(now_boot.saturating_add(120_000_000_000)),
+            expires_at_unix_ms: Some(expires_at_unix_ms),
+        };
+        let result = serde_json::to_vec(&pending)
+            .map_err(|error| format!("encode pending Apply confirmation: {error}"))
+            .and_then(|raw| durable::write(Path::new(APPLY_OPERATION), &raw));
+        if let Err(error) = result {
+            // B is live but not Accepted. The Applying journal still retains
+            // A, and even an ambiguous pending-journal write must attempt an
+            // immediate rollback before requiring serial recovery.
+            return restore_failed_apply(
+                &current,
+                &proposed,
+                &footprint,
+                lan_ready_before,
+                pending.previous_accepted.as_deref(),
+                pending.previous_attribution.as_deref(),
+                format!("retain pending Apply confirmation: {error}"),
+            );
+        }
+        return json!({"ok": true, "outcome": "pending_confirmation", "status": "pending_confirmation", "applied": true, "accepted": false, "revision": proposed.revision, "base_revision": base, "applying": actor, "expires_at_unix_ms": expires_at_unix_ms});
     }
     let accepted_journal = match serde_json::to_vec(&ApplyOperation {
         phase: ApplyPhase::Accepted,
         accepted: current.clone(),
         previous_accepted: old_predecessor,
+        previous_attribution: old_attribution,
+        proposed: None,
+        applying: actor.clone(),
+        deadline_boot_ns: None,
+        expires_at_unix_ms: None,
     }) {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -521,7 +856,7 @@ fn apply_desired_request(input: &Value, base_revision: Option<u64>) -> Value {
     if let Err(error) = durable::remove(Path::new(APPLY_OPERATION)) {
         eprintln!("netd: remove completed apply journal: {error}");
     }
-    json!({"ok": true, "outcome": "accepted", "status": "accepted", "applied": true, "accepted": true, "revision": proposed.revision, "base_revision": base, "predecessor_revision": current.revision})
+    json!({"ok": true, "outcome": "accepted", "status": "accepted", "applied": true, "accepted": true, "revision": proposed.revision, "base_revision": base, "predecessor_revision": current.revision, "applying": actor})
 }
 
 fn require_recovery_guard() -> Result<(), String> {
@@ -557,7 +892,10 @@ fn recover_interrupted_apply() -> Result<u64, String> {
     require_recovery_guard()?;
     let target = read_recovery_target()?;
     let mut previous = target.operation.accepted;
-    let tentative = accepted_desired().ok();
+    let tentative = target
+        .operation
+        .proposed
+        .or_else(|| accepted_desired().ok());
     set_lan_services_ready(false)?;
     apply(&mut previous)?;
     if let Some(tentative) = tentative.as_ref() {
@@ -569,6 +907,7 @@ fn recover_interrupted_apply() -> Result<u64, String> {
             Some(bytes) => durable::write(Path::new(PREVIOUS_ACCEPTED), bytes)?,
             None => durable::remove(Path::new(PREVIOUS_ACCEPTED))?,
         }
+        restore_attribution(target.operation.previous_attribution.as_deref())?;
     }
     let generation = set_lan_services_ready(true)?
         .ok_or("LAN service generation was not published during recovery")?;
@@ -610,6 +949,7 @@ fn restore_failed_apply(
     footprint: &RollbackFootprint,
     lan_ready_before: bool,
     old_predecessor: Option<&[u8]>,
+    old_attribution: Option<&[u8]>,
     error: String,
 ) -> Value {
     let mut failures = Vec::new();
@@ -636,6 +976,9 @@ fn restore_failed_apply(
     };
     if let Err(cause) = predecessor_result {
         failures.push(format!("restore retained predecessor: {cause}"));
+    }
+    if let Err(cause) = restore_attribution(old_attribution) {
+        failures.push(format!("restore prior Apply actors: {cause}"));
     }
     if failures.is_empty() {
         match set_lan_services_ready(lan_ready_before) {

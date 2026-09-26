@@ -30,6 +30,8 @@ pub struct DesiredState {
     pub wan_pd: Option<String>,
     #[serde(default)]
     pub ui_exposure: Vec<String>,
+    #[serde(default)]
+    pub apply_confirmation: bool,
 }
 
 impl Default for DesiredState {
@@ -46,6 +48,7 @@ impl Default for DesiredState {
             dhcp_pool: None,
             wan_pd: None,
             ui_exposure: Vec::new(),
+            apply_confirmation: false,
         }
     }
 }

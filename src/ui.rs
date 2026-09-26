@@ -462,6 +462,11 @@ fn dispatch(req: &HttpRequest) -> HttpResponse {
         ("POST", "/api/logout") => logout(req),
         ("GET", "/api/administrators") => administrators(authentication.as_ref()),
         ("GET", "/api/routes") => routes(),
+        ("GET", "/api/apply-confirmation") => apply_confirmation_status(),
+        ("POST", "/api/apply-confirmation/configure") => {
+            configure_apply_confirmation(req, authentication.as_ref())
+        }
+        ("POST", "/api/apply-confirmation/confirm") => confirm_apply(req, authentication.as_ref()),
         ("GET", "/api/draft") => draft_status(authentication.as_ref()),
         ("POST", "/api/draft/save") => save_draft(req, authentication.as_ref()),
         ("POST", "/api/draft/apply") => apply_draft(req, authentication.as_ref()),
@@ -1217,6 +1222,123 @@ fn routes() -> HttpResponse {
     }
 }
 
+fn apply_confirmation_status() -> HttpResponse {
+    if !Path::new(BOOTSTRAP).exists() {
+        return json_response(
+            409,
+            json!({"ok": false, "error": "complete Bootstrap first"}),
+        );
+    }
+    match netd_cmd(&json!({"op": "get_apply_confirmation"})) {
+        Ok(reply) if reply["ok"] == true => json_response(200, reply),
+        Ok(reply) => json_response(502, reply),
+        Err(error) => json_response(502, json!({"ok": false, "error": error})),
+    }
+}
+
+fn configure_apply_confirmation(
+    req: &HttpRequest,
+    authentication: Option<&Authentication>,
+) -> HttpResponse {
+    let Some(authentication) = authentication else {
+        return json_response(401, json!({"ok": false, "error": "sign in required"}));
+    };
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Setting {
+        base_revision: u64,
+        enabled: bool,
+    }
+    let setting: Setting = match serde_json::from_slice(&req.body) {
+        Ok(setting) => setting,
+        Err(_) => {
+            return json_response(
+                400,
+                json!({"ok": false, "error": "invalid Apply confirmation setting"}),
+            )
+        }
+    };
+    let mut desired = match complete_desired() {
+        Ok(desired) => desired,
+        Err(error) => return json_response(502, json!({"ok": false, "error": error})),
+    };
+    if desired.revision != setting.base_revision {
+        return json_response(
+            409,
+            json!({"ok": false, "outcome": "rejected", "revision": desired.revision, "error": "Accepted Desired state changed; reload before applying"}),
+        );
+    }
+    desired.apply_confirmation = setting.enabled;
+    let reply = match netd_cmd_with_timeout(
+        &json!({
+            "op": "apply_desired", "base_revision": setting.base_revision,
+            "desired": desired, "applying": authentication.principal,
+        }),
+        Duration::from_secs(120),
+    ) {
+        Ok(reply) => reply,
+        Err(error) => {
+            return json_response(
+                502,
+                json!({"ok": false, "outcome": "indeterminate", "error": error}),
+            )
+        }
+    };
+    let status = if reply["ok"] == true {
+        200
+    } else if reply["outcome"] == "rejected" || reply["outcome"] == "busy" {
+        409
+    } else {
+        502
+    };
+    json_response(status, reply)
+}
+
+fn confirm_apply(req: &HttpRequest, authentication: Option<&Authentication>) -> HttpResponse {
+    let Some(authentication) = authentication else {
+        return json_response(401, json!({"ok": false, "error": "sign in required"}));
+    };
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Confirmation {
+        revision: u64,
+    }
+    let confirmation: Confirmation = match serde_json::from_slice(&req.body) {
+        Ok(confirmation) => confirmation,
+        Err(_) => {
+            return json_response(
+                400,
+                json!({"ok": false, "error": "pending revision is required"}),
+            )
+        }
+    };
+    let reply = match netd_cmd_with_timeout(
+        &json!({
+            "op": "confirm_apply", "revision": confirmation.revision,
+            "confirming": authentication.principal,
+        }),
+        Duration::from_secs(120),
+    ) {
+        Ok(reply) => reply,
+        Err(error) => {
+            return json_response(
+                502,
+                json!({"ok": false, "outcome": "indeterminate", "error": error}),
+            )
+        }
+    };
+    json_response(
+        if reply["ok"] == true {
+            200
+        } else if reply["outcome"] == "rejected" {
+            409
+        } else {
+            502
+        },
+        reply,
+    )
+}
+
 fn draft_status(authentication: Option<&Authentication>) -> HttpResponse {
     let Some(authentication) = authentication else {
         return json_response(401, json!({"ok": false, "error": "sign in required"}));
@@ -1397,7 +1519,8 @@ fn apply_draft(req: &HttpRequest, authentication: Option<&Authentication>) -> Ht
         );
     }
     let reply = match netd_cmd_with_timeout(
-        &json!({"op": "apply_desired", "base_revision": draft.base_revision, "desired": draft.desired}),
+        &json!({"op": "apply_desired", "base_revision": draft.base_revision, "desired": draft.desired,
+            "applying": authentication.principal}),
         // Allow both bounded Host activation and rollback before reporting.
         Duration::from_secs(120),
     ) {
@@ -1418,11 +1541,16 @@ fn apply_draft(req: &HttpRequest, authentication: Option<&Authentication>) -> Ht
                 409
             } else if reply["outcome"] == "rejected" {
                 400
+            } else if reply["outcome"] == "busy" {
+                409
             } else {
                 502
             },
             reply,
         );
+    }
+    if reply["outcome"] == "pending_confirmation" {
+        return json_response(200, reply);
     }
     if let Err(error) = durable::remove(&path) {
         return json_response(
@@ -1561,6 +1689,7 @@ fn apply_routes(req: &HttpRequest, authentication: Option<&Authentication>) -> H
             "op": "apply_desired",
             "base_revision": change.base_revision,
             "desired": desired,
+            "applying": authentication.principal,
         }),
         // Allow both bounded Host activation and rollback before reporting.
         Duration::from_secs(120),
@@ -1577,6 +1706,8 @@ fn apply_routes(req: &HttpRequest, authentication: Option<&Authentication>) -> H
         200
     } else if reply["outcome"] == "rejected" {
         400
+    } else if reply["outcome"] == "busy" {
+        409
     } else {
         502
     };

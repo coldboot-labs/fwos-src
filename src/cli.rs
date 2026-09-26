@@ -8,6 +8,8 @@ use std::path::Path;
 use std::process;
 use std::time::Duration;
 
+use fwos_fwd_setup::identity::Principal;
+
 const SOCK: &str = "/var/lib/fwos/netd.sock";
 const UPDATE_SOCK: &str = "/var/lib/fwos/update.sock";
 const DESIRED: &str = "/var/lib/fwos/desired.toml";
@@ -75,8 +77,8 @@ fn show_desired() -> Result<String, String> {
     fs::read_to_string(DESIRED).map_err(|e| format!("read {DESIRED}: {e}"))
 }
 
-fn restore_previous_client() -> Result<String, String> {
-    let body = serde_json::json!({"op": "restore_previous"}).to_string();
+fn restore_previous_client(applying: Option<&Principal>) -> Result<String, String> {
+    let body = serde_json::json!({"op": "restore_previous", "applying": applying}).to_string();
     // Manual recovery uses the same bounded Host activation and rollback as
     // a normal Desired state apply; keep the socket open for its outcome.
     socket_roundtrip_for(SOCK, body.as_bytes(), Duration::from_secs(120))

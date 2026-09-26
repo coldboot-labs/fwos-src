@@ -311,7 +311,7 @@ fn admin_session(
             writeln!(out, "session authorization expired").map_err(|e| e.to_string())?;
             return Ok(());
         }
-        match admin_handle(out, line.trim())? {
+        match admin_handle_with_principal(out, line.trim(), Some(&authentication.principal))? {
             AdminAct::Continue => {}
             AdminAct::Logout => return Ok(()),
         }
@@ -324,7 +324,16 @@ enum AdminAct {
     Logout,
 }
 
+#[cfg(test)]
 fn admin_handle(out: &mut impl Write, line: &str) -> Result<AdminAct, String> {
+    admin_handle_with_principal(out, line, None)
+}
+
+fn admin_handle_with_principal(
+    out: &mut impl Write,
+    line: &str,
+    principal: Option<&identity::Principal>,
+) -> Result<AdminAct, String> {
     let line = line.trim();
     let (cmd, rest) = match line.split_once(char::is_whitespace) {
         Some((cmd, rest)) => (cmd, rest.trim()),
@@ -346,7 +355,7 @@ fn admin_handle(out: &mut impl Write, line: &str) -> Result<AdminAct, String> {
                 out.flush().map_err(|e| e.to_string())?;
                 return Ok(AdminAct::Continue);
             }
-            write_cmd(out, super::restore_previous_client())?;
+            write_cmd(out, super::restore_previous_client(principal))?;
             Ok(AdminAct::Continue)
         }
         // Existing full-CLI callers remain available until the console
@@ -415,13 +424,18 @@ fn print_admin_status(out: &mut impl Write) -> Result<(), String> {
         .and_then(|value| value.get("phase"))
         .and_then(|phase| phase.as_str())
         == Some("accepted");
+    let pending_phase = operation
+        .as_ref()
+        .and_then(|value| value.get("phase"))
+        .and_then(|phase| phase.as_str())
+        == Some("pending_confirmation");
     let netd_recovery_required = matches!(
         super::netd_json(&serde_json::json!({"op": "get_desired"})),
         Ok(reply) if reply["outcome"] == "recovery_required"
     );
     let indeterminate = accepted_phase && netd_recovery_required;
     let recovery_required = Path::new(APPLY_PREVIOUS).exists()
-        || (Path::new(APPLY_OPERATION).exists() && !accepted_phase)
+        || (Path::new(APPLY_OPERATION).exists() && !accepted_phase && !pending_phase)
         || (!accepted_phase && netd_recovery_required);
     let desired = fs::read_to_string(DESIRED)
         .ok()
@@ -471,6 +485,18 @@ fn print_admin_status(out: &mut impl Write) -> Result<(), String> {
     if recovery_required {
         writeln!(out, "Recovery required: interrupted Desired state apply")
             .map_err(|e| e.to_string())?;
+    } else if pending_phase {
+        let revision = operation
+            .as_ref()
+            .and_then(|value| value.get("proposed"))
+            .and_then(|value| value.get("revision"))
+            .and_then(|value| value.as_u64());
+        writeln!(
+            out,
+            "Apply confirmation pending for network revision {}",
+            revision.unwrap_or(0)
+        )
+        .map_err(|e| e.to_string())?;
     } else if indeterminate {
         writeln!(
             out,

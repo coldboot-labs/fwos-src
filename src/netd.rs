@@ -82,6 +82,8 @@ struct ApplyOperation {
     #[serde(default)]
     applying: Option<Principal>,
     #[serde(default)]
+    draft_version: Option<String>,
+    #[serde(default)]
     deadline_boot_ns: Option<u64>,
     #[serde(default)]
     expires_at_unix_ms: Option<u64>,
@@ -92,6 +94,8 @@ struct ApplyAttribution {
     revision: u64,
     applying: Option<Principal>,
     confirming: Option<Principal>,
+    #[serde(default)]
+    draft_version: Option<String>,
 }
 
 fn boot_time_ns() -> Result<u64, String> {
@@ -195,6 +199,7 @@ fn read_recovery_target() -> Result<RecoveryTarget, String> {
             proposed: None,
             confirmation_id: None,
             applying: None,
+            draft_version: None,
             deadline_boot_ns: None,
             expires_at_unix_ms: None,
         },
@@ -371,7 +376,7 @@ fn handle_client(mut stream: UnixStream) -> Result<(), String> {
         // Their base is the current Accepted revision at receipt, on this
         // single-threaded socket loop; they use the same validation and apply.
         Ok(v) if Path::new(BOOTSTRAPPED).exists() => {
-            apply_desired_request(&v, None, None, ApplyIntent::Ordinary).to_string()
+            apply_desired_request(&v, None, None, None, ApplyIntent::Ordinary).to_string()
         }
         Ok(_) => json!({"ok": false, "error": "complete Bootstrap before applying Desired state"})
             .to_string(),
@@ -425,6 +430,7 @@ fn handle_cmd(v: &Value) -> String {
             Err(error) => json!({"ok": false, "error": error}).to_string(),
         },
         "get_apply_confirmation" => apply_confirmation_status().to_string(),
+        "was_draft_accepted" => was_draft_accepted(v).to_string(),
         "confirm_apply" => confirm_apply(v).to_string(),
         "restore_previous" => {
             let actor = v.get("applying").cloned()
@@ -439,7 +445,8 @@ fn handle_cmd(v: &Value) -> String {
                 return json!({"ok": false, "outcome": "rejected", "error": "base_revision is required"}).to_string();
             };
             let actor = v.get("applying").cloned().and_then(|actor| serde_json::from_value::<Principal>(actor).ok());
-            apply_desired_request(v.get("desired").unwrap_or(&Value::Null), Some(base), actor, ApplyIntent::Ordinary).to_string()
+            let draft_version = v.get("draft_version").and_then(Value::as_str).map(str::to_owned);
+            apply_desired_request(v.get("desired").unwrap_or(&Value::Null), Some(base), actor, draft_version, ApplyIntent::Ordinary).to_string()
         }
         other => json!({"ok": false, "error": format!("unknown op {other}")}).to_string(),
     }
@@ -500,8 +507,46 @@ fn apply_confirmation_status() -> Value {
         Ok(None) => Value::Null,
         Err(error) => return json!({"ok": false, "error": error}),
     };
+    let last_accepted = accepted_attribution(accepted.revision).map(|record| {
+        json!({
+            "revision": record.revision,
+            "applying": record.applying,
+            "confirming": record.confirming,
+        })
+    });
     json!({"ok": true, "enabled": accepted.apply_confirmation, "accepted_revision": accepted.revision,
-        "pending": pending, "last_accepted": accepted_attribution(accepted.revision)})
+        "pending": pending, "last_accepted": last_accepted})
+}
+
+fn was_draft_accepted(request: &Value) -> Value {
+    if recovery_pending() {
+        return json!({"ok": false, "error": "Accepted Desired state is unavailable during recovery"});
+    }
+    let Some(revision) = request.get("revision").and_then(Value::as_u64) else {
+        return json!({"ok": false, "error": "Accepted revision is required"});
+    };
+    let Some(version) = request.get("draft_version").and_then(Value::as_str) else {
+        return json!({"ok": false, "error": "draft version is required"});
+    };
+    let Some(owner) = request
+        .get("owner")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<Principal>(value).ok())
+    else {
+        return json!({"ok": false, "error": "draft owner is required"});
+    };
+    let accepted = match accepted_desired() {
+        Ok(accepted) => accepted,
+        Err(error) => return json!({"ok": false, "error": error}),
+    };
+    let matches = accepted.revision == revision
+        && accepted_attribution(revision).is_some_and(|record| {
+            record.draft_version.as_deref() == Some(version)
+                && record.applying.as_ref().is_some_and(|actor| {
+                    actor.source == owner.source && actor.subject == owner.subject
+                })
+        });
+    json!({"ok": true, "accepted": matches})
 }
 
 fn pending_expired(operation: &ApplyOperation) -> Result<bool, String> {
@@ -571,6 +616,7 @@ fn confirm_apply(request: &Value) -> Value {
             revision,
             applying: operation.applying.clone(),
             confirming: Some(confirming.clone()),
+            draft_version: operation.draft_version.clone(),
         })?;
         persist(proposed)?;
         persist_at(Path::new(PREVIOUS_ACCEPTED), &operation.accepted)?;
@@ -582,6 +628,7 @@ fn confirm_apply(request: &Value) -> Value {
             proposed: None,
             confirmation_id: None,
             applying: operation.applying.clone(),
+            draft_version: operation.draft_version.clone(),
             deadline_boot_ns: None,
             expires_at_unix_ms: None,
         };
@@ -655,6 +702,7 @@ fn restore_previous_request(actor: Option<Principal>) -> Value {
         &input,
         Some(current.revision),
         actor,
+        None,
         ApplyIntent::RecoveryRestore,
     )
 }
@@ -663,6 +711,7 @@ fn apply_desired_request(
     input: &Value,
     base_revision: Option<u64>,
     actor: Option<Principal>,
+    draft_version: Option<String>,
     intent: ApplyIntent,
 ) -> Value {
     if apply_busy() {
@@ -724,6 +773,7 @@ fn apply_desired_request(
         proposed: None,
         confirmation_id: None,
         applying: actor.clone(),
+        draft_version: draft_version.clone(),
         deadline_boot_ns: None,
         expires_at_unix_ms: None,
     };
@@ -778,6 +828,7 @@ fn apply_desired_request(
                 revision: proposed.revision,
                 applying: actor.clone(),
                 confirming: None,
+                draft_version: draft_version.clone(),
             })?;
         }
         Ok::<(), String>(())
@@ -835,6 +886,7 @@ fn apply_desired_request(
             proposed: Some(proposed.clone()),
             confirmation_id: Some(confirmation_id),
             applying: actor.clone(),
+            draft_version: draft_version.clone(),
             deadline_boot_ns: Some(now_boot.saturating_add(120_000_000_000)),
             expires_at_unix_ms: Some(expires_at_unix_ms),
         };
@@ -865,6 +917,7 @@ fn apply_desired_request(
         proposed: None,
         confirmation_id: None,
         applying: actor.clone(),
+        draft_version,
         deadline_boot_ns: None,
         expires_at_unix_ms: None,
     }) {

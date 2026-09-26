@@ -95,10 +95,12 @@ fn same_desired_content(left: &DesiredState, right: &DesiredState) -> Result<boo
 
 // Called under the owner's draft lock. A matching on-disk snapshot is only a
 // candidate: during recovery desired.toml could be tentative. Ask netd for a
-// stable Accepted revision before durably clearing a confirmed proposal.
+// stable Accepted revision and exact owner/draft version before durably
+// clearing a confirmed proposal. Equal content from another Apply is not ours.
 // If netd is unavailable, keep the draft so private editing can continue.
 fn read_draft_reconciled(
     path: &Path,
+    owner: &Principal,
     snapshot: Option<&DesiredState>,
 ) -> Result<Option<Draft>, String> {
     let Some(draft) = read_draft(path)? else {
@@ -116,6 +118,18 @@ fn read_draft_reconciled(
         Err(_) => return Ok(Some(draft)),
     };
     if stable.revision != snapshot.revision || !same_desired_content(&draft.desired, &stable)? {
+        return Ok(Some(draft));
+    }
+    let accepted = match netd_cmd(&json!({
+        "op": "was_draft_accepted",
+        "revision": stable.revision,
+        "owner": owner,
+        "draft_version": draft.version,
+    })) {
+        Ok(reply) => reply["ok"] == true && reply["accepted"] == true,
+        Err(_) => false,
+    };
+    if !accepted {
         return Ok(Some(draft));
     }
     durable::remove(path)?;
@@ -1299,7 +1313,7 @@ fn configure_apply_confirmation(
     let lock = draft_lock(&path);
     let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let snapshot = accepted_snapshot_for_drafting().ok();
-    match read_draft_reconciled(&path, snapshot.as_ref()) {
+    match read_draft_reconciled(&path, &authentication.principal, snapshot.as_ref()) {
         Ok(Some(_)) => {
             return json_response(
                 409,
@@ -1412,7 +1426,7 @@ fn draft_status(authentication: Option<&Authentication>) -> HttpResponse {
         Ok(desired) => desired,
         Err(error) => return json_response(502, json!({"ok": false, "error": error})),
     };
-    let draft = match read_draft_reconciled(&path, Some(&accepted)) {
+    let draft = match read_draft_reconciled(&path, &authentication.principal, Some(&accepted)) {
         Ok(draft) => draft,
         Err(error) => return json_response(502, json!({"ok": false, "error": error})),
     };
@@ -1467,10 +1481,11 @@ fn save_draft(req: &HttpRequest, authentication: Option<&Authentication>) -> Htt
     let lock = draft_lock(&path);
     let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let snapshot = accepted_snapshot_for_drafting();
-    let existing = match read_draft_reconciled(&path, snapshot.as_ref().ok()) {
-        Ok(draft) => draft,
-        Err(error) => return json_response(502, json!({"ok": false, "error": error})),
-    };
+    let existing =
+        match read_draft_reconciled(&path, &authentication.principal, snapshot.as_ref().ok()) {
+            Ok(draft) => draft,
+            Err(error) => return json_response(502, json!({"ok": false, "error": error})),
+        };
     let (base_revision, mut desired) = match existing {
         Some(draft) if change.version.as_deref() == Some(draft.version.as_str()) => {
             (draft.base_revision, draft.desired)
@@ -1547,7 +1562,7 @@ fn apply_draft(req: &HttpRequest, authentication: Option<&Authentication>) -> Ht
     let lock = draft_lock(&path);
     let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let snapshot = accepted_snapshot_for_drafting().ok();
-    let draft = match read_draft_reconciled(&path, snapshot.as_ref()) {
+    let draft = match read_draft_reconciled(&path, &authentication.principal, snapshot.as_ref()) {
         Ok(Some(draft)) => draft,
         Ok(None) => {
             return json_response(
@@ -1578,7 +1593,7 @@ fn apply_draft(req: &HttpRequest, authentication: Option<&Authentication>) -> Ht
     }
     let reply = match netd_cmd_with_timeout(
         &json!({"op": "apply_desired", "base_revision": draft.base_revision, "desired": draft.desired,
-            "applying": authentication.principal}),
+            "applying": authentication.principal, "draft_version": draft.version}),
         // Allow both bounded Host activation and rollback before reporting.
         Duration::from_secs(120),
     ) {
@@ -1651,16 +1666,17 @@ fn reconcile_draft(req: &HttpRequest, authentication: Option<&Authentication>) -
     let lock = draft_lock(&path);
     let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let snapshot = accepted_snapshot_for_drafting();
-    let previous = match read_draft_reconciled(&path, snapshot.as_ref().ok()) {
-        Ok(Some(draft)) => draft,
-        Ok(None) => {
-            return json_response(
-                404,
-                json!({"ok": false, "error": "no private pending draft"}),
-            )
-        }
-        Err(error) => return json_response(502, json!({"ok": false, "error": error})),
-    };
+    let previous =
+        match read_draft_reconciled(&path, &authentication.principal, snapshot.as_ref().ok()) {
+            Ok(Some(draft)) => draft,
+            Ok(None) => {
+                return json_response(
+                    404,
+                    json!({"ok": false, "error": "no private pending draft"}),
+                )
+            }
+            Err(error) => return json_response(502, json!({"ok": false, "error": error})),
+        };
     if request.base_revision != previous.base_revision || request.version != previous.version {
         return json_response(
             409,
@@ -1720,7 +1736,7 @@ fn apply_routes(req: &HttpRequest, authentication: Option<&Authentication>) -> H
     let lock = draft_lock(&path);
     let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let snapshot = accepted_snapshot_for_drafting().ok();
-    match read_draft_reconciled(&path, snapshot.as_ref()) {
+    match read_draft_reconciled(&path, &authentication.principal, snapshot.as_ref()) {
         Ok(Some(_)) => {
             return json_response(
                 409,

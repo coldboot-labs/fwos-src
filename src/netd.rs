@@ -1764,6 +1764,7 @@ fn validate(state: &DesiredState) -> Result<(), String> {
         state.wan_pd.as_deref(),
     )?;
     lan_services_match_interface(state)?;
+    validate_policy(state)?;
     for wg in &state.wireguard {
         bootstrap_values::interface(&wg.name, None, None, &wg.addresses)?;
         let key = base64::engine::general_purpose::STANDARD
@@ -2370,6 +2371,66 @@ fn pd_subnet64(pd: &str) -> Option<String> {
 fn pd_pool(pd: &str) -> Option<(String, String)> {
     let lan = bootstrap_values::delegated_lan(pd)?;
     Some((lan.pool_start, lan.pool_end))
+}
+
+fn validate_policy(state: &DesiredState) -> Result<(), String> {
+    for rule in &state.nft_extra {
+        validate_policy_rule(state, rule)?;
+    }
+    Ok(())
+}
+
+fn validate_policy_rule(state: &DesiredState, rule: &str) -> Result<(), String> {
+    let rule = rule.trim();
+    if rule.is_empty()
+        || rule.chars().any(|c| {
+            !(c.is_ascii_alphanumeric() || matches!(c, ' ' | '"' | '.' | '/' | ':' | '-' | '_'))
+        })
+    {
+        return Err("invalid firewall policy".into());
+    }
+    let forbidden = [
+        "flush",
+        "table",
+        "chain",
+        "hook",
+        "policy",
+        "dnat",
+        "snat",
+        "masquerade",
+        "redirect",
+        "include",
+        "define",
+        "jump",
+        "goto",
+    ];
+    if rule
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|token| forbidden.contains(&token.to_ascii_lowercase().as_str()))
+    {
+        return Err("invalid firewall policy".into());
+    }
+    let verdict = rule.split_whitespace().last().unwrap_or("");
+    if !matches!(verdict, "accept" | "drop" | "reject") {
+        return Err("firewall policy needs a drop, reject, or accept verdict".into());
+    }
+    if let Some(name) = policy_iifname(rule) {
+        let Some(iface) = state.interfaces.iter().find(|iface| iface.name == name) else {
+            return Err(format!("firewall policy uses unknown interface {name}"));
+        };
+        if verdict == "accept" && iface.role.as_deref() == Some("wan") {
+            return Err("firewall policy must not accept WAN input".into());
+        }
+    } else if verdict == "accept" {
+        return Err("firewall accept must name a LAN or Management NIC".into());
+    }
+    Ok(())
+}
+
+fn policy_iifname(rule: &str) -> Option<String> {
+    let parts: Vec<&str> = rule.split_whitespace().collect();
+    let pos = parts.iter().position(|part| *part == "iifname")?;
+    Some(parts.get(pos + 1)?.trim_matches('"').to_string())
 }
 
 fn program_nft(state: &DesiredState) -> Result<(), String> {
@@ -3601,6 +3662,26 @@ mod tests {
         let unbound = unbound_conf("192.168.1.1", "192.168.1.0/24");
         assert!(unbound.contains("interface: 192.168.1.1"), "{unbound}");
         assert!(!unbound.contains("10.0.2.15"), "{unbound}");
+    }
+
+    #[test]
+    fn firewall_policy_rejects_wan_accept_and_keeps_a_narrowing_drop() {
+        let mut state = wan_lan();
+        state.nft_extra = vec!["ip saddr 203.0.113.50 drop".into()];
+        assert!(validate(&state).is_ok(), "{:?}", validate(&state).err());
+        state.nft_extra = vec!["iifname \"enp2s0\" accept".into()];
+        let err = validate(&state).unwrap_err();
+        assert!(err.contains("must not accept WAN input"), "{err}");
+        state.nft_extra = vec!["tcp dport 22 accept".into()];
+        let err = validate(&state).unwrap_err();
+        assert!(err.contains("LAN or Management NIC"), "{err}");
+        state.nft_extra = vec!["flush ruleset".into()];
+        let err = validate(&state).unwrap_err();
+        assert!(err.contains("invalid firewall policy"), "{err}");
+        state.nft_extra = vec![
+            "iifname \"enp1s0\" ip saddr 10.0.2.2 icmp type echo-request drop".into(),
+        ];
+        assert!(validate(&state).is_ok(), "{:?}", validate(&state).err());
     }
 
     #[test]

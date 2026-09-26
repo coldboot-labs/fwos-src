@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use fwos_fwd_setup::desired::{DesiredState, StaticRoute};
+use fwos_fwd_setup::desired::{DesiredState, Iface, StaticRoute};
 use fwos_fwd_setup::identity::{self, Authentication, AuthenticationResult, Principal};
 use fwos_fwd_setup::{bootstrap_values, durable};
 
@@ -47,6 +47,10 @@ struct Draft {
     base_revision: u64,
     version: String,
     desired: DesiredState,
+    /// Sections this draft proposes. Empty means a route draft written before
+    /// interface editing existed.
+    #[serde(default)]
+    sections: Vec<String>,
 }
 
 fn draft_locks() -> &'static Mutex<HashMap<PathBuf, Arc<Mutex<()>>>> {
@@ -504,6 +508,7 @@ fn dispatch(req: &HttpRequest) -> HttpResponse {
         ("POST", "/api/logout") => logout(req),
         ("GET", "/api/administrators") => administrators(authentication.as_ref()),
         ("GET", "/api/routes") => routes(),
+        ("GET", "/api/interfaces") => interfaces(),
         ("GET", "/api/apply-confirmation") => apply_confirmation_status(),
         ("POST", "/api/apply-confirmation/configure") => {
             configure_apply_confirmation(req, authentication.as_ref())
@@ -517,6 +522,8 @@ fn dispatch(req: &HttpRequest) -> HttpResponse {
         ("POST", "/api/routes/save-and-apply") => {
             save_and_apply_route(req, authentication.as_ref())
         }
+        ("POST", "/api/interfaces/apply") => apply_interfaces(req, authentication.as_ref()),
+        ("POST", "/api/interfaces/save-and-apply") => apply_interfaces(req, authentication.as_ref()),
         ("POST", "/api/administrators") => create_administrator(req, authentication.as_ref()),
         ("POST", "/api/administrators/password") => {
             change_administrator_password(req, authentication.as_ref())
@@ -1430,7 +1437,10 @@ fn draft_status(authentication: Option<&Authentication>) -> HttpResponse {
             json!({
                 "ok": true, "status": "pending", "base_revision": draft.base_revision,
                 "accepted_revision": accepted.revision, "stale": draft.base_revision != accepted.revision,
-                "version": draft.version, "routes": draft.desired.routes,
+                "version": draft.version, "sections": effective_sections(&draft),
+                "routes": draft.desired.routes,
+                "interfaces": draft.desired.interfaces,
+                "ui_exposure": draft.desired.ui_exposure,
             }),
         ),
         None => json_response(
@@ -1477,7 +1487,12 @@ enum RouteApplyRequest {
 struct DraftChange {
     base_revision: u64,
     version: Option<String>,
-    routes: Vec<StaticRoute>,
+    #[serde(default)]
+    routes: Option<Vec<StaticRoute>>,
+    #[serde(default)]
+    interfaces: Option<Vec<Iface>>,
+    #[serde(default)]
+    ui_exposure: Option<Vec<String>>,
 }
 
 fn save_draft(req: &HttpRequest, authentication: Option<&Authentication>) -> HttpResponse {
@@ -1503,9 +1518,10 @@ fn save_draft(req: &HttpRequest, authentication: Option<&Authentication>) -> Htt
             Ok(draft) => draft,
             Err(error) => return json_response(502, json!({"ok": false, "error": error})),
         };
-    let (base_revision, mut desired) = match existing {
+    let (base_revision, mut desired, mut sections) = match existing {
         Some(draft) if change.version.as_deref() == Some(draft.version.as_str()) => {
-            (draft.base_revision, draft.desired)
+            let sections = effective_sections(&draft);
+            (draft.base_revision, draft.desired, sections)
         }
         Some(_) => {
             return json_response(
@@ -1520,7 +1536,7 @@ fn save_draft(req: &HttpRequest, authentication: Option<&Authentication>) -> Htt
             );
         }
         None => match snapshot {
-            Ok(desired) => (desired.revision, desired),
+            Ok(desired) => (desired.revision, desired, Vec::new()),
             Err(error) => return json_response(502, json!({"ok": false, "error": error})),
         },
     };
@@ -1530,7 +1546,15 @@ fn save_draft(req: &HttpRequest, authentication: Option<&Authentication>) -> Htt
             json!({"ok": false, "error": "Draft base changed; reload before saving"}),
         );
     }
-    desired.routes = change.routes;
+    if let Err(error) = apply_draft_sections(
+        &mut desired,
+        &mut sections,
+        change.routes,
+        change.interfaces,
+        change.ui_exposure,
+    ) {
+        return json_response(400, json!({"ok": false, "error": error}));
+    }
     let version = match identity::random_token() {
         Ok(version) => version,
         Err(error) => return json_response(502, json!({"ok": false, "error": error})),
@@ -1539,6 +1563,7 @@ fn save_draft(req: &HttpRequest, authentication: Option<&Authentication>) -> Htt
         base_revision,
         version,
         desired,
+        sections,
     };
     if let Err(error) = write_draft(&path, &draft) {
         return json_response(502, json!({"ok": false, "error": error}));
@@ -1660,7 +1685,12 @@ struct DraftReconciliation {
     base_revision: u64,
     version: String,
     accepted_revision: u64,
-    routes: Vec<StaticRoute>,
+    #[serde(default)]
+    routes: Option<Vec<StaticRoute>>,
+    #[serde(default)]
+    interfaces: Option<Vec<Iface>>,
+    #[serde(default)]
+    ui_exposure: Option<Vec<String>>,
 }
 
 fn reconcile_draft(req: &HttpRequest, authentication: Option<&Authentication>) -> HttpResponse {
@@ -1711,7 +1741,16 @@ fn reconcile_draft(req: &HttpRequest, authentication: Option<&Authentication>) -
             json!({"ok": false, "error": "Accepted revision changed; review reconciliation again"}),
         );
     }
-    accepted.routes = request.routes;
+    let sections = effective_sections(&previous);
+    if let Err(error) = apply_reviewed_sections(
+        &mut accepted,
+        &sections,
+        request.routes,
+        request.interfaces,
+        request.ui_exposure,
+    ) {
+        return json_response(409, json!({"ok": false, "error": error}));
+    }
     let version = match identity::random_token() {
         Ok(version) => version,
         Err(error) => return json_response(502, json!({"ok": false, "error": error})),
@@ -1720,6 +1759,7 @@ fn reconcile_draft(req: &HttpRequest, authentication: Option<&Authentication>) -
         base_revision: accepted.revision,
         version,
         desired: accepted,
+        sections,
     };
     if let Err(error) = write_draft(&path, &draft) {
         return json_response(502, json!({"ok": false, "error": error}));
@@ -1731,7 +1771,7 @@ fn reconcile_draft(req: &HttpRequest, authentication: Option<&Authentication>) -
 }
 
 fn apply_routes(req: &HttpRequest, authentication: Option<&Authentication>) -> HttpResponse {
-    let authentication = match route_apply_authentication(authentication) {
+    let authentication = match operator_session(authentication) {
         Ok(authentication) => authentication,
         Err(response) => return response,
     };
@@ -1747,7 +1787,7 @@ fn apply_routes(req: &HttpRequest, authentication: Option<&Authentication>) -> H
     apply_route_change(authentication, RouteApplyRequest::Reviewed(change))
 }
 
-fn submit_route_apply(
+fn submit_desired_apply(
     desired: DesiredState,
     base_revision: u64,
     actor: &Principal,
@@ -1784,7 +1824,7 @@ fn save_and_apply_route(
     req: &HttpRequest,
     authentication: Option<&Authentication>,
 ) -> HttpResponse {
-    let authentication = match route_apply_authentication(authentication) {
+    let authentication = match operator_session(authentication) {
         Ok(authentication) => authentication,
         Err(response) => return response,
     };
@@ -1800,7 +1840,7 @@ fn save_and_apply_route(
     apply_route_change(authentication, RouteApplyRequest::Standalone(change))
 }
 
-fn route_apply_authentication(
+fn operator_session(
     authentication: Option<&Authentication>,
 ) -> Result<&Authentication, HttpResponse> {
     let Some(authentication) = authentication else {
@@ -1889,7 +1929,254 @@ fn apply_route_change(authentication: &Authentication, request: RouteApplyReques
             }
         }
     }
-    submit_route_apply(desired, base_revision, &authentication.principal)
+    submit_desired_apply(desired, base_revision, &authentication.principal)
+}
+
+fn interfaces() -> HttpResponse {
+    if !Path::new(BOOTSTRAP).exists() {
+        return json_response(
+            409,
+            json!({"ok": false, "error": "complete Bootstrap first"}),
+        );
+    }
+    match complete_desired() {
+        Ok(desired) => json_response(
+            200,
+            json!({
+                "ok": true,
+                "status": "accepted",
+                "revision": desired.revision,
+                "interfaces": desired.interfaces,
+                "ui_exposure": desired.ui_exposure,
+                "lan_prefix": desired.lan_prefix,
+                "nics": list_nics(),
+            }),
+        ),
+        Err(error) => json_response(502, json!({"ok": false, "error": error})),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InterfaceChange {
+    base_revision: u64,
+    interfaces: Vec<Iface>,
+    ui_exposure: Vec<String>,
+}
+
+fn apply_interfaces(req: &HttpRequest, authentication: Option<&Authentication>) -> HttpResponse {
+    let authentication = match operator_session(authentication) {
+        Ok(authentication) => authentication,
+        Err(response) => return response,
+    };
+    let change: InterfaceChange = match serde_json::from_slice(&req.body) {
+        Ok(change) => change,
+        Err(error) => {
+            return json_response(
+                400,
+                json!({"ok": false, "outcome": "rejected", "error": format!("invalid interface change: {error}")}),
+            )
+        }
+    };
+    let path = draft_path(&authentication.principal);
+    let lock = draft_lock(&path);
+    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let snapshot = accepted_snapshot_for_drafting().ok();
+    match read_draft_reconciled(&path, &authentication.principal, snapshot.as_ref()) {
+        Ok(Some(_)) => {
+            return json_response(
+                409,
+                json!({
+                    "ok": false, "outcome": "rejected",
+                    "error": "Private pending draft exists; review and apply or reconcile it first"
+                }),
+            )
+        }
+        Ok(None) => (),
+        Err(error) => return json_response(502, json!({"ok": false, "error": error})),
+    }
+    let mut desired = match complete_desired() {
+        Ok(desired) => desired,
+        Err(error) => return json_response(502, json!({"ok": false, "error": error})),
+    };
+    if desired.revision != change.base_revision {
+        return json_response(
+            409,
+            json!({"ok": false, "outcome": "rejected", "revision": desired.revision,
+            "error": "Accepted Desired state changed; reload before applying"}),
+        );
+    }
+    store_interface_section(&mut desired, change.interfaces, change.ui_exposure);
+    submit_desired_apply(desired, change.base_revision, &authentication.principal)
+}
+
+fn effective_sections(draft: &Draft) -> Vec<String> {
+    if draft.sections.is_empty() {
+        vec!["routes".into()]
+    } else {
+        draft.sections.clone()
+    }
+}
+
+fn remember_section(sections: &mut Vec<String>, section: &str) {
+    if !sections.iter().any(|existing| existing == section) {
+        sections.push(section.to_string());
+    }
+}
+
+fn apply_draft_sections(
+    desired: &mut DesiredState,
+    sections: &mut Vec<String>,
+    routes: Option<Vec<StaticRoute>>,
+    interfaces: Option<Vec<Iface>>,
+    ui_exposure: Option<Vec<String>>,
+) -> Result<(), String> {
+    if routes.is_none() && interfaces.is_none() && ui_exposure.is_none() {
+        return Err("invalid draft change".into());
+    }
+    if let Some(routes) = routes {
+        desired.routes = routes;
+        remember_section(sections, "routes");
+    }
+    if interfaces.is_some() || ui_exposure.is_some() {
+        let (Some(interfaces), Some(ui_exposure)) = (interfaces, ui_exposure) else {
+            return Err("interfaces and ui_exposure are saved together".into());
+        };
+        store_interface_section(desired, interfaces, ui_exposure);
+        remember_section(sections, "interfaces");
+    }
+    Ok(())
+}
+
+fn apply_reviewed_sections(
+    desired: &mut DesiredState,
+    sections: &[String],
+    routes: Option<Vec<StaticRoute>>,
+    interfaces: Option<Vec<Iface>>,
+    ui_exposure: Option<Vec<String>>,
+) -> Result<(), String> {
+    if sections.iter().any(|section| section == "routes") {
+        let Some(routes) = routes else {
+            return Err("Draft routes changed; review them again".into());
+        };
+        desired.routes = routes;
+    }
+    if sections.iter().any(|section| section == "interfaces") {
+        let (Some(interfaces), Some(ui_exposure)) = (interfaces, ui_exposure) else {
+            return Err("Draft interfaces changed; review them again".into());
+        };
+        store_interface_section(desired, interfaces, ui_exposure);
+    }
+    Ok(())
+}
+
+fn store_interface_section(
+    desired: &mut DesiredState,
+    interfaces: Vec<Iface>,
+    ui_exposure: Vec<String>,
+) {
+    desired.interfaces = interfaces;
+    desired.ui_exposure = ui_exposure;
+    sync_lan_prefix_from_first_lan(desired);
+}
+
+fn sync_lan_prefix_from_first_lan(state: &mut DesiredState) {
+    let Some(lan) = state
+        .interfaces
+        .iter()
+        .find(|iface| iface.role.as_deref() == Some("lan"))
+    else {
+        return;
+    };
+    let addresses: Vec<String> = lan.addresses.clone();
+    let matched = state.lan_prefix.as_deref().and_then(|prefix| {
+        let host = ipv4_prefix_host(prefix)?;
+        let host_prefix = format!("{host}/");
+        addresses
+            .iter()
+            .find(|address| address.starts_with(&host_prefix))
+            .cloned()
+    });
+    let Some(cidr) = matched.or_else(|| {
+        addresses.into_iter().find(|address| {
+            address
+                .split_once('/')
+                .is_some_and(|(ip, _)| ip.parse::<Ipv4Addr>().is_ok())
+        })
+    }) else {
+        return;
+    };
+    let Some(prefix) = ipv4_network_prefix(&cidr) else {
+        return;
+    };
+    if state.lan_prefix.as_deref() == Some(prefix.as_str()) {
+        return;
+    }
+    state.lan_prefix = Some(prefix.clone());
+    if state
+        .dhcp_pool
+        .as_deref()
+        .is_some_and(|pool| !dhcp_pool_inside(&prefix, pool))
+    {
+        state.dhcp_pool = None;
+    }
+}
+
+fn dhcp_pool_inside(prefix: &str, pool: &str) -> bool {
+    let Some((base, bits)) = ipv4_network(prefix) else {
+        return false;
+    };
+    let (first, last) = pool.split_once('-').unwrap_or((pool, pool));
+    let Ok(first) = first.trim().parse::<Ipv4Addr>() else {
+        return false;
+    };
+    let Ok(last) = last.trim().parse::<Ipv4Addr>() else {
+        return false;
+    };
+    let mask = if bits == 0 {
+        0
+    } else {
+        u32::MAX << (32 - bits)
+    };
+    u32::from(first) & mask == u32::from(base) & mask
+        && u32::from(last) & mask == u32::from(base) & mask
+}
+
+fn ipv4_network(cidr: &str) -> Option<(Ipv4Addr, u8)> {
+    let (address, bits) = cidr.split_once('/')?;
+    let address: Ipv4Addr = address.parse().ok()?;
+    let bits: u8 = bits.parse().ok()?;
+    (bits <= 32).then_some((address, bits))
+}
+
+fn ipv4_prefix_host(prefix: &str) -> Option<String> {
+    let ip = prefix.split('/').next()?;
+    let mut octets: Vec<u8> = ip.split('.').filter_map(|part| part.parse().ok()).collect();
+    if octets.len() != 4 {
+        return None;
+    }
+    if octets[3] == 0 {
+        octets[3] = 1;
+    }
+    Some(format!(
+        "{}.{}.{}.{}",
+        octets[0], octets[1], octets[2], octets[3]
+    ))
+}
+
+fn ipv4_network_prefix(cidr: &str) -> Option<String> {
+    let (address, bits) = cidr.split_once('/')?;
+    let address: Ipv4Addr = address.parse().ok()?;
+    let bits: u8 = bits.parse().ok()?;
+    if bits > 32 {
+        return None;
+    }
+    let mask = if bits == 0 {
+        0
+    } else {
+        u32::MAX << (32 - bits)
+    };
+    Some(format!("{}/{}", Ipv4Addr::from(u32::from(address) & mask), bits))
 }
 
 fn valid_hostname(name: &str) -> bool {
@@ -2109,5 +2396,162 @@ mod tests {
         let body = String::from_utf8_lossy(&resp.body);
         assert!(!body.contains("update.sock"));
         assert!(!body.contains("bootc"));
+    }
+
+    fn sample_state() -> DesiredState {
+        DesiredState {
+            interfaces: vec![
+                Iface {
+                    name: "enp1s0".into(),
+                    placement: String::new(),
+                    role: Some("lan".into()),
+                    addresses: vec!["192.168.1.1/24".into()],
+                    vlan: None,
+                    parent: None,
+                    dhcp: false,
+                },
+                Iface {
+                    name: "enp2s0".into(),
+                    placement: String::new(),
+                    role: Some("wan".into()),
+                    addresses: vec!["192.0.2.1/24".into()],
+                    vlan: None,
+                    parent: None,
+                    dhcp: false,
+                },
+            ],
+            routes: vec![StaticRoute {
+                to: "198.51.100.0/24".into(),
+                via: "192.0.2.2".into(),
+                dev: Some("enp2s0".into()),
+            }],
+            hostname: Some("fwos-box".into()),
+            lan_prefix: Some("192.168.1.0/24".into()),
+            dhcp_pool: Some("192.168.1.100-192.168.1.200".into()),
+            ui_exposure: vec!["enp1s0".into()],
+            nft_extra: vec!["ip saddr 203.0.113.50 drop".into()],
+            ..DesiredState::default()
+        }
+    }
+
+    #[test]
+    fn interface_edits_keep_routes_and_other_settings() {
+        let mut desired = sample_state();
+        let mut sections = Vec::new();
+        let interfaces = vec![
+            Iface {
+                name: "enp1s0".into(),
+                placement: String::new(),
+                role: Some("lan".into()),
+                addresses: vec!["203.0.113.10/24".into()],
+                vlan: None,
+                parent: None,
+                dhcp: false,
+            },
+            Iface {
+                name: "enp2s0".into(),
+                placement: String::new(),
+                role: Some("wan".into()),
+                addresses: vec!["198.51.100.1/24".into()],
+                vlan: None,
+                parent: None,
+                dhcp: false,
+            },
+        ];
+        apply_draft_sections(
+            &mut desired,
+            &mut sections,
+            None,
+            Some(interfaces),
+            Some(vec!["enp1s0".into()]),
+        )
+        .unwrap();
+        assert_eq!(sections, vec!["interfaces".to_string()]);
+        assert_eq!(desired.routes[0].to, "198.51.100.0/24");
+        assert_eq!(desired.hostname.as_deref(), Some("fwos-box"));
+        assert_eq!(desired.nft_extra, vec!["ip saddr 203.0.113.50 drop".to_string()]);
+        assert_eq!(desired.lan_prefix.as_deref(), Some("203.0.113.0/24"));
+        assert_eq!(desired.dhcp_pool, None);
+        assert!(bootstrap_values::addressing(
+            desired.lan_prefix.as_deref(),
+            desired.dhcp_pool.as_deref(),
+            desired.wan_pd.as_deref(),
+        )
+        .is_ok());
+        assert_eq!(desired.interfaces[1].addresses, vec!["198.51.100.1/24".to_string()]);
+        apply_draft_sections(
+            &mut desired,
+            &mut sections,
+            Some(vec![StaticRoute {
+                to: "203.0.113.0/24".into(),
+                via: "198.51.100.2".into(),
+                dev: Some("enp2s0".into()),
+            }]),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(desired.interfaces[0].addresses, vec!["203.0.113.10/24".to_string()]);
+        assert_eq!(desired.ui_exposure, vec!["enp1s0".to_string()]);
+        assert_eq!(sections, vec!["interfaces".to_string(), "routes".to_string()]);
+    }
+
+    #[test]
+    fn lan_prefix_follows_a_mask_change_and_keeps_an_inside_pool() {
+        let mut desired = sample_state();
+        desired.dhcp_pool = Some("192.168.1.20-192.168.1.40".into());
+        desired.interfaces[0].addresses = vec!["192.168.1.1/25".into()];
+        let interfaces = desired.interfaces.clone();
+        store_interface_section(&mut desired, interfaces, vec!["enp1s0".into()]);
+        assert_eq!(desired.lan_prefix.as_deref(), Some("192.168.1.0/25"));
+        assert_eq!(
+            desired.dhcp_pool.as_deref(),
+            Some("192.168.1.20-192.168.1.40")
+        );
+        assert!(bootstrap_values::addressing(
+            desired.lan_prefix.as_deref(),
+            desired.dhcp_pool.as_deref(),
+            None,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn reconcile_overlays_only_reviewed_sections() {
+        let mut accepted = sample_state();
+        accepted.revision = 4;
+        accepted.routes.clear();
+        accepted.interfaces[0].addresses = vec!["10.1.0.1/24".into()];
+        accepted.lan_prefix = Some("10.1.0.0/24".into());
+        let routes = vec![StaticRoute {
+            to: "198.51.100.0/24".into(),
+            via: "192.0.2.2".into(),
+            dev: Some("enp2s0".into()),
+        }];
+        apply_reviewed_sections(&mut accepted, &["routes".into()], Some(routes), None, None)
+            .unwrap();
+        assert_eq!(accepted.interfaces[0].addresses, vec!["10.1.0.1/24".to_string()]);
+        assert_eq!(accepted.routes[0].to, "198.51.100.0/24");
+        let routes = accepted.routes.clone();
+        let error = apply_reviewed_sections(
+            &mut accepted,
+            &["routes".into(), "interfaces".into()],
+            Some(routes),
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.contains("interfaces"), "{error}");
+    }
+
+    #[test]
+    fn legacy_route_draft_without_sections_is_routes_only() {
+        let draft = Draft {
+            base_revision: 1,
+            version: "abc".into(),
+            desired: sample_state(),
+            sections: Vec::new(),
+        };
+        assert_eq!(effective_sections(&draft), vec!["routes".to_string()]);
     }
 }

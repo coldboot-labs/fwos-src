@@ -38,7 +38,6 @@ const BOOTSTRAPPED: &str = "/var/lib/fwos/bootstrapped";
 const BOOTSTRAP_ATTEMPT: &str = "/var/lib/fwos/bootstrap-attempt.json";
 const IDENTITY: &str = "/var/lib/fwos/identity.json";
 const HOSTNAME: &str = "/var/lib/fwos/hostname";
-const CGNAT: [u8; 2] = [100, 64];
 static RECOVERY_REQUIRED: AtomicBool = AtomicBool::new(false);
 
 fn recovery_pending() -> bool {
@@ -1850,6 +1849,9 @@ fn validate(state: &DesiredState) -> Result<(), String> {
                 return Err(format!("route {} uses unknown interface {dev}", route.to));
             }
         }
+        if management_gateway(state, gateway, route.dev.as_deref()) {
+            return Err("Management NIC has no gateway".into());
+        }
         if !route_next_hop_on_link(state, gateway, route.dev.as_deref()) {
             return Err(format!(
                 "route {} next hop {} needs a configured on-link interface address",
@@ -1923,6 +1925,17 @@ fn validate(state: &DesiredState) -> Result<(), String> {
     Ok(())
 }
 
+fn management_gateway(state: &DesiredState, gateway: IpAddr, device: Option<&str>) -> bool {
+    state.interfaces.iter().any(|iface| {
+        iface.role.as_deref() == Some("mgmt")
+            && (device == Some(iface.name.as_str())
+                || iface
+                    .addresses
+                    .iter()
+                    .any(|cidr| gateway_in_cidr(gateway, cidr)))
+    })
+}
+
 fn route_next_hop_on_link(state: &DesiredState, gateway: IpAddr, device: Option<&str>) -> bool {
     let first_lan = state
         .interfaces
@@ -1984,7 +1997,7 @@ fn gateway_in_cidr(gateway: IpAddr, cidr: &str) -> bool {
 }
 
 fn validate_mgmt_iface(iface: &Iface) -> Result<(), String> {
-    if iface.vlan.is_some() || iface.parent.is_some() {
+    if iface.vlan.is_some() || iface.parent.is_some() || iface.name.contains('.') {
         return Err("Management NIC owns the whole parent".into());
     }
     if iface.dhcp {
@@ -2809,8 +2822,9 @@ fn expose_ips(cidrs: &[String]) -> Vec<String> {
     out
 }
 
-// Bootstrap deliberately excludes link-local HTTPS. Keep permanent Desired
-// state exposure on its existing policy; it is a separate configuration path.
+// Bootstrap HTTPS stays on RFC1918 and IPv6 ULA. Steady-state UI exposure uses
+// the configured interface address, including global unicast, and is filtered
+// only by expose_allowed.
 fn bootstrap_expose_ips(cidrs: &[String]) -> Vec<String> {
     expose_ips(cidrs)
         .into_iter()
@@ -2824,24 +2838,21 @@ fn bootstrap_expose_ips(cidrs: &[String]) -> Vec<String> {
 
 fn expose_allowed(ip: &str) -> bool {
     if let Ok(v4) = ip.parse::<std::net::Ipv4Addr>() {
-        if v4.is_loopback() {
+        if v4.is_loopback() || v4.is_unspecified() || v4.is_multicast() || v4.is_broadcast() {
             return false;
         }
         let o = v4.octets();
-        if o[0] == CGNAT[0] && (64..=127).contains(&o[1]) {
-            return false;
-        }
         // Host↔mgmt plumbing is not operator reachability.
         if o[0] == 169 && o[1] == 254 && o[2] == 127 {
             return false;
         }
-        return v4.is_private() || v4.is_link_local();
+        return true;
     }
     if let Ok(v6) = ip.parse::<std::net::Ipv6Addr>() {
-        if v6.is_loopback() {
+        if v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() {
             return false;
         }
-        return v6.is_unicast_link_local() || (v6.octets()[0] & 0xfe) == 0xfc;
+        return true;
     }
     false
 }
@@ -3068,16 +3079,55 @@ mod tests {
     }
 
     #[test]
-    fn expose_allowed_is_private_or_link_local() {
+    fn steady_state_exposure_allows_global_unicast() {
         assert!(expose_allowed("10.0.2.15"));
         assert!(expose_allowed("192.168.1.1"));
         assert!(expose_allowed("169.254.1.1"));
         assert!(!expose_allowed("169.254.127.6"));
-        assert!(!expose_allowed("8.8.8.8"));
-        assert!(!expose_allowed("100.64.0.1"));
-        assert!(!expose_allowed("2001:db8::1"));
+        assert!(expose_allowed("8.8.8.8"));
+        assert!(expose_allowed("203.0.113.1"));
+        assert!(expose_allowed("100.64.0.1"));
+        assert!(expose_allowed("2001:db8::1"));
         assert!(expose_allowed("fd53:1:1::9"));
         assert!(expose_allowed("fe80::1"));
+        assert!(!expose_allowed("127.0.0.1"));
+        assert!(!expose_allowed("::1"));
+    }
+
+    #[test]
+    fn bootstrap_exposure_stays_rfc1918_or_ula() {
+        let ips = bootstrap_expose_ips(&[
+            "203.0.113.10/24".into(),
+            "8.8.8.8/24".into(),
+            "100.64.0.1/24".into(),
+            "192.168.1.1/24".into(),
+            "2001:db8::1/64".into(),
+            "fd53:1:1::9/64".into(),
+            "fe80::1/64".into(),
+            "169.254.1.1/16".into(),
+        ]);
+        assert_eq!(
+            ips,
+            vec!["192.168.1.1".to_string(), "fd53:1:1::9".to_string()]
+        );
+    }
+
+    #[test]
+    fn steady_state_exposure_dnats_a_global_lan_address() {
+        let mut state = wan_lan();
+        state.interfaces[0].addresses = vec!["203.0.113.10/24".into()];
+        state.lan_prefix = Some("203.0.113.0/24".into());
+        state.dhcp_pool = None;
+        assert!(validate(&state).is_ok(), "{:?}", validate(&state).err());
+        let rules = nft_rules(&state);
+        assert!(
+            rules.contains("iifname \"enp1s0\" ip daddr 203.0.113.10 tcp dport 443 dnat"),
+            "{rules}"
+        );
+        assert!(
+            !rules.contains("iifname \"enp2s0\" ip daddr"),
+            "WAN stays closed:\n{rules}"
+        );
     }
 
     fn iface(name: &str, role: &str, addrs: &[&str]) -> Iface {
@@ -3500,6 +3550,30 @@ mod tests {
         let unbound = unbound_conf("192.168.1.1", "192.168.1.0/24");
         assert!(unbound.contains("interface: 192.168.1.1"), "{unbound}");
         assert!(!unbound.contains("10.0.2.15"), "{unbound}");
+    }
+
+    #[test]
+    fn management_nic_name_must_be_the_whole_parent() {
+        let mut state = wan_lan_mgmt();
+        state.interfaces[2].name = "enp3s0.20".into();
+        let err = validate(&state).unwrap_err();
+        assert!(err.contains("whole parent"), "{err}");
+    }
+
+    #[test]
+    fn management_nic_rejects_a_gateway_route() {
+        let mut state = wan_lan_mgmt();
+        state.routes.push(fwos_fwd_setup::desired::StaticRoute {
+            to: "198.51.100.0/24".into(),
+            via: "10.0.2.2".into(),
+            dev: Some("enp3s0".into()),
+        });
+        let err = validate(&state).unwrap_err();
+        assert!(err.contains("no gateway"), "{err}");
+
+        state.routes[0].dev = None;
+        let err = validate(&state).unwrap_err();
+        assert!(err.contains("no gateway"), "{err}");
     }
 
     #[test]

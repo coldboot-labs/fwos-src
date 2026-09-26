@@ -543,6 +543,17 @@ fn require_recovery_guard() -> Result<(), String> {
 }
 
 fn recover_interrupted_apply() -> Result<u64, String> {
+    // The marker may have been unlinked before its parent fsync failed, or
+    // reopening forwarding may have failed after a durable unlink. A/P and
+    // Host services were already restored; retry only the guarded final step.
+    if RECOVERY_REQUIRED.load(Ordering::SeqCst)
+        && !Path::new(APPLY_OPERATION).exists()
+        && !Path::new(APPLY_PREVIOUS).exists()
+    {
+        let previous = accepted_desired()?;
+        reopen_restored_forwarding(&previous)?;
+        return Ok(previous.revision);
+    }
     require_recovery_guard()?;
     let target = read_recovery_target()?;
     let mut previous = target.operation.accepted;
@@ -567,19 +578,29 @@ fn recover_interrupted_apply() -> Result<u64, String> {
 }
 
 fn finish_recovery(previous: &DesiredState, marker: &str) -> Result<(), String> {
-    // Reopen forwarding only after the prior Accepted state and its Host
-    // services are live and durable. The marker still prevents other applies.
-    RECOVERY_REQUIRED.store(false, Ordering::SeqCst);
-    if let Err(error) = program_nft(previous) {
-        let _ = require_recovery_guard();
-        return Err(format!("reopen restored forwarding: {error}"));
-    }
+    // A/P and Host services are live and durable. Keep the physical guard
+    // until the in-flight marker is durably gone, so a failed completion has
+    // never forwarded traffic. A crash after unlink boots durable A normally.
     if let Err(error) = durable::remove(Path::new(marker)) {
         let guard = require_recovery_guard();
         return Err(format!(
             "complete interrupted apply recovery: {error}; guard: {guard:?}"
         ));
     }
+    reopen_restored_forwarding(previous)?;
+    Ok(())
+}
+
+fn reopen_restored_forwarding(previous: &DesiredState) -> Result<(), String> {
+    // Keep other applies excluded until nft atomically installs the unguarded
+    // Accepted policy. A failure leaves the runtime guard set for serial retry.
+    if let Err(error) = nft_apply(&nft_rules_with_recovery_guard(previous, false)) {
+        let guard = require_recovery_guard();
+        return Err(format!(
+            "reopen restored forwarding: {error}; guard: {guard:?}"
+        ));
+    }
+    RECOVERY_REQUIRED.store(false, Ordering::SeqCst);
     Ok(())
 }
 
@@ -1785,6 +1806,10 @@ fn program_nft(state: &DesiredState) -> Result<(), String> {
 }
 
 fn nft_rules(state: &DesiredState) -> String {
+    nft_rules_with_recovery_guard(state, RECOVERY_REQUIRED.load(Ordering::SeqCst))
+}
+
+fn nft_rules_with_recovery_guard(state: &DesiredState, recovery_required: bool) -> String {
     let wans: Vec<&str> = state
         .interfaces
         .iter()
@@ -1814,7 +1839,7 @@ fn nft_rules(state: &DesiredState) -> String {
     rules.push_str("  }\n");
     rules.push_str("  chain forward {\n");
     rules.push_str("    type filter hook forward priority filter; policy drop;\n");
-    if RECOVERY_REQUIRED.load(Ordering::SeqCst) {
+    if recovery_required {
         rules.push_str("    drop\n");
     }
     rules.push_str("    ct state established,related accept\n");

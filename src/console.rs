@@ -415,13 +415,17 @@ fn print_admin_status(out: &mut impl Write) -> Result<(), String> {
         .and_then(|value| value.get("phase"))
         .and_then(|phase| phase.as_str())
         == Some("accepted");
-    let indeterminate = accepted_phase
-        && matches!(
-            super::netd_json(&serde_json::json!({"op": "get_desired"})),
-            Ok(reply) if reply["outcome"] == "recovery_required"
-        );
+    let netd_recovery_required = matches!(
+        super::netd_json(&serde_json::json!({"op": "get_desired"})),
+        Ok(reply) if reply["outcome"] == "recovery_required"
+    );
+    let indeterminate = accepted_phase && netd_recovery_required;
     let recovery_required = Path::new(APPLY_PREVIOUS).exists()
-        || (Path::new(APPLY_OPERATION).exists() && !accepted_phase);
+        || (Path::new(APPLY_OPERATION).exists() && !accepted_phase)
+        || (!accepted_phase && netd_recovery_required);
+    let desired = fs::read_to_string(DESIRED)
+        .ok()
+        .and_then(|raw| raw.parse::<toml::Value>().ok());
     let recovery_target = operation
         .as_ref()
         .and_then(|operation| operation.get("accepted").cloned())
@@ -431,10 +435,16 @@ fn print_admin_status(out: &mut impl Write) -> Result<(), String> {
             fs::read_to_string(APPLY_PREVIOUS)
                 .ok()
                 .and_then(|raw| raw.parse::<toml::Value>().ok())
+        })
+        .or_else(|| {
+            // After a post-unlink completion failure, A is already durable
+            // and netd still guards forwarding. It remains the retry target.
+            if recovery_required && !Path::new(APPLY_OPERATION).exists() {
+                desired.clone()
+            } else {
+                None
+            }
         });
-    let desired = fs::read_to_string(DESIRED)
-        .ok()
-        .and_then(|raw| raw.parse::<toml::Value>().ok());
     let shown = if indeterminate {
         None
     } else if recovery_required {

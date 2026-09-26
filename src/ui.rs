@@ -1467,6 +1467,11 @@ enum StandaloneRouteChange {
     },
 }
 
+enum RouteApplyRequest {
+    Reviewed(RouteChange),
+    Standalone(StandaloneRouteChange),
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DraftChange {
@@ -1726,15 +1731,10 @@ fn reconcile_draft(req: &HttpRequest, authentication: Option<&Authentication>) -
 }
 
 fn apply_routes(req: &HttpRequest, authentication: Option<&Authentication>) -> HttpResponse {
-    let Some(authentication) = authentication else {
-        return json_response(401, json!({"ok": false, "error": "sign in required"}));
+    let authentication = match route_apply_authentication(authentication) {
+        Ok(authentication) => authentication,
+        Err(response) => return response,
     };
-    if !Path::new(BOOTSTRAP).exists() {
-        return json_response(
-            409,
-            json!({"ok": false, "error": "complete Bootstrap first"}),
-        );
-    }
     let change: RouteChange = match serde_json::from_slice(&req.body) {
         Ok(change) => change,
         Err(error) => {
@@ -1744,35 +1744,7 @@ fn apply_routes(req: &HttpRequest, authentication: Option<&Authentication>) -> H
             )
         }
     };
-    let path = draft_path(&authentication.principal);
-    let lock = draft_lock(&path);
-    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let snapshot = accepted_snapshot_for_drafting().ok();
-    match read_draft_reconciled(&path, &authentication.principal, snapshot.as_ref()) {
-        Ok(Some(_)) => {
-            return json_response(
-                409,
-                json!({
-                    "ok": false, "outcome": "rejected",
-                    "error": "Private pending draft exists; review and apply or reconcile it first"
-                }),
-            )
-        }
-        Ok(None) => (),
-        Err(error) => return json_response(502, json!({"ok": false, "error": error})),
-    }
-    let mut desired = match complete_desired() {
-        Ok(desired) => desired,
-        Err(error) => return json_response(502, json!({"ok": false, "error": error})),
-    };
-    if desired.revision != change.base_revision {
-        return json_response(
-            409,
-            json!({"ok": false, "outcome": "rejected", "error": "Accepted Desired state changed; reload before applying", "revision": desired.revision}),
-        );
-    }
-    desired.routes = change.routes;
-    submit_route_apply(desired, change.base_revision, &authentication.principal)
+    apply_route_change(authentication, RouteApplyRequest::Reviewed(change))
 }
 
 fn submit_route_apply(
@@ -1812,15 +1784,10 @@ fn save_and_apply_route(
     req: &HttpRequest,
     authentication: Option<&Authentication>,
 ) -> HttpResponse {
-    let Some(authentication) = authentication else {
-        return json_response(401, json!({"ok": false, "error": "sign in required"}));
+    let authentication = match route_apply_authentication(authentication) {
+        Ok(authentication) => authentication,
+        Err(response) => return response,
     };
-    if !Path::new(BOOTSTRAP).exists() {
-        return json_response(
-            409,
-            json!({"ok": false, "error": "complete Bootstrap first"}),
-        );
-    }
     let change: StandaloneRouteChange = match serde_json::from_slice(&req.body) {
         Ok(change) => change,
         Err(error) => {
@@ -1829,6 +1796,36 @@ fn save_and_apply_route(
                 json!({"ok": false, "outcome": "rejected", "error": format!("invalid standalone route change: {error}")}),
             )
         }
+    };
+    apply_route_change(authentication, RouteApplyRequest::Standalone(change))
+}
+
+fn route_apply_authentication(
+    authentication: Option<&Authentication>,
+) -> Result<&Authentication, HttpResponse> {
+    let Some(authentication) = authentication else {
+        return Err(json_response(
+            401,
+            json!({"ok": false, "error": "sign in required"}),
+        ));
+    };
+    if !Path::new(BOOTSTRAP).exists() {
+        return Err(json_response(
+            409,
+            json!({"ok": false, "error": "complete Bootstrap first"}),
+        ));
+    }
+    Ok(authentication)
+}
+
+fn apply_route_change(authentication: &Authentication, request: RouteApplyRequest) -> HttpResponse {
+    let base_revision = match &request {
+        RouteApplyRequest::Reviewed(change) => change.base_revision,
+        RouteApplyRequest::Standalone(
+            StandaloneRouteChange::Add { base_revision, .. }
+            | StandaloneRouteChange::Change { base_revision, .. }
+            | StandaloneRouteChange::Remove { base_revision, .. },
+        ) => *base_revision,
     };
     let path = draft_path(&authentication.principal);
     let lock = draft_lock(&path);
@@ -1851,11 +1848,6 @@ fn save_and_apply_route(
         Ok(desired) => desired,
         Err(error) => return json_response(502, json!({"ok": false, "error": error})),
     };
-    let base_revision = match &change {
-        StandaloneRouteChange::Add { base_revision, .. }
-        | StandaloneRouteChange::Change { base_revision, .. }
-        | StandaloneRouteChange::Remove { base_revision, .. } => *base_revision,
-    };
     if desired.revision != base_revision {
         return json_response(
             409,
@@ -1863,31 +1855,38 @@ fn save_and_apply_route(
             "error": "Accepted Desired state changed; reload before applying"}),
         );
     }
-    let selected = match &change {
-        StandaloneRouteChange::Add { .. } => None,
-        StandaloneRouteChange::Change { original, .. }
-        | StandaloneRouteChange::Remove { original, .. } => {
-            let matches: Vec<usize> = desired
-                .routes
-                .iter()
-                .enumerate()
-                .filter_map(|(index, existing)| (existing == original).then_some(index))
-                .collect();
-            if matches.len() != 1 {
-                return json_response(
-                    409,
-                    json!({"ok": false, "outcome": "rejected", "revision": desired.revision,
-                    "error": "Selected Accepted route changed; reload before applying"}),
-                );
+    match request {
+        RouteApplyRequest::Reviewed(change) => desired.routes = change.routes,
+        RouteApplyRequest::Standalone(change) => {
+            let selected = match &change {
+                StandaloneRouteChange::Add { .. } => None,
+                StandaloneRouteChange::Change { original, .. }
+                | StandaloneRouteChange::Remove { original, .. } => {
+                    let matches: Vec<usize> = desired
+                        .routes
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, existing)| (existing == original).then_some(index))
+                        .collect();
+                    if matches.len() != 1 {
+                        return json_response(
+                            409,
+                            json!({"ok": false, "outcome": "rejected", "revision": desired.revision,
+                            "error": "Selected Accepted route changed; reload before applying"}),
+                        );
+                    }
+                    Some(matches[0])
+                }
+            };
+            match change {
+                StandaloneRouteChange::Add { route, .. } => desired.routes.push(route),
+                StandaloneRouteChange::Change { route, .. } => {
+                    desired.routes[selected.unwrap()] = route
+                }
+                StandaloneRouteChange::Remove { .. } => {
+                    desired.routes.remove(selected.unwrap());
+                }
             }
-            Some(matches[0])
-        }
-    };
-    match change {
-        StandaloneRouteChange::Add { route, .. } => desired.routes.push(route),
-        StandaloneRouteChange::Change { route, .. } => desired.routes[selected.unwrap()] = route,
-        StandaloneRouteChange::Remove { .. } => {
-            desired.routes.remove(selected.unwrap());
         }
     }
     submit_route_apply(desired, base_revision, &authentication.principal)

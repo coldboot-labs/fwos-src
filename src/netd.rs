@@ -1618,6 +1618,7 @@ fn bootstrap_apply_inner(request: &Value) -> Result<(), BootstrapFailure> {
         state.dhcp_pool.as_deref(),
         state.wan_pd.as_deref(),
     )?;
+    lan_services_match_interface(&state)?;
     if identity::tentative_first_administrator_subject().as_deref() != Some(admin_subject) {
         return Err("Bootstrap administrator changed before apply".into());
     }
@@ -1762,6 +1763,7 @@ fn validate(state: &DesiredState) -> Result<(), String> {
         state.dhcp_pool.as_deref(),
         state.wan_pd.as_deref(),
     )?;
+    lan_services_match_interface(state)?;
     for wg in &state.wireguard {
         bootstrap_values::interface(&wg.name, None, None, &wg.addresses)?;
         let key = base64::engine::general_purpose::STANDARD
@@ -2028,6 +2030,55 @@ fn exposes_ui(state: &DesiredState, name: &str) -> bool {
     state.ui_exposure.iter().any(|n| n == name)
 }
 
+fn lan_services_match_interface(state: &DesiredState) -> Result<(), String> {
+    let Some(lan) = lan_l2(state) else {
+        return Ok(());
+    };
+    let interface_prefixes = lan_interface_prefixes(lan);
+    if interface_prefixes.is_empty() {
+        return Ok(());
+    }
+    if let Some(prefix) = state.lan_prefix.as_deref().filter(|prefix| !prefix.is_empty()) {
+        let Some(expected) = ipv4_prefix(prefix) else {
+            return Err("LAN prefix does not match a LAN interface address".into());
+        };
+        if !interface_prefixes.contains(&expected) {
+            return Err("LAN prefix does not match a LAN interface address".into());
+        }
+    } else if let Some(pool) = state.dhcp_pool.as_deref().filter(|pool| !pool.is_empty()) {
+        let Some(implied) = prefix_from_pool(pool).as_deref().and_then(ipv4_prefix) else {
+            return Err("DHCP pool does not match a LAN interface address".into());
+        };
+        if !interface_prefixes.contains(&implied) {
+            return Err("DHCP pool does not match a LAN interface address".into());
+        }
+    }
+    Ok(())
+}
+
+fn lan_interface_prefixes(iface: &Iface) -> Vec<(std::net::Ipv4Addr, u8)> {
+    iface
+        .addresses
+        .iter()
+        .filter_map(|cidr| ipv4_prefix(cidr))
+        .collect()
+}
+
+fn ipv4_prefix(cidr: &str) -> Option<(std::net::Ipv4Addr, u8)> {
+    let (address, bits) = cidr.split_once('/')?;
+    let address: std::net::Ipv4Addr = address.parse().ok()?;
+    let bits: u8 = bits.parse().ok()?;
+    if bits > 32 {
+        return None;
+    }
+    let mask = if bits == 0 {
+        0
+    } else {
+        u32::MAX << (32 - bits)
+    };
+    Some((std::net::Ipv4Addr::from(u32::from(address) & mask), bits))
+}
+
 fn lan_l2(state: &DesiredState) -> Option<&Iface> {
     state
         .interfaces
@@ -2274,7 +2325,7 @@ fn kea_dhcp6_conf(dev: &str, subnet: &str, p1: &str, p2: &str) -> String {
 
 fn unbound_conf(lan_v4: &str, prefix: &str) -> String {
     format!(
-        "server:\n  interface: {lan_v4}\n  port: 53\n  access-control: {prefix} allow\n  access-control: 127.0.0.0/8 allow\n  do-daemonize: no\n  username: \"\"\n  chroot: \"\"\n  directory: \"/tmp\"\n  pidfile: \"/tmp/unbound.pid\"\n  use-syslog: no\n  logfile: /dev/null\n"
+        "server:\n  interface: {lan_v4}\n  port: 53\n  access-control: {prefix} allow\n  access-control: 127.0.0.0/8 allow\n  local-zone: \"localhost.\" static\n  local-data: \"localhost. 10800 IN A 127.0.0.1\"\n  do-daemonize: no\n  username: \"\"\n  chroot: \"\"\n  directory: \"/tmp\"\n  pidfile: \"/tmp/unbound.pid\"\n  use-syslog: no\n  logfile: /dev/null\n"
     )
 }
 
@@ -3550,6 +3601,30 @@ mod tests {
         let unbound = unbound_conf("192.168.1.1", "192.168.1.0/24");
         assert!(unbound.contains("interface: 192.168.1.1"), "{unbound}");
         assert!(!unbound.contains("10.0.2.15"), "{unbound}");
+    }
+
+    #[test]
+    fn lan_prefix_must_contain_a_lan_address() {
+        let mut state = wan_lan();
+        state.interfaces[0].addresses = vec!["10.1.0.1/24".into()];
+        state.lan_prefix = Some("192.168.1.0/24".into());
+        state.dhcp_pool = Some("192.168.1.20-192.168.1.40".into());
+        let err = validate(&state).unwrap_err();
+        assert!(
+            err.contains("LAN prefix") || err.contains("dhcp_pool"),
+            "{err}"
+        );
+        state.lan_prefix = Some("10.1.0.0/16".into());
+        state.dhcp_pool = Some("10.1.0.20-10.1.0.40".into());
+        let err = validate(&state).unwrap_err();
+        assert!(err.contains("LAN prefix"), "{err}");
+        state.lan_prefix = None;
+        state.dhcp_pool = Some("192.168.9.10-192.168.9.20".into());
+        let err = validate(&state).unwrap_err();
+        assert!(err.contains("DHCP pool"), "{err}");
+        state.lan_prefix = Some("10.1.0.0/24".into());
+        state.dhcp_pool = Some("10.1.0.20-10.1.0.40".into());
+        assert!(validate(&state).is_ok(), "{:?}", validate(&state).err());
     }
 
     #[test]

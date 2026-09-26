@@ -509,6 +509,7 @@ fn dispatch(req: &HttpRequest) -> HttpResponse {
         ("GET", "/api/administrators") => administrators(authentication.as_ref()),
         ("GET", "/api/routes") => routes(),
         ("GET", "/api/interfaces") => interfaces(),
+        ("GET", "/api/lan-services") => lan_services(),
         ("GET", "/api/apply-confirmation") => apply_confirmation_status(),
         ("POST", "/api/apply-confirmation/configure") => {
             configure_apply_confirmation(req, authentication.as_ref())
@@ -524,6 +525,10 @@ fn dispatch(req: &HttpRequest) -> HttpResponse {
         }
         ("POST", "/api/interfaces/apply") => apply_interfaces(req, authentication.as_ref()),
         ("POST", "/api/interfaces/save-and-apply") => apply_interfaces(req, authentication.as_ref()),
+        ("POST", "/api/lan-services/apply") => apply_lan_services(req, authentication.as_ref()),
+        ("POST", "/api/lan-services/save-and-apply") => {
+            apply_lan_services(req, authentication.as_ref())
+        }
         ("POST", "/api/administrators") => create_administrator(req, authentication.as_ref()),
         ("POST", "/api/administrators/password") => {
             change_administrator_password(req, authentication.as_ref())
@@ -1441,6 +1446,9 @@ fn draft_status(authentication: Option<&Authentication>) -> HttpResponse {
                 "routes": draft.desired.routes,
                 "interfaces": draft.desired.interfaces,
                 "ui_exposure": draft.desired.ui_exposure,
+                "lan_prefix": draft.desired.lan_prefix,
+                "dhcp_pool": draft.desired.dhcp_pool,
+                "wan_pd": draft.desired.wan_pd,
             }),
         ),
         None => json_response(
@@ -1493,6 +1501,8 @@ struct DraftChange {
     interfaces: Option<Vec<Iface>>,
     #[serde(default)]
     ui_exposure: Option<Vec<String>>,
+    #[serde(default)]
+    services: Option<LanServices>,
 }
 
 fn save_draft(req: &HttpRequest, authentication: Option<&Authentication>) -> HttpResponse {
@@ -1552,6 +1562,7 @@ fn save_draft(req: &HttpRequest, authentication: Option<&Authentication>) -> Htt
         change.routes,
         change.interfaces,
         change.ui_exposure,
+        change.services,
     ) {
         return json_response(400, json!({"ok": false, "error": error}));
     }
@@ -1691,6 +1702,8 @@ struct DraftReconciliation {
     interfaces: Option<Vec<Iface>>,
     #[serde(default)]
     ui_exposure: Option<Vec<String>>,
+    #[serde(default)]
+    services: Option<LanServices>,
 }
 
 fn reconcile_draft(req: &HttpRequest, authentication: Option<&Authentication>) -> HttpResponse {
@@ -1748,6 +1761,7 @@ fn reconcile_draft(req: &HttpRequest, authentication: Option<&Authentication>) -
         request.routes,
         request.interfaces,
         request.ui_exposure,
+        request.services,
     ) {
         return json_response(409, json!({"ok": false, "error": error}));
     }
@@ -2024,14 +2038,26 @@ fn remember_section(sections: &mut Vec<String>, section: &str) {
     }
 }
 
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct LanServices {
+    #[serde(default)]
+    lan_prefix: String,
+    #[serde(default)]
+    dhcp_pool: String,
+    #[serde(default)]
+    wan_pd: String,
+}
+
 fn apply_draft_sections(
     desired: &mut DesiredState,
     sections: &mut Vec<String>,
     routes: Option<Vec<StaticRoute>>,
     interfaces: Option<Vec<Iface>>,
     ui_exposure: Option<Vec<String>>,
+    services: Option<LanServices>,
 ) -> Result<(), String> {
-    if routes.is_none() && interfaces.is_none() && ui_exposure.is_none() {
+    if routes.is_none() && interfaces.is_none() && ui_exposure.is_none() && services.is_none() {
         return Err("invalid draft change".into());
     }
     if let Some(routes) = routes {
@@ -2045,6 +2071,10 @@ fn apply_draft_sections(
         store_interface_section(desired, interfaces, ui_exposure);
         remember_section(sections, "interfaces");
     }
+    if let Some(services) = services {
+        store_lan_services(desired, services);
+        remember_section(sections, "services");
+    }
     Ok(())
 }
 
@@ -2054,6 +2084,7 @@ fn apply_reviewed_sections(
     routes: Option<Vec<StaticRoute>>,
     interfaces: Option<Vec<Iface>>,
     ui_exposure: Option<Vec<String>>,
+    services: Option<LanServices>,
 ) -> Result<(), String> {
     if sections.iter().any(|section| section == "routes") {
         let Some(routes) = routes else {
@@ -2067,7 +2098,100 @@ fn apply_reviewed_sections(
         };
         store_interface_section(desired, interfaces, ui_exposure);
     }
+    if sections.iter().any(|section| section == "services") {
+        let Some(services) = services else {
+            return Err("Draft LAN services changed; review them again".into());
+        };
+        store_lan_services(desired, services);
+    }
     Ok(())
+}
+
+fn store_lan_services(desired: &mut DesiredState, services: LanServices) {
+    desired.lan_prefix = blank_to_none(services.lan_prefix);
+    desired.dhcp_pool = blank_to_none(services.dhcp_pool);
+    desired.wan_pd = blank_to_none(services.wan_pd);
+}
+
+fn blank_to_none(value: String) -> Option<String> {
+    let value = value.trim().to_string();
+    if value.is_empty() { None } else { Some(value) }
+}
+
+fn lan_services() -> HttpResponse {
+    if !Path::new(BOOTSTRAP).exists() {
+        return json_response(
+            409,
+            json!({"ok": false, "error": "complete Bootstrap first"}),
+        );
+    }
+    match complete_desired() {
+        Ok(desired) => json_response(
+            200,
+            json!({
+                "ok": true,
+                "status": "accepted",
+                "revision": desired.revision,
+                "lan_prefix": desired.lan_prefix,
+                "dhcp_pool": desired.dhcp_pool,
+                "wan_pd": desired.wan_pd,
+                "lan": desired.interfaces.iter().find(|iface| iface.role.as_deref() == Some("lan")).map(|iface| iface.name.clone()),
+            }),
+        ),
+        Err(error) => json_response(502, json!({"ok": false, "error": error})),
+    }
+}
+
+fn apply_lan_services(req: &HttpRequest, authentication: Option<&Authentication>) -> HttpResponse {
+    let authentication = match operator_session(authentication) {
+        Ok(authentication) => authentication,
+        Err(response) => return response,
+    };
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct LanServiceChange {
+        base_revision: u64,
+        services: LanServices,
+    }
+    let change: LanServiceChange = match serde_json::from_slice(&req.body) {
+        Ok(change) => change,
+        Err(error) => {
+            return json_response(
+                400,
+                json!({"ok": false, "outcome": "rejected", "error": format!("invalid LAN service change: {error}")}),
+            )
+        }
+    };
+    let path = draft_path(&authentication.principal);
+    let lock = draft_lock(&path);
+    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let snapshot = accepted_snapshot_for_drafting().ok();
+    match read_draft_reconciled(&path, &authentication.principal, snapshot.as_ref()) {
+        Ok(Some(_)) => {
+            return json_response(
+                409,
+                json!({
+                    "ok": false, "outcome": "rejected",
+                    "error": "Private pending draft exists; review and apply or reconcile it first"
+                }),
+            )
+        }
+        Ok(None) => (),
+        Err(error) => return json_response(502, json!({"ok": false, "error": error})),
+    }
+    let mut desired = match complete_desired() {
+        Ok(desired) => desired,
+        Err(error) => return json_response(502, json!({"ok": false, "error": error})),
+    };
+    if desired.revision != change.base_revision {
+        return json_response(
+            409,
+            json!({"ok": false, "outcome": "rejected", "revision": desired.revision,
+            "error": "Accepted Desired state changed; reload before applying"}),
+        );
+    }
+    store_lan_services(&mut desired, change.services);
+    submit_desired_apply(desired, change.base_revision, &authentication.principal)
 }
 
 fn store_interface_section(
@@ -2464,6 +2588,7 @@ mod tests {
             None,
             Some(interfaces),
             Some(vec!["enp1s0".into()]),
+            None,
         )
         .unwrap();
         assert_eq!(sections, vec!["interfaces".to_string()]);
@@ -2487,6 +2612,7 @@ mod tests {
                 via: "198.51.100.2".into(),
                 dev: Some("enp2s0".into()),
             }]),
+            None,
             None,
             None,
         )
@@ -2528,7 +2654,7 @@ mod tests {
             via: "192.0.2.2".into(),
             dev: Some("enp2s0".into()),
         }];
-        apply_reviewed_sections(&mut accepted, &["routes".into()], Some(routes), None, None)
+        apply_reviewed_sections(&mut accepted, &["routes".into()], Some(routes), None, None, None)
             .unwrap();
         assert_eq!(accepted.interfaces[0].addresses, vec!["10.1.0.1/24".to_string()]);
         assert_eq!(accepted.routes[0].to, "198.51.100.0/24");
@@ -2539,9 +2665,37 @@ mod tests {
             Some(routes),
             None,
             None,
+            None,
         )
         .unwrap_err();
         assert!(error.contains("interfaces"), "{error}");
+    }
+
+    #[test]
+    fn lan_service_draft_keeps_interfaces_and_routes() {
+        let mut desired = sample_state();
+        let mut sections = vec!["interfaces".into()];
+        apply_draft_sections(
+            &mut desired,
+            &mut sections,
+            None,
+            None,
+            None,
+            Some(LanServices {
+                lan_prefix: "192.168.1.0/24".into(),
+                dhcp_pool: "192.168.1.20-192.168.1.40".into(),
+                wan_pd: String::new(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(desired.routes[0].to, "198.51.100.0/24");
+        assert_eq!(desired.interfaces[1].role.as_deref(), Some("wan"));
+        assert_eq!(desired.dhcp_pool.as_deref(), Some("192.168.1.20-192.168.1.40"));
+        assert_eq!(desired.wan_pd, None);
+        assert_eq!(
+            sections,
+            vec!["interfaces".to_string(), "services".to_string()]
+        );
     }
 
     #[test]

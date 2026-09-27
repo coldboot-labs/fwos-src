@@ -517,6 +517,7 @@ fn dispatch(req: &HttpRequest) -> HttpResponse {
         ("GET", "/api/firewall") => firewall(),
         ("GET", "/api/wireguard") => wireguard(),
         ("GET", "/api/qdiscs") => qdiscs(),
+        ("GET", "/api/ipv6") => ipv6(),
         ("GET", "/api/apply-confirmation") => apply_confirmation_status(),
         ("POST", "/api/apply-confirmation/configure") => {
             configure_apply_confirmation(req, authentication.as_ref())
@@ -542,6 +543,8 @@ fn dispatch(req: &HttpRequest) -> HttpResponse {
         ("POST", "/api/wireguard/save-and-apply") => apply_wireguard(req, authentication.as_ref()),
         ("POST", "/api/qdiscs/apply") => apply_qdiscs(req, authentication.as_ref()),
         ("POST", "/api/qdiscs/save-and-apply") => apply_qdiscs(req, authentication.as_ref()),
+        ("POST", "/api/ipv6/apply") => apply_ipv6(req, authentication.as_ref()),
+        ("POST", "/api/ipv6/save-and-apply") => apply_ipv6(req, authentication.as_ref()),
         ("POST", "/api/administrators") => create_administrator(req, authentication.as_ref()),
         ("POST", "/api/administrators/password") => {
             change_administrator_password(req, authentication.as_ref())
@@ -1465,6 +1468,7 @@ fn draft_status(authentication: Option<&Authentication>) -> HttpResponse {
                 "firewall": draft.desired.nft_extra,
                 "wireguard": redacted_wireguard(&draft.desired.wireguard),
                 "qdiscs": draft.desired.qdiscs,
+                "ipv6": wan_ipv6_settings(&draft.desired),
             }),
         ),
         None => json_response(
@@ -1525,6 +1529,8 @@ struct DraftChange {
     wireguard: Option<Vec<WgInput>>,
     #[serde(default)]
     qdiscs: Option<Vec<Qdisc>>,
+    #[serde(default)]
+    ipv6: Option<Ipv6Settings>,
 }
 
 fn save_draft(req: &HttpRequest, authentication: Option<&Authentication>) -> HttpResponse {
@@ -1591,6 +1597,7 @@ fn save_draft(req: &HttpRequest, authentication: Option<&Authentication>) -> Htt
         change.firewall,
         change.wireguard,
         change.qdiscs,
+        change.ipv6,
     ) {
         return json_response(400, json!({"ok": false, "error": error}));
     }
@@ -1739,6 +1746,8 @@ struct DraftReconciliation {
     wireguard: Option<Vec<WgInput>>,
     #[serde(default)]
     qdiscs: Option<Vec<Qdisc>>,
+    #[serde(default)]
+    ipv6: Option<Ipv6Settings>,
 }
 
 fn reconcile_draft(req: &HttpRequest, authentication: Option<&Authentication>) -> HttpResponse {
@@ -1807,6 +1816,7 @@ fn reconcile_draft(req: &HttpRequest, authentication: Option<&Authentication>) -
         request.firewall,
         reviewed_wireguard,
         request.qdiscs,
+        request.ipv6,
     ) {
         return json_response(409, json!({"ok": false, "error": error}));
     }
@@ -2105,6 +2115,7 @@ fn apply_draft_sections(
     firewall: Option<Vec<String>>,
     wireguard: Option<Vec<WgInput>>,
     qdiscs: Option<Vec<Qdisc>>,
+    ipv6: Option<Ipv6Settings>,
 ) -> Result<(), String> {
     if routes.is_none()
         && interfaces.is_none()
@@ -2113,6 +2124,7 @@ fn apply_draft_sections(
         && firewall.is_none()
         && wireguard.is_none()
         && qdiscs.is_none()
+        && ipv6.is_none()
     {
         return Err("invalid draft change".into());
     }
@@ -2150,6 +2162,10 @@ fn apply_draft_sections(
         store_qdiscs(desired, qdiscs)?;
         remember_section(sections, "qdiscs");
     }
+    if let Some(ipv6) = ipv6 {
+        store_ipv6(desired, ipv6)?;
+        remember_section(sections, "ipv6");
+    }
     Ok(())
 }
 
@@ -2163,6 +2179,7 @@ fn apply_reviewed_sections(
     firewall: Option<Vec<String>>,
     wireguard: Option<Vec<WgInput>>,
     qdiscs: Option<Vec<Qdisc>>,
+    ipv6: Option<Ipv6Settings>,
 ) -> Result<(), String> {
     if sections.iter().any(|section| section == "routes") {
         let Some(routes) = routes else {
@@ -2200,6 +2217,13 @@ fn apply_reviewed_sections(
             return Err("Draft qdiscs changed; review them again".into());
         };
         store_qdiscs(desired, qdiscs)?;
+    }
+    // After interfaces: this section owns WAN IPv6 acquisition.
+    if sections.iter().any(|section| section == "ipv6") {
+        let Some(ipv6) = ipv6 else {
+            return Err("Draft IPv6 settings changed; review them again".into());
+        };
+        store_ipv6(desired, ipv6)?;
     }
     Ok(())
 }
@@ -2663,11 +2687,158 @@ fn apply_qdiscs(req: &HttpRequest, authentication: Option<&Authentication>) -> H
     submit_desired_apply(desired, change.base_revision, &authentication.principal)
 }
 
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct WanIpv6 {
+    name: String,
+    /// "static", "slaac", or "dhcpv6".
+    ipv6: String,
+    #[serde(default)]
+    request_pd: bool,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Ipv6Settings {
+    wans: Vec<WanIpv6>,
+}
+
+fn wan_ipv6_settings(desired: &DesiredState) -> Vec<WanIpv6> {
+    desired
+        .interfaces
+        .iter()
+        .filter(|iface| iface.role.as_deref() == Some("wan"))
+        .map(|iface| WanIpv6 {
+            name: iface.name.clone(),
+            ipv6: iface.ipv6.clone().unwrap_or_else(|| "static".into()),
+            request_pd: iface.request_pd,
+        })
+        .collect()
+}
+
+fn store_ipv6(desired: &mut DesiredState, settings: Ipv6Settings) -> Result<(), String> {
+    for wan in settings.wans {
+        let Some(iface) = desired
+            .interfaces
+            .iter_mut()
+            .find(|iface| iface.name == wan.name && iface.role.as_deref() == Some("wan"))
+        else {
+            return Err(format!("{} is not a WAN", wan.name));
+        };
+        iface.ipv6 = match wan.ipv6.as_str() {
+            "static" | "" => None,
+            mode => Some(mode.to_string()),
+        };
+        iface.request_pd = wan.request_pd;
+    }
+    Ok(())
+}
+
+fn ipv6() -> HttpResponse {
+    if !Path::new(BOOTSTRAP).exists() {
+        return json_response(
+            409,
+            json!({"ok": false, "error": "complete Bootstrap first"}),
+        );
+    }
+    match complete_desired() {
+        Ok(desired) => {
+            let live = netd_cmd(&json!({"op": "ipv6_status"}))
+                .unwrap_or_else(|error| json!({"ok": false, "error": error}));
+            json_response(
+                200,
+                json!({
+                    "ok": true,
+                    "status": "accepted",
+                    "revision": desired.revision,
+                    "wans": wan_ipv6_settings(&desired),
+                    "wan_pd": desired.wan_pd,
+                    "live": live,
+                }),
+            )
+        }
+        Err(error) => json_response(502, json!({"ok": false, "error": error})),
+    }
+}
+
+fn apply_ipv6(req: &HttpRequest, authentication: Option<&Authentication>) -> HttpResponse {
+    let authentication = match operator_session(authentication) {
+        Ok(authentication) => authentication,
+        Err(response) => return response,
+    };
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Ipv6Change {
+        base_revision: u64,
+        ipv6: Ipv6Settings,
+    }
+    let change: Ipv6Change = match serde_json::from_slice(&req.body) {
+        Ok(change) => change,
+        Err(error) => {
+            return json_response(
+                400,
+                json!({"ok": false, "outcome": "rejected", "error": format!("invalid IPv6 change: {error}")}),
+            )
+        }
+    };
+    let path = draft_path(&authentication.principal);
+    let lock = draft_lock(&path);
+    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let snapshot = accepted_snapshot_for_drafting().ok();
+    match read_draft_reconciled(&path, &authentication.principal, snapshot.as_ref()) {
+        Ok(Some(_)) => {
+            return json_response(
+                409,
+                json!({
+                    "ok": false, "outcome": "rejected",
+                    "error": "Private pending draft exists; review and apply or reconcile it first"
+                }),
+            )
+        }
+        Ok(None) => (),
+        Err(error) => return json_response(502, json!({"ok": false, "error": error})),
+    }
+    let mut desired = match complete_desired() {
+        Ok(desired) => desired,
+        Err(error) => return json_response(502, json!({"ok": false, "error": error})),
+    };
+    if desired.revision != change.base_revision {
+        return json_response(
+            409,
+            json!({"ok": false, "outcome": "rejected", "revision": desired.revision,
+            "error": "Accepted Desired state changed; reload before applying"}),
+        );
+    }
+    if let Err(error) = store_ipv6(&mut desired, change.ipv6) {
+        return json_response(
+            400,
+            json!({"ok": false, "outcome": "rejected", "error": error}),
+        );
+    }
+    submit_desired_apply(desired, change.base_revision, &authentication.principal)
+}
+
 fn store_interface_section(
     desired: &mut DesiredState,
     interfaces: Vec<Iface>,
     ui_exposure: Vec<String>,
 ) {
+    let mut interfaces = interfaces;
+    // The IPv6 page owns WAN acquisition; an interface edit keeps it while
+    // the interface stays a WAN and clears it otherwise.
+    for iface in &mut interfaces {
+        let previous = desired
+            .interfaces
+            .iter()
+            .find(|previous| previous.name == iface.name);
+        if iface.role.as_deref() == Some("wan") {
+            iface.ipv6 = previous.and_then(|previous| previous.ipv6.clone());
+            iface.request_pd = previous.is_some_and(|previous| previous.request_pd);
+        } else {
+            iface.ipv6 = None;
+            iface.request_pd = false;
+        }
+    }
     desired.interfaces = interfaces;
     desired.ui_exposure = ui_exposure;
     sync_lan_prefix_from_first_lan(desired);
@@ -3002,6 +3173,8 @@ mod tests {
                     vlan: None,
                     parent: None,
                     dhcp: false,
+                    ipv6: None,
+                    request_pd: false,
                 },
                 Iface {
                     name: "enp2s0".into(),
@@ -3011,6 +3184,8 @@ mod tests {
                     vlan: None,
                     parent: None,
                     dhcp: false,
+                    ipv6: None,
+                    request_pd: false,
                 },
             ],
             routes: vec![StaticRoute {
@@ -3040,6 +3215,8 @@ mod tests {
                 vlan: None,
                 parent: None,
                 dhcp: false,
+                ipv6: None,
+                request_pd: false,
             },
             Iface {
                 name: "enp2s0".into(),
@@ -3049,6 +3226,8 @@ mod tests {
                 vlan: None,
                 parent: None,
                 dhcp: false,
+                ipv6: None,
+                request_pd: false,
             },
         ];
         apply_draft_sections(
@@ -3057,6 +3236,7 @@ mod tests {
             None,
             Some(interfaces),
             Some(vec!["enp1s0".into()]),
+            None,
             None,
             None,
             None,
@@ -3084,6 +3264,7 @@ mod tests {
                 via: "198.51.100.2".into(),
                 dev: Some("enp2s0".into()),
             }]),
+            None,
             None,
             None,
             None,
@@ -3139,6 +3320,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(accepted.interfaces[0].addresses, vec!["10.1.0.1/24".to_string()]);
@@ -3154,9 +3336,103 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap_err();
         assert!(error.contains("interfaces"), "{error}");
+    }
+
+    fn wan_ipv6(name: &str, ipv6: &str, request_pd: bool) -> WanIpv6 {
+        WanIpv6 {
+            name: name.into(),
+            ipv6: ipv6.into(),
+            request_pd,
+        }
+    }
+
+    #[test]
+    fn ipv6_settings_change_only_wan_acquisition() {
+        let mut desired = sample_state();
+        store_ipv6(
+            &mut desired,
+            Ipv6Settings {
+                wans: vec![wan_ipv6("enp2s0", "dhcpv6", true)],
+            },
+        )
+        .unwrap();
+        assert_eq!(desired.interfaces[1].ipv6.as_deref(), Some("dhcpv6"));
+        assert!(desired.interfaces[1].request_pd);
+        assert_eq!(desired.interfaces[1].addresses, vec!["192.0.2.1/24".to_string()]);
+        assert_eq!(desired.routes[0].to, "198.51.100.0/24");
+        assert_eq!(desired.dhcp_pool.as_deref(), Some("192.168.1.100-192.168.1.200"));
+        store_ipv6(
+            &mut desired,
+            Ipv6Settings {
+                wans: vec![wan_ipv6("enp2s0", "static", false)],
+            },
+        )
+        .unwrap();
+        assert_eq!(desired.interfaces[1].ipv6, None);
+        assert!(!desired.interfaces[1].request_pd);
+        let error = store_ipv6(
+            &mut desired,
+            Ipv6Settings {
+                wans: vec![wan_ipv6("enp1s0", "slaac", false)],
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("not a WAN"), "{error}");
+    }
+
+    #[test]
+    fn interface_edits_keep_wan_ipv6_settings_until_the_role_changes() {
+        let mut desired = sample_state();
+        desired.interfaces[1].ipv6 = Some("slaac".into());
+        desired.interfaces[1].request_pd = true;
+        let mut edited = desired.interfaces.clone();
+        edited[1].ipv6 = None;
+        edited[1].request_pd = false;
+        edited[1].addresses = vec!["198.51.100.1/24".into()];
+        store_interface_section(&mut desired, edited.clone(), vec!["enp1s0".into()]);
+        assert_eq!(desired.interfaces[1].ipv6.as_deref(), Some("slaac"));
+        assert!(desired.interfaces[1].request_pd);
+        assert_eq!(desired.interfaces[1].addresses, vec!["198.51.100.1/24".to_string()]);
+        edited[1].role = Some("unused".into());
+        store_interface_section(&mut desired, edited, vec!["enp1s0".into()]);
+        assert_eq!(desired.interfaces[1].ipv6, None);
+        assert!(!desired.interfaces[1].request_pd);
+    }
+
+    #[test]
+    fn ipv6_draft_section_joins_other_sections() {
+        let mut desired = sample_state();
+        let mut sections = vec!["services".into()];
+        apply_draft_sections(
+            &mut desired,
+            &mut sections,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Ipv6Settings {
+                wans: vec![wan_ipv6("enp2s0", "slaac", true)],
+            }),
+        )
+        .unwrap();
+        assert_eq!(sections, vec!["services".to_string(), "ipv6".to_string()]);
+        let mut accepted = sample_state();
+        let error = apply_reviewed_sections(
+            &mut accepted, &sections, None, None, None, Some(LanServices {
+                lan_prefix: "192.168.1.0/24".into(),
+                dhcp_pool: "192.168.1.100-192.168.1.200".into(),
+                wan_pd: String::new(),
+            }), None, None, None, None,
+        )
+        .unwrap_err();
+        assert!(error.contains("IPv6"), "{error}");
     }
 
     #[test]
@@ -3174,6 +3450,7 @@ mod tests {
                 dhcp_pool: "192.168.1.20-192.168.1.40".into(),
                 wan_pd: String::new(),
             }),
+            None,
             None,
             None,
             None,

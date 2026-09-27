@@ -1,4 +1,5 @@
 mod network;
+mod ra;
 
 use network::{
     add_addr, ip_cmd, link_exists, lock_unopted, run_ip, traffic_nic_names, write_sysctl,
@@ -38,6 +39,7 @@ const BOOTSTRAPPED: &str = "/var/lib/fwos/bootstrapped";
 const BOOTSTRAP_ATTEMPT: &str = "/var/lib/fwos/bootstrap-attempt.json";
 const IDENTITY: &str = "/var/lib/fwos/identity.json";
 const HOSTNAME: &str = "/var/lib/fwos/hostname";
+const DHCP6_DIR: &str = "/var/lib/fwos/dhcp6";
 static RECOVERY_REQUIRED: AtomicBool = AtomicBool::new(false);
 
 fn recovery_pending() -> bool {
@@ -357,13 +359,16 @@ fn run() -> Result<(), String> {
     let gid = wheel_gid().unwrap_or(10);
     chown(path, Some(0), Some(gid)).map_err(|e| format!("chown {SOCK}: {e}"))?;
     let mut observed_exposure = None;
+    let mut ipv6 = Ipv6Runtime::default();
     let mut refresh_at = Instant::now();
     loop {
         expire_pending_confirmation();
         if Instant::now() >= refresh_at {
             refresh_bootstrap_exposure(&mut observed_exposure)?;
+            ipv6.refresh();
             refresh_at = Instant::now() + Duration::from_secs(1);
         }
+        ipv6.advertiser.poll();
         // Keep command application and address observation on the same thread:
         // an old observation must never republish a replaced selection.
         let mut ready = libc::pollfd {
@@ -454,6 +459,7 @@ fn handle_client(mut stream: UnixStream) -> Result<(), String> {
 fn handle_cmd(v: &Value) -> String {
     match v.get("op").and_then(Value::as_str).unwrap_or("") {
         "list" => list_nics_reply(),
+        "ipv6_status" => ipv6_status().to_string(),
         "opt" => match parse_opt(v).and_then(apply_and_persist_opt) {
             Ok(()) => json!({"ok": true}).to_string(),
             Err(err) => json!({"ok": false, "error": err}).to_string(),
@@ -1479,7 +1485,7 @@ fn desired_addresses(state: &DesiredState) -> Vec<(String, String)> {
         }))
         .collect();
     if let Some(lan) = lan_l2(state) {
-        if let Some(pd) = state.wan_pd.as_deref().and_then(pd_lan_addr) {
+        if let Some(pd) = routed_lan_prefix(state).as_deref().and_then(pd_lan_addr) {
             addresses.push((lan.name.clone(), pd));
         }
     }
@@ -1768,6 +1774,7 @@ fn validate(state: &DesiredState) -> Result<(), String> {
         state.wan_pd.as_deref(),
     )?;
     lan_services_match_interface(state)?;
+    validate_ipv6(state)?;
     validate_policy(state)?;
     let mut wireguard_names = HashSet::new();
     for wg in &state.wireguard {
@@ -1937,6 +1944,39 @@ fn validate(state: &DesiredState) -> Result<(), String> {
         if !state.ui_exposure.iter().any(|n| n == &mgmt.name) {
             return Err("Management NIC must be in ui_exposure".into());
         }
+    }
+    Ok(())
+}
+
+// ADR-0009: WAN IPv6 is learned by RA/SLAAC or DHCPv6 and the LAN prefix is
+// delegated or statically routed. Nothing here selects a translation mode.
+fn validate_ipv6(state: &DesiredState) -> Result<(), String> {
+    let mut requesting = 0;
+    for iface in &state.interfaces {
+        let wan = iface.role.as_deref() == Some("wan");
+        if let Some(mode) = iface.ipv6.as_deref() {
+            if !wan {
+                return Err(format!("IPv6 acquisition on {} is for only a WAN", iface.name));
+            }
+            if !matches!(mode, "slaac" | "dhcpv6") {
+                return Err(format!("unsupported IPv6 mode {mode} on {}", iface.name));
+            }
+        }
+        if iface.request_pd {
+            if !wan {
+                return Err(format!(
+                    "prefix delegation on {} is requested by only a WAN",
+                    iface.name
+                ));
+            }
+            requesting += 1;
+        }
+    }
+    if requesting > 1 {
+        return Err("only one WAN can request prefix delegation".into());
+    }
+    if requesting == 1 && static_lan_prefix(state).is_some() {
+        return Err("choose a static routed IPv6 prefix or prefix delegation, not both".into());
     }
     Ok(())
 }
@@ -2188,6 +2228,7 @@ fn apply(state: &mut DesiredState) -> Result<(), String> {
         }
     }
     program_vlans(state)?;
+    program_wan_ipv6(state)?;
     program_wg(state)?;
     program_routes(state)?;
     program_qdiscs(state)?;
@@ -2246,52 +2287,416 @@ fn program_lan_services(state: &DesiredState, publish: bool) -> Result<(), Strin
         }
         return Ok(());
     };
+    // IPv6 on the LAN follows the delegated or statically routed prefix and
+    // does not depend on an IPv4 LAN prefix (IPv6-only LANs).
+    let delegated = routed_lan_prefix(state);
+    if let Some(v6) = delegated.as_deref().and_then(pd_lan_addr) {
+        add_addr(&lan.name, &v6)?;
+    }
     let prefix = state
         .lan_prefix
         .clone()
         .or_else(|| state.dhcp_pool.as_deref().and_then(prefix_from_pool));
-    let Some(prefix) = prefix else {
-        if publish {
-            remove_lan_service_configs()?;
+    let lan_v4 = match prefix.as_deref() {
+        Some(prefix) => {
+            let lan_v4 =
+                first_v4_host(prefix).ok_or_else(|| "lan_prefix has no v4 host".to_string())?;
+            let plen = prefix.split('/').nth(1).unwrap_or("24");
+            add_addr(&lan.name, &format!("{lan_v4}/{plen}"))?;
+            Some(lan_v4)
         }
-        return Ok(());
+        None => None,
     };
-    let lan_v4 = first_v4_host(&prefix).ok_or_else(|| "lan_prefix has no v4 host".to_string())?;
-    let plen = prefix.split('/').nth(1).unwrap_or("24");
-    add_addr(&lan.name, &format!("{lan_v4}/{plen}"))?;
-    if let Some(pd) = state.wan_pd.as_deref() {
-        if let Some(v6) = pd_lan_addr(pd) {
-            add_addr(&lan.name, &v6)?;
-        }
-    }
     if !publish {
         return Ok(());
     }
-    let Some(pool) = state.dhcp_pool.as_deref() else {
-        remove_lan_service_configs()?;
-        return Ok(());
-    };
     fs::create_dir_all("/var/lib/fwos/kea").map_err(|e| format!("mkdir kea: {e}"))?;
     fs::create_dir_all("/var/lib/fwos/unbound").map_err(|e| format!("mkdir unbound: {e}"))?;
-    let (p1, p2) = split_pool(pool);
-    let kea4 = kea_dhcp4_conf(&lan.name, &prefix, &p1, &p2, &lan_v4);
-    fs::write("/var/lib/fwos/kea/kea-dhcp4.conf", kea4)
-        .map_err(|e| format!("write kea-dhcp4: {e}"))?;
-    if let Some(pd) = state.wan_pd.as_deref() {
-        if let (Some(v6_sub), Some((v6p1, v6p2))) = (pd_subnet64(pd), pd_pool(pd)) {
-            let kea6 = kea_dhcp6_conf(&lan.name, &v6_sub, &v6p1, &v6p2);
-            fs::write("/var/lib/fwos/kea/kea-dhcp6.conf", kea6)
-                .map_err(|e| format!("write kea-dhcp6: {e}"))?;
-        } else {
-            durable::remove(Path::new("/var/lib/fwos/kea/kea-dhcp6.conf"))?;
+    match (prefix.as_deref(), lan_v4.as_deref(), state.dhcp_pool.as_deref()) {
+        (Some(prefix), Some(lan_v4), Some(pool)) => {
+            let (p1, p2) = split_pool(pool);
+            let kea4 = kea_dhcp4_conf(&lan.name, prefix, &p1, &p2, lan_v4);
+            fs::write("/var/lib/fwos/kea/kea-dhcp4.conf", kea4)
+                .map_err(|e| format!("write kea-dhcp4: {e}"))?;
+            let unbound = unbound_conf(lan_v4, prefix);
+            fs::write("/var/lib/fwos/unbound/unbound.conf", unbound)
+                .map_err(|e| format!("write unbound: {e}"))?;
         }
-    } else {
-        durable::remove(Path::new("/var/lib/fwos/kea/kea-dhcp6.conf"))?;
+        _ => {
+            durable::remove(Path::new("/var/lib/fwos/kea/kea-dhcp4.conf"))?;
+            durable::remove(Path::new("/var/lib/fwos/unbound/unbound.conf"))?;
+        }
     }
-    let unbound = unbound_conf(&lan_v4, &prefix);
-    fs::write("/var/lib/fwos/unbound/unbound.conf", unbound)
-        .map_err(|e| format!("write unbound: {e}"))?;
+    write_kea_dhcp6(&lan.name, delegated.as_deref())
+}
+
+fn write_kea_dhcp6(lan: &str, delegated: Option<&str>) -> Result<(), String> {
+    if let Some(pd) = delegated {
+        if let (Some(v6_sub), Some((v6p1, v6p2))) = (pd_subnet64(pd), pd_pool(pd)) {
+            let kea6 = kea_dhcp6_conf(lan, &v6_sub, &v6p1, &v6p2);
+            return fs::write("/var/lib/fwos/kea/kea-dhcp6.conf", kea6)
+                .map_err(|e| format!("write kea-dhcp6: {e}"));
+        }
+    }
+    durable::remove(Path::new("/var/lib/fwos/kea/kea-dhcp6.conf"))
+}
+
+/// The LAN's routed IPv6 prefix: an operator-configured static prefix, or
+/// the prefix currently delegated to the WAN that requests one.
+fn routed_lan_prefix(state: &DesiredState) -> Option<String> {
+    if let Some(pd) = static_lan_prefix(state) {
+        return Some(pd.to_string());
+    }
+    acquired_prefix(state)
+}
+
+fn static_lan_prefix(state: &DesiredState) -> Option<&str> {
+    state.wan_pd.as_deref().filter(|pd| !pd.is_empty())
+}
+
+fn acquired_prefix(state: &DesiredState) -> Option<String> {
+    let wan = state
+        .interfaces
+        .iter()
+        .find(|iface| iface.request_pd && iface.role.as_deref() == Some("wan"))?;
+    let raw = fs::read_to_string(dhcp6_file(&wan.name, "pd")).ok()?;
+    let prefix = raw.trim();
+    bootstrap_values::delegated_lan(prefix).map(|_| prefix.to_string())
+}
+
+fn dhcp6_file(dev: &str, kind: &str) -> String {
+    format!("{DHCP6_DIR}/{dev}.{kind}")
+}
+
+/// Follows a DHCPv6 delegated prefix onto the LAN between applies and keeps
+/// Router Advertisements matched to the Accepted LAN prefixes.
+#[derive(Default)]
+struct Ipv6Runtime {
+    advertiser: ra::Advertiser,
+    observed: Option<(Option<String>, Option<(String, String)>)>,
+}
+
+impl Ipv6Runtime {
+    fn refresh(&mut self) {
+        if !Path::new(BOOTSTRAPPED).exists() || recovery_pending() {
+            return;
+        }
+        // While a revision awaits confirmation it is the live network, and
+        // the operator must see its IPv6 working before confirming it.
+        let state = match pending_operation() {
+            Ok(Some(operation)) => match operation.proposed {
+                Some(proposed) => proposed,
+                None => return,
+            },
+            Ok(None) => match accepted_desired() {
+                Ok(state) => state,
+                Err(_) => return,
+            },
+            Err(_) => return,
+        };
+        let delegated = routed_lan_prefix(&state);
+        let address = lan_l2(&state)
+            .map(|lan| lan.name.clone())
+            .zip(delegated.as_deref().and_then(pd_lan_addr));
+        if let Some((previous, previous_address)) = &self.observed {
+            if *previous != delegated {
+                if let Some((dev, cidr)) = previous_address.as_ref().filter(|old| Some(*old) != address.as_ref()) {
+                    if let Err(error) = run_ip(&["addr", "del", cidr, "dev", dev]) {
+                        eprintln!("netd: remove previous delegated LAN address: {error}");
+                    }
+                }
+                let result = program_lan_services(&state, true)
+                    .and_then(|()| set_lan_services_ready(true).map(|_| ()));
+                if let Err(error) = result {
+                    eprintln!("netd: follow delegated IPv6 prefix: {error}");
+                    return;
+                }
+            }
+        }
+        self.observed = Some((delegated.clone(), address));
+        let info = lan_ipv6(&state, delegated.as_deref());
+        let mut lans: Vec<ra::Lan> = Vec::new();
+        for (dev, prefix) in info.prefixes {
+            match lans.iter_mut().find(|lan| lan.dev == dev) {
+                Some(lan) => lan.prefixes.push(prefix),
+                None => lans.push(ra::Lan {
+                    managed: delegated.is_some()
+                        && lan_l2(&state).is_some_and(|lan| lan.name == dev),
+                    dev,
+                    prefixes: vec![prefix],
+                }),
+            }
+        }
+        self.advertiser.configure(lans);
+    }
+}
+
+struct LanIpv6 {
+    source: &'static str,
+    prefixes: Vec<(String, std::net::Ipv6Addr)>,
+    note: String,
+}
+
+/// The routed /64s on LAN links. Without a delegated or routed prefix the
+/// LAN gets no global IPv6; FWOS does not translate to the WAN address.
+fn lan_ipv6(state: &DesiredState, delegated: Option<&str>) -> LanIpv6 {
+    let mut prefixes = Vec::new();
+    let mut source = "none";
+    if let (Some(lan), Some(pd)) = (lan_l2(state), delegated.and_then(bootstrap_values::delegated_lan)) {
+        if let Some((network, _)) = pd.subnet_cidr.split_once('/') {
+            if let Ok(network) = network.parse() {
+                prefixes.push((lan.name.clone(), network));
+                source = if static_lan_prefix(state).is_some() {
+                    "static"
+                } else {
+                    "delegated"
+                };
+            }
+        }
+    }
+    for iface in state
+        .interfaces
+        .iter()
+        .filter(|iface| iface.role.as_deref() == Some("lan"))
+    {
+        for cidr in &iface.addresses {
+            let Some((address, bits)) = cidr.split_once('/') else {
+                continue;
+            };
+            let Ok(address) = address.parse::<std::net::Ipv6Addr>() else {
+                continue;
+            };
+            if bits != "64" || address.is_unicast_link_local() || address.is_multicast() {
+                continue;
+            }
+            let network = std::net::Ipv6Addr::from(u128::from(address) & (u128::MAX << 64));
+            if !prefixes.iter().any(|(dev, known)| dev == &iface.name && *known == network) {
+                prefixes.push((iface.name.clone(), network));
+                if source == "none" {
+                    source = "interface";
+                }
+            }
+        }
+    }
+    let note = if prefixes.is_empty() {
+        "No delegated or routed IPv6 prefix: the LAN has no global IPv6 and IPv6 is not forwarded. There is no NAT66, NPTv6, or NAT64.".to_string()
+    } else {
+        "IPv6 from the LAN is routed to the WAN without translation.".to_string()
+    };
+    LanIpv6 { source, prefixes, note }
+}
+
+fn ipv6_status() -> Value {
+    let state = match accepted_desired() {
+        Ok(state) => state,
+        Err(error) => return json!({"ok": false, "error": error}),
+    };
+    let delegated = routed_lan_prefix(&state);
+    let wans: Vec<Value> = state
+        .interfaces
+        .iter()
+        .filter(|iface| iface.role.as_deref() == Some("wan"))
+        .map(|iface| {
+            let addresses: Vec<String> = iface_cidrs(&iface.name)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|cidr| {
+                    cidr.split('/').next().and_then(|ip| ip.parse::<std::net::Ipv6Addr>().ok())
+                        .is_some_and(|ip| !ip.is_unicast_link_local())
+                })
+                .collect();
+            let default_route = ip_cmd()
+                .args(["-6", "route", "show", "default", "dev", &iface.name])
+                .output()
+                .is_ok_and(|output| !output.stdout.is_empty());
+            let acquired = iface
+                .request_pd
+                .then(|| fs::read_to_string(dhcp6_file(&iface.name, "pd")).ok())
+                .flatten()
+                .map(|prefix| prefix.trim().to_string());
+            json!({
+                "name": iface.name, "mode": iface.ipv6.as_deref().unwrap_or("static"),
+                "request_pd": iface.request_pd, "addresses": addresses,
+                "default_route": default_route, "delegated_prefix": acquired,
+            })
+        })
+        .collect();
+    let lan = lan_ipv6(&state, delegated.as_deref());
+    json!({
+        "ok": true, "revision": state.revision, "wans": wans,
+        "lan": lan_l2(&state).map(|lan| lan.name.clone()),
+        "lan_source": lan.source,
+        "lan_prefixes": lan.prefixes.iter().map(|(dev, prefix)| json!({"dev": dev, "prefix": format!("{prefix}/64")})).collect::<Vec<_>>(),
+        "translation": "none", "note": lan.note,
+    })
+}
+
+/// WAN IPv6: RA (accept_ra=2 because fwd forwards), optional SLAAC, and a
+/// DHCPv6 client for an address and/or a delegated prefix. Static IPv6 is
+/// just interface addresses and routes.
+fn program_wan_ipv6(state: &DesiredState) -> Result<(), String> {
+    fs::create_dir_all(DHCP6_DIR).map_err(|e| format!("mkdir {DHCP6_DIR}: {e}"))?;
+    let mut wanted = Vec::new();
+    for iface in &state.interfaces {
+        if iface.role.as_deref() != Some("wan") {
+            continue;
+        }
+        let mode = iface.ipv6.as_deref();
+        write_sysctl(&iface.name, "ipv6", "accept_ra", if mode.is_some() { "2" } else { "0" })?;
+        write_sysctl(
+            &iface.name,
+            "ipv6",
+            "autoconf",
+            if mode == Some("slaac") { "1" } else { "0" },
+        )?;
+        // Turning RA or SLAAC off also withdraws what they configured.
+        if mode.is_none() {
+            run_ip(&["-6", "route", "flush", "dev", &iface.name, "proto", "ra"])?;
+        }
+        if mode != Some("slaac") {
+            run_ip(&["-6", "addr", "flush", "dev", &iface.name, "scope", "global", "dynamic"])?;
+        }
+        let args = dhclient6_args(iface);
+        if !args.is_empty() {
+            wanted.push(iface.name.clone());
+            start_dhclient6(&iface.name, &args)?;
+        }
+    }
+    let entries = fs::read_dir(DHCP6_DIR).map_err(|e| format!("read {DHCP6_DIR}: {e}"))?;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if let Some(dev) = name.strip_suffix(".pid") {
+            if !wanted.iter().any(|wan| wan == dev) {
+                stop_dhclient6(dev);
+            }
+        }
+    }
     Ok(())
+}
+
+fn dhclient6_args(iface: &Iface) -> Vec<&'static str> {
+    let mut args = Vec::new();
+    if iface.ipv6.as_deref() == Some("dhcpv6") {
+        args.push("-N");
+    }
+    if iface.request_pd {
+        args.push("-P");
+    }
+    args
+}
+
+fn start_dhclient6(dev: &str, modes: &[&str]) -> Result<(), String> {
+    let record = modes.join(" ");
+    if dhclient6_running(dev)
+        && fs::read_to_string(dhcp6_file(dev, "args")).ok().as_deref() == Some(record.as_str())
+    {
+        return Ok(());
+    }
+    stop_dhclient6(dev);
+    write_dhclient6_script()?;
+    wait_link_local(dev);
+    let lease = dhcp6_file(dev, "leases");
+    let pid = dhcp6_file(dev, "pid");
+    let script = format!("{DHCP6_DIR}/dhclient6-script");
+    let mut args = vec!["-6", "-nw"];
+    args.extend_from_slice(modes);
+    args.extend_from_slice(&["-sf", &script, "-lf", &lease, "-pf", &pid, dev]);
+    let output = Command::new("dhclient")
+        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+        .args(&args)
+        .output()
+        .map_err(|e| format!("dhclient -6: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "DHCPv6 on {dev} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    fs::write(dhcp6_file(dev, "args"), record).map_err(|e| format!("record DHCPv6 on {dev}: {e}"))
+}
+
+fn dhclient6_running(dev: &str) -> bool {
+    let Ok(pid) = fs::read_to_string(dhcp6_file(dev, "pid")) else {
+        return false;
+    };
+    fs::read(format!("/proc/{}/cmdline", pid.trim()))
+        .map(|cmdline| String::from_utf8_lossy(&cmdline).contains("dhclient"))
+        .unwrap_or(false)
+}
+
+fn stop_dhclient6(dev: &str) {
+    if dhclient6_running(dev) {
+        if let Ok(pid) = fs::read_to_string(dhcp6_file(dev, "pid")) {
+            let _ = Command::new("kill")
+                .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+                .args(["-TERM", pid.trim()])
+                .status();
+        }
+    }
+    // SIGTERM does not run the script; withdraw the leased address here.
+    if let Ok(cidr) = fs::read_to_string(dhcp6_file(dev, "addr")) {
+        let _ = run_ip(&["-6", "addr", "del", cidr.trim(), "dev", dev]);
+    }
+    for kind in ["pid", "args", "pd", "addr"] {
+        let _ = fs::remove_file(dhcp6_file(dev, kind));
+    }
+}
+
+// dhclient cannot bind the DHCPv6 client port until link-local DAD finishes.
+fn wait_link_local(dev: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let ready = ip_cmd()
+            .args(["-6", "-o", "addr", "show", "dev", dev, "scope", "link", "-tentative"])
+            .output()
+            .is_ok_and(|output| !output.stdout.is_empty());
+        if ready {
+            return;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
+fn write_dhclient6_script() -> Result<(), String> {
+    let path = format!("{DHCP6_DIR}/dhclient6-script");
+    fs::write(&path, dhclient6_script()).map_err(|e| format!("write dhclient6-script: {e}"))?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+        .map_err(|e| format!("chmod dhclient6-script: {e}"))
+}
+
+fn dhclient6_script() -> String {
+    format!(
+        r#"#!/bin/sh
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+pd="{DHCP6_DIR}/${{interface}}.pd"
+addr="{DHCP6_DIR}/${{interface}}.addr"
+case "${{reason}}" in
+BOUND6|RENEW6|REBIND6|REBOOT6)
+  if [ -n "${{new_ip6_address}}" ] && [ -n "${{new_ip6_prefixlen}}" ]; then
+    if [ -n "${{old_ip6_address}}" ] && [ "${{old_ip6_address}}" != "${{new_ip6_address}}" ]; then
+      ip -6 addr del "${{old_ip6_address}}/${{old_ip6_prefixlen}}" dev "${{interface}}"
+    fi
+    ip -6 addr replace "${{new_ip6_address}}/${{new_ip6_prefixlen}}" dev "${{interface}}"
+    printf '%s\n' "${{new_ip6_address}}/${{new_ip6_prefixlen}}" > "${{addr}}.tmp" && mv -f "${{addr}}.tmp" "${{addr}}"
+  fi
+  if [ -n "${{new_ip6_prefix}}" ]; then
+    printf '%s
+' "${{new_ip6_prefix}}" > "${{pd}}.tmp" && mv -f "${{pd}}.tmp" "${{pd}}"
+  fi
+  ;;
+EXPIRE6|RELEASE6|STOP6)
+  if [ -n "${{old_ip6_address}}" ]; then
+    ip -6 addr del "${{old_ip6_address}}/${{old_ip6_prefixlen}}" dev "${{interface}}"
+    rm -f "${{addr}}"
+  fi
+  if [ -n "${{old_ip6_prefix}}" ]; then
+    rm -f "${{pd}}"
+  fi
+  ;;
+esac
+exit 0
+"#
+    )
 }
 
 fn remove_lan_service_configs() -> Result<(), String> {
@@ -2498,6 +2903,14 @@ fn nft_rules_with_recovery_guard(state: &DesiredState, recovery_required: bool) 
         rules.push_str(&format!(
             "    iifname \"{wan}\" ct state established,related accept\n"
         ));
+        // Neighbor discovery, RA, and DHCPv6 replies to a multicast Solicit
+        // are not conntrack replies; IPv6 on the WAN needs them.
+        rules.push_str(&format!(
+            "    iifname \"{wan}\" icmpv6 type {{ nd-neighbor-solicit, nd-neighbor-advert, nd-router-advert, packet-too-big, destination-unreachable, time-exceeded, parameter-problem }} accept\n"
+        ));
+        rules.push_str(&format!(
+            "    iifname \"{wan}\" ip6 saddr fe80::/10 udp sport 547 udp dport 546 accept\n"
+        ));
         rules.push_str(&format!("    iifname \"{wan}\" drop\n"));
     }
     rules.push_str("  }\n");
@@ -2557,8 +2970,11 @@ fn nft_rules_with_recovery_guard(state: &DesiredState, recovery_required: bool) 
     if v4_wan {
         rules.push_str("  chain postrouting {\n");
         rules.push_str("    type nat hook postrouting priority srcnat; policy accept;\n");
+        // NAT44 only: IPv6 LAN-to-WAN stays routed (ADR-0009).
         for wan in &wans {
-            rules.push_str(&format!("    oifname \"{wan}\" masquerade\n"));
+            rules.push_str(&format!(
+                "    oifname \"{wan}\" meta nfproto ipv4 masquerade\n"
+            ));
         }
         rules.push_str("  }\n");
     }
@@ -3298,6 +3714,8 @@ mod tests {
             vlan: None,
             parent: None,
             dhcp: false,
+            ipv6: None,
+            request_pd: false,
         }
     }
 
@@ -3310,6 +3728,8 @@ mod tests {
             vlan: Some(vid),
             parent: Some(parent.into()),
             dhcp: false,
+            ipv6: None,
+            request_pd: false,
         }
     }
 
@@ -3324,6 +3744,129 @@ mod tests {
             dhcp_pool: Some("192.168.1.100-192.168.1.200".into()),
             ..DesiredState::default()
         }
+    }
+
+    fn dual_stack_pd() -> DesiredState {
+        let mut state = wan_lan();
+        state.interfaces[1].ipv6 = Some("dhcpv6".into());
+        state.interfaces[1].request_pd = true;
+        state
+    }
+
+    #[test]
+    fn wan_ipv6_modes_are_slaac_or_dhcpv6_on_a_wan() {
+        let mut state = dual_stack_pd();
+        assert!(validate(&state).is_ok(), "{:?}", validate(&state).err());
+        state.interfaces[1].ipv6 = Some("slaac".into());
+        assert!(validate(&state).is_ok(), "{:?}", validate(&state).err());
+        state.interfaces[1].ipv6 = Some("nat66".into());
+        assert!(validate(&state).unwrap_err().contains("IPv6 mode"));
+        state.interfaces[1].ipv6 = None;
+        state.interfaces[0].ipv6 = Some("slaac".into());
+        assert!(validate(&state).unwrap_err().contains("only a WAN"));
+    }
+
+    #[test]
+    fn prefix_delegation_is_requested_by_one_wan_and_not_with_a_static_prefix() {
+        let mut state = dual_stack_pd();
+        state.interfaces[0].request_pd = true;
+        assert!(validate(&state).unwrap_err().contains("only a WAN"));
+        state.interfaces[0].request_pd = false;
+        state.wan_pd = Some("2001:db8:1::/48".into());
+        assert!(validate(&state).unwrap_err().contains("static"));
+        state.wan_pd = None;
+        let mut second = iface("enp3s0", "wan", &["198.51.100.1/24"]);
+        second.request_pd = true;
+        state.interfaces.push(second);
+        assert!(validate(&state).unwrap_err().contains("only one WAN"));
+    }
+
+    #[test]
+    fn ipv6_only_wan_and_lan_validate_without_ipv4() {
+        let mut state = wan_lan();
+        state.interfaces[0].addresses = vec!["10.0.2.15/24".into()];
+        state.interfaces[1].addresses = Vec::new();
+        state.interfaces[1].ipv6 = Some("slaac".into());
+        state.lan_prefix = None;
+        state.dhcp_pool = None;
+        state.wan_pd = Some("2001:db8:20::/56".into());
+        assert!(validate(&state).is_ok(), "{:?}", validate(&state).err());
+    }
+
+    #[test]
+    fn nat44_masquerade_never_translates_ipv6() {
+        let mut state = dual_stack_pd();
+        state.interfaces[1].addresses.push("2001:db8:ff::1/64".into());
+        let rules = nft_rules(&state);
+        assert!(
+            rules.contains("oifname \"enp2s0\" meta nfproto ipv4 masquerade"),
+            "{rules}"
+        );
+        assert!(!rules.contains("oifname \"enp2s0\" masquerade"), "{rules}");
+        for forbidden in ["snat ip6", "masquerade to", "dnat ip6 to 2", "nat66", "npt"] {
+            assert!(!rules.contains(forbidden), "{forbidden}: {rules}");
+        }
+        state.interfaces[1].addresses = Vec::new();
+        let v6_only = nft_rules(&state);
+        let fwos = &v6_only[v6_only.find("table inet fwos").expect(&v6_only)..];
+        assert!(!fwos.contains("masquerade"), "{v6_only}");
+    }
+
+    #[test]
+    fn wan_input_keeps_neighbor_discovery_and_dhcpv6_replies_before_drop() {
+        let rules = nft_rules(&dual_stack_pd());
+        let accept_nd = rules
+            .find("iifname \"enp2s0\" icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-advert, packet-too-big, destination-unreachable, time-exceeded, parameter-problem } accept")
+            .expect(&rules);
+        let accept_dhcp = rules
+            .find("iifname \"enp2s0\" ip6 saddr fe80::/10 udp sport 547 udp dport 546 accept")
+            .expect(&rules);
+        let drop = rules.find("iifname \"enp2s0\" drop").expect(&rules);
+        assert!(accept_nd < drop && accept_dhcp < drop, "{rules}");
+        assert!(!rules.contains("daddr fe80"), "{rules}");
+    }
+
+    #[test]
+    fn lan_ipv6_prefixes_come_from_a_delegated_or_routed_prefix_only() {
+        let mut state = dual_stack_pd();
+        let none = lan_ipv6(&state, None);
+        assert!(none.prefixes.is_empty());
+        assert_eq!(none.source, "none");
+        assert!(none.note.contains("no NAT66"), "{}", none.note);
+        let delegated = lan_ipv6(&state, Some("2001:db8:ff00::/56"));
+        assert_eq!(delegated.source, "delegated");
+        assert_eq!(
+            delegated.prefixes,
+            vec![("enp1s0".to_string(), "2001:db8:ff00::".parse().unwrap())]
+        );
+        state.interfaces[1].request_pd = false;
+        state.wan_pd = Some("2001:db8:20::/48".into());
+        assert_eq!(lan_ipv6(&state, state.wan_pd.as_deref()).source, "static");
+        state.wan_pd = None;
+        state.interfaces[0].addresses.push("2001:db8:30::1/64".into());
+        state.interfaces[0].addresses.push("fe80::1/64".into());
+        state.interfaces[0].addresses.push("2001:db8:31::1/56".into());
+        let routed = lan_ipv6(&state, None);
+        assert_eq!(routed.source, "interface");
+        assert_eq!(
+            routed.prefixes,
+            vec![("enp1s0".to_string(), "2001:db8:30::".parse().unwrap())]
+        );
+    }
+
+    #[test]
+    fn dhclient6_requests_only_what_the_wan_mode_needs() {
+        let mut wan = iface("enp2s0", "wan", &[]);
+        assert!(dhclient6_args(&wan).is_empty());
+        wan.ipv6 = Some("slaac".into());
+        assert!(dhclient6_args(&wan).is_empty());
+        wan.request_pd = true;
+        assert_eq!(dhclient6_args(&wan), vec!["-P"]);
+        wan.ipv6 = Some("dhcpv6".into());
+        assert_eq!(dhclient6_args(&wan), vec!["-N", "-P"]);
+        let script = dhclient6_script();
+        assert!(script.contains("new_ip6_prefix"), "{script}");
+        assert!(script.contains("/var/lib/fwos/dhcp6/${interface}.pd"), "{script}");
     }
 
     #[test]

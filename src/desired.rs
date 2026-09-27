@@ -69,6 +69,12 @@ pub struct Iface {
     pub parent: Option<String>,
     #[serde(default)]
     pub dhcp: bool,
+    /// WAN IPv6 acquisition: "slaac" or "dhcpv6". Static IPv6 uses addresses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipv6: Option<String>,
+    /// Request a DHCPv6 delegated prefix on this WAN for the LAN.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub request_pd: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

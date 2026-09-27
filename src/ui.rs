@@ -1900,6 +1900,53 @@ fn parse_network_export(text: &str) -> Result<DesiredState, String> {
     Ok(file.desired)
 }
 
+// scrypt work factors for passphrase-encrypted exports: about a second and
+// 256 MiB to encrypt, and at most 1 GiB to try a file made elsewhere.
+// SCRYPT_LOCK runs one at a time so concurrent requests cannot exhaust memory.
+const EXPORT_SCRYPT_WORK_FACTOR: u8 = 18;
+const IMPORT_SCRYPT_MAX_WORK_FACTOR: u8 = 20;
+const AGE_ARMOR_BEGIN: &str = "-----BEGIN AGE ENCRYPTED FILE-----";
+const AGE_BINARY_HEADER: &str = "age-encryption.org/";
+static SCRYPT_LOCK: Mutex<()> = Mutex::new(());
+
+/// Encrypt a network export with the operator's passphrase as an armored age
+/// file. The passphrase is used for this file only and never retained.
+fn encrypt_network_export(plaintext: &str, passphrase: &str) -> Result<String, String> {
+    if passphrase.is_empty() {
+        return Err("enter a passphrase to encrypt the export".into());
+    }
+    let mut recipient = age::scrypt::Recipient::new(passphrase.to_owned().into());
+    recipient.set_work_factor(EXPORT_SCRYPT_WORK_FACTOR);
+    let _scrypt = SCRYPT_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    age::encrypt_and_armor(&recipient, plaintext.as_bytes())
+        .map_err(|_| "encrypt network export".into())
+}
+
+fn is_encrypted_export(content: &str) -> bool {
+    let head = content.trim_start();
+    head.starts_with(AGE_ARMOR_BEGIN) || head.starts_with(AGE_BINARY_HEADER)
+}
+
+/// Parse an imported file, decrypting it first when it is an age file. Errors
+/// never echo the passphrase.
+fn decode_network_import(content: &str, passphrase: Option<&str>) -> Result<DesiredState, String> {
+    if !is_encrypted_export(content) {
+        return parse_network_export(content);
+    }
+    let passphrase = match passphrase {
+        Some(passphrase) if !passphrase.is_empty() => passphrase,
+        _ => return Err("this export is encrypted; enter its passphrase".into()),
+    };
+    let mut identity = age::scrypt::Identity::new(passphrase.to_owned().into());
+    identity.set_max_work_factor(IMPORT_SCRYPT_MAX_WORK_FACTOR);
+    let _scrypt = SCRYPT_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let plaintext = age::decrypt(&identity, content.trim_start().as_bytes())
+        .map_err(|_| "wrong passphrase or damaged encrypted export")?;
+    let plaintext =
+        String::from_utf8(plaintext).map_err(|_| "decrypted export is not a network export")?;
+    parse_network_export(&plaintext)
+}
+
 /// A private draft proposing the imported network in full on the Accepted base.
 fn imported_draft(mut desired: DesiredState, base_revision: u64, version: String) -> Draft {
     desired.revision = base_revision;
@@ -1917,6 +1964,9 @@ fn imported_draft(mut desired: DesiredState, base_revision: u64, version: String
 #[serde(deny_unknown_fields)]
 struct ExportRequest {
     acknowledge_sensitive: bool,
+    /// Encrypts the export when present; plaintext export stays available.
+    #[serde(default)]
+    passphrase: Option<String>,
 }
 
 fn export_desired(req: &HttpRequest, authentication: Option<&Authentication>) -> HttpResponse {
@@ -1937,17 +1987,25 @@ fn export_desired(req: &HttpRequest, authentication: Option<&Authentication>) ->
         Ok(desired) => desired,
         Err(error) => return json_response(502, json!({"ok": false, "error": error})),
     };
-    match network_export(&desired) {
-        Ok(content) => json_response(
-            200,
-            json!({
-                "ok": true, "revision": desired.revision,
-                "filename": format!("fwos-network-r{}.toml", desired.revision),
-                "content": content,
-            }),
-        ),
-        Err(error) => json_response(502, json!({"ok": false, "error": error})),
-    }
+    let content = match network_export(&desired) {
+        Ok(content) => content,
+        Err(error) => return json_response(502, json!({"ok": false, "error": error})),
+    };
+    let filename = format!("fwos-network-r{}.toml", desired.revision);
+    let (content, filename, encrypted) = match request.passphrase.as_deref() {
+        None => (content, filename, false),
+        Some(passphrase) => match encrypt_network_export(&content, passphrase) {
+            Ok(content) => (content, format!("{filename}.age"), true),
+            Err(error) => return json_response(400, json!({"ok": false, "error": error})),
+        },
+    };
+    json_response(
+        200,
+        json!({
+            "ok": true, "revision": desired.revision, "encrypted": encrypted,
+            "filename": filename, "content": content,
+        }),
+    )
 }
 
 #[derive(Deserialize)]
@@ -1955,6 +2013,9 @@ fn export_desired(req: &HttpRequest, authentication: Option<&Authentication>) ->
 struct ImportRequest {
     base_revision: u64,
     content: String,
+    /// Needed only for an encrypted export; never stored.
+    #[serde(default)]
+    passphrase: Option<String>,
 }
 
 fn import_desired(req: &HttpRequest, authentication: Option<&Authentication>) -> HttpResponse {
@@ -1966,7 +2027,7 @@ fn import_desired(req: &HttpRequest, authentication: Option<&Authentication>) ->
         Ok(request) => request,
         Err(_) => return json_response(400, json!({"ok": false, "error": "invalid network import"})),
     };
-    let imported = match parse_network_export(&request.content) {
+    let imported = match decode_network_import(&request.content, request.passphrase.as_deref()) {
         Ok(imported) => imported,
         Err(error) => {
             return json_response(400, json!({"ok": false, "outcome": "rejected", "error": error}))
@@ -2022,7 +2083,8 @@ fn import_desired(req: &HttpRequest, authentication: Option<&Authentication>) ->
     }
     json_response(
         200,
-        json!({"ok": true, "status": "pending", "base_revision": draft.base_revision, "version": draft.version}),
+        json!({"ok": true, "status": "pending", "base_revision": draft.base_revision, "version": draft.version,
+            "encrypted": is_encrypted_export(&request.content)}),
     )
 }
 
@@ -3816,6 +3878,63 @@ mod tests {
         ] {
             assert!(parse_network_export(&bad).is_err(), "accepted: {bad}");
         }
+    }
+
+    const EXPORT_PASSPHRASE: &str = "correct horse battery staple";
+
+    #[test]
+    fn encrypted_export_is_an_armored_age_file_that_needs_its_passphrase() {
+        let mut state = sample_state();
+        state.wireguard = vec![tunnel("wg0", EXPORT_KEY, 51820)];
+        let plaintext = network_export(&state).unwrap();
+        let encrypted = encrypt_network_export(&plaintext, EXPORT_PASSPHRASE).unwrap();
+        assert!(encrypted.starts_with("-----BEGIN AGE ENCRYPTED FILE-----"), "{encrypted}");
+        assert!(!encrypted.contains(EXPORT_KEY) && !encrypted.contains(EXPORT_PASSPHRASE));
+        let imported = decode_network_import(&encrypted, Some(EXPORT_PASSPHRASE)).unwrap();
+        assert_eq!(
+            serde_json::to_value(&imported).unwrap(),
+            serde_json::to_value(&state).unwrap()
+        );
+        assert!(decode_network_import(&encrypted, None)
+            .unwrap_err()
+            .contains("passphrase"));
+        assert!(decode_network_import(&encrypted, Some("")).is_err());
+    }
+
+    #[test]
+    fn encrypted_import_rejects_wrong_passphrases_and_damaged_files() {
+        let plaintext = network_export(&sample_state()).unwrap();
+        let encrypted = encrypt_network_export(&plaintext, EXPORT_PASSPHRASE).unwrap();
+        let wrong = decode_network_import(&encrypted, Some("wrong horse")).unwrap_err();
+        assert!(!wrong.contains(EXPORT_PASSPHRASE) && !wrong.contains("wrong horse"), "{wrong}");
+        let lines: Vec<&str> = encrypted.lines().collect();
+        let mut damaged_body = lines.clone();
+        let middle = damaged_body.len() / 2;
+        let line = damaged_body[middle];
+        let flipped = format!("{}{}", if line.starts_with('A') { 'B' } else { 'A' }, &line[1..]);
+        damaged_body[middle] = &flipped;
+        for damaged in [
+            damaged_body.join("\n"),
+            lines[..lines.len() - 2].join("\n"),
+            "-----BEGIN AGE ENCRYPTED FILE-----\nnot base64\n-----END AGE ENCRYPTED FILE-----\n".into(),
+            "age-encryption.org/v1\n-> scrypt\n".into(),
+        ] {
+            assert!(
+                decode_network_import(&damaged, Some(EXPORT_PASSPHRASE)).is_err(),
+                "accepted: {damaged}"
+            );
+        }
+        // Decryption does not bypass the network export checks.
+        let foreign = encrypt_network_export("administrators = [\"mallory\"]\n", EXPORT_PASSPHRASE).unwrap();
+        assert!(decode_network_import(&foreign, Some(EXPORT_PASSPHRASE)).is_err());
+    }
+
+    #[test]
+    fn plaintext_import_stays_available_and_ignores_encryption_options() {
+        let plaintext = network_export(&sample_state()).unwrap();
+        assert!(decode_network_import(&plaintext, None).is_ok());
+        assert!(decode_network_import(&plaintext, Some(EXPORT_PASSPHRASE)).is_ok());
+        assert!(encrypt_network_export(&plaintext, "").is_err(), "an empty passphrase is no encryption");
     }
 
     #[test]

@@ -2439,12 +2439,19 @@ fn validate_policy_rule(state: &DesiredState, rule: &str) -> Result<(), String> 
     if !matches!(verdict, "accept" | "drop" | "reject") {
         return Err("firewall policy needs a drop, reject, or accept verdict".into());
     }
+    // A verdict alone would match all input, including LAN DHCP and DNS.
+    if rule.split_whitespace().count() < 2 {
+        return Err("firewall policy needs an interface, source, or protocol match".into());
+    }
     if let Some(name) = policy_iifname(rule) {
         let Some(iface) = state.interfaces.iter().find(|iface| iface.name == name) else {
             return Err(format!("firewall policy uses unknown interface {name}"));
         };
         if verdict == "accept" && iface.role.as_deref() == Some("wan") {
             return Err("firewall policy must not accept WAN input".into());
+        }
+        if verdict == "accept" && !matches!(iface.role.as_deref(), Some("lan" | "mgmt")) {
+            return Err("firewall accept must name a LAN or Management NIC".into());
         }
     } else if verdict == "accept" {
         return Err("firewall accept must name a LAN or Management NIC".into());
@@ -3755,6 +3762,15 @@ mod tests {
         state.nft_extra = vec!["flush ruleset".into()];
         let err = validate(&state).unwrap_err();
         assert!(err.contains("invalid firewall policy"), "{err}");
+        state.nft_extra = vec!["drop".into()];
+        let err = validate(&state).unwrap_err();
+        assert!(err.contains("needs an interface, source, or protocol"), "{err}");
+        state.interfaces.push(iface("enp3s0", "unused", &[]));
+        state.nft_extra = vec!["iifname \"enp3s0\" accept".into()];
+        let err = validate(&state).unwrap_err();
+        assert!(err.contains("LAN or Management NIC"), "{err}");
+        state.nft_extra = vec!["iifname \"enp1s0\" tcp dport 22 accept".into()];
+        assert!(validate(&state).is_ok(), "{:?}", validate(&state).err());
         state.nft_extra = vec![
             "iifname \"enp1s0\" ip saddr 10.0.2.2 icmp type echo-request drop".into(),
         ];

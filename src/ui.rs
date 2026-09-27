@@ -51,6 +51,10 @@ struct Draft {
     /// interface editing existed.
     #[serde(default)]
     sections: Vec<String>,
+    /// WireGuard tunnels this draft edited. Empty in a draft written before
+    /// tunnel tracking existed, which then carries every tunnel.
+    #[serde(default)]
+    wireguard_edits: Vec<String>,
 }
 
 fn draft_locks() -> &'static Mutex<HashMap<PathBuf, Arc<Mutex<()>>>> {
@@ -1546,10 +1550,10 @@ fn save_draft(req: &HttpRequest, authentication: Option<&Authentication>) -> Htt
             Ok(draft) => draft,
             Err(error) => return json_response(502, json!({"ok": false, "error": error})),
         };
-    let (base_revision, mut desired, mut sections) = match existing {
+    let (base_revision, mut desired, mut sections, mut wireguard_edits) = match existing {
         Some(draft) if change.version.as_deref() == Some(draft.version.as_str()) => {
             let sections = effective_sections(&draft);
-            (draft.base_revision, draft.desired, sections)
+            (draft.base_revision, draft.desired, sections, draft.wireguard_edits)
         }
         Some(_) => {
             return json_response(
@@ -1564,7 +1568,7 @@ fn save_draft(req: &HttpRequest, authentication: Option<&Authentication>) -> Htt
             );
         }
         None => match snapshot {
-            Ok(desired) => (desired.revision, desired, Vec::new()),
+            Ok(desired) => (desired.revision, desired, Vec::new(), Vec::new()),
             Err(error) => return json_response(502, json!({"ok": false, "error": error})),
         },
     };
@@ -1573,6 +1577,9 @@ fn save_draft(req: &HttpRequest, authentication: Option<&Authentication>) -> Htt
             409,
             json!({"ok": false, "error": "Draft base changed; reload before saving"}),
         );
+    }
+    for tunnel in change.wireguard.iter().flatten() {
+        remember_section(&mut wireguard_edits, &tunnel.name);
     }
     if let Err(error) = apply_draft_sections(
         &mut desired,
@@ -1596,6 +1603,7 @@ fn save_draft(req: &HttpRequest, authentication: Option<&Authentication>) -> Htt
         version,
         desired,
         sections,
+        wireguard_edits,
     };
     if let Err(error) = write_draft(&path, &draft) {
         return json_response(502, json!({"ok": false, "error": error}));
@@ -1782,8 +1790,12 @@ fn reconcile_draft(req: &HttpRequest, authentication: Option<&Authentication>) -
         );
     }
     let sections = effective_sections(&previous);
+    let mut reviewed_wireguard = request.wireguard;
     if sections.iter().any(|section| section == "wireguard") {
-        accepted.wireguard = previous.desired.wireguard.clone();
+        carry_wireguard_edits(&mut accepted, &previous);
+        if let Some(tunnels) = reviewed_wireguard.as_mut() {
+            tunnels.retain(|tunnel| edited_tunnel(&previous, &tunnel.name));
+        }
     }
     if let Err(error) = apply_reviewed_sections(
         &mut accepted,
@@ -1793,7 +1805,7 @@ fn reconcile_draft(req: &HttpRequest, authentication: Option<&Authentication>) -
         request.ui_exposure,
         request.services,
         request.firewall,
-        request.wireguard,
+        reviewed_wireguard,
         request.qdiscs,
     ) {
         return json_response(409, json!({"ok": false, "error": error}));
@@ -1807,6 +1819,7 @@ fn reconcile_draft(req: &HttpRequest, authentication: Option<&Authentication>) -
         version,
         desired: accepted,
         sections,
+        wireguard_edits: previous.wireguard_edits,
     };
     if let Err(error) = write_draft(&path, &draft) {
         return json_response(502, json!({"ok": false, "error": error}));
@@ -2435,6 +2448,28 @@ fn store_wireguard(
         desired.routes.push(route);
     }
     Ok(())
+}
+
+fn edited_tunnel(draft: &Draft, name: &str) -> bool {
+    draft.wireguard_edits.is_empty() || draft.wireguard_edits.iter().any(|edit| edit == name)
+}
+
+/// Carry only the tunnels this draft edited onto a newer Accepted state, so a
+/// reconciled draft keeps its stored key without reverting other tunnels.
+fn carry_wireguard_edits(accepted: &mut DesiredState, draft: &Draft) {
+    for tunnel in &draft.desired.wireguard {
+        if !edited_tunnel(draft, &tunnel.name) {
+            continue;
+        }
+        match accepted
+            .wireguard
+            .iter_mut()
+            .find(|existing| existing.name == tunnel.name)
+        {
+            Some(existing) => *existing = tunnel.clone(),
+            None => accepted.wireguard.push(tunnel.clone()),
+        }
+    }
 }
 
 fn wireguard() -> HttpResponse {
@@ -3247,7 +3282,41 @@ mod tests {
             version: "abc".into(),
             desired: sample_state(),
             sections: Vec::new(),
+            wireguard_edits: Vec::new(),
         };
         assert_eq!(effective_sections(&draft), vec!["routes".to_string()]);
+    }
+
+    fn tunnel(name: &str, key: &str, port: u16) -> Wg {
+        Wg {
+            name: name.into(),
+            private_key: key.into(),
+            listen_port: Some(port),
+            addresses: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn reconcile_carries_only_the_edited_tunnel() {
+        let mut base = sample_state();
+        base.wireguard = vec![tunnel("wg0", "old-key", 51820), tunnel("wg1", "wg1-key", 51830)];
+        let mut draft_state = base.clone();
+        draft_state.wireguard[0] = tunnel("wg0", "new-key", 51821);
+        let draft = Draft {
+            base_revision: 1,
+            version: "abc".into(),
+            desired: draft_state,
+            sections: vec!["wireguard".into()],
+            wireguard_edits: vec!["wg0".into()],
+        };
+        let mut accepted = base;
+        accepted.revision = 2;
+        accepted.wireguard[1] = tunnel("wg1", "rotated-key", 51831);
+        carry_wireguard_edits(&mut accepted, &draft);
+        assert_eq!(accepted.wireguard[0].private_key, "new-key");
+        assert_eq!(accepted.wireguard[0].listen_port, Some(51821));
+        assert_eq!(accepted.wireguard[1].private_key, "rotated-key");
+        assert_eq!(accepted.wireguard[1].listen_port, Some(51831));
+        assert!(!edited_tunnel(&draft, "wg1"));
     }
 }

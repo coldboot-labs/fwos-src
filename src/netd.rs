@@ -492,6 +492,10 @@ fn handle_cmd(v: &Value) -> String {
             Err(error) => json!({"ok": false, "error": error}).to_string(),
         },
         "get_apply_confirmation" => apply_confirmation_status().to_string(),
+        "qdisc_show" => match live_qdisc_show() {
+            Ok(qdiscs) => json!({"ok": true, "qdiscs": qdiscs}).to_string(),
+            Err(error) => json!({"ok": false, "error": error}).to_string(),
+        },
         "was_draft_accepted" => was_draft_accepted(v).to_string(),
         "confirm_apply" => confirm_apply(v).to_string(),
         "restore_previous" => {
@@ -2652,6 +2656,21 @@ fn program_routes(state: &DesiredState) -> Result<(), String> {
     Ok(())
 }
 
+fn live_qdisc_show() -> Result<String, String> {
+    let output = Command::new("tc")
+        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+        .args(["qdisc", "show"])
+        .output()
+        .map_err(|error| format!("tc qdisc show: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "tc qdisc show failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 fn program_qdiscs(state: &DesiredState) -> Result<(), String> {
     for q in &state.qdiscs {
         let output = Command::new("tc")
@@ -3683,6 +3702,23 @@ mod tests {
         let unbound = unbound_conf("192.168.1.1", "192.168.1.0/24");
         assert!(unbound.contains("interface: 192.168.1.1"), "{unbound}");
         assert!(!unbound.contains("10.0.2.15"), "{unbound}");
+    }
+
+    #[test]
+    fn unsupported_qdisc_is_rejected_before_apply() {
+        let mut state = wan_lan();
+        state.qdiscs.push(fwos_fwd_setup::desired::Qdisc {
+            dev: "enp2s0".into(),
+            kind: "fq_codel".into(),
+        });
+        assert!(validate(&state).is_ok(), "{:?}", validate(&state).err());
+        state.qdiscs[0].kind = "tbf".into();
+        let err = validate(&state).unwrap_err();
+        assert!(err.contains("unsupported qdisc"), "{err}");
+        state.qdiscs[0].kind = "fq_codel".into();
+        state.qdiscs[0].dev = "missing0".into();
+        let err = validate(&state).unwrap_err();
+        assert!(err.contains("unsupported qdisc"), "{err}");
     }
 
     #[test]

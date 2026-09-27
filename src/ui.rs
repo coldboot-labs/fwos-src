@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use fwos_fwd_setup::desired::{DesiredState, Iface, StaticRoute, Wg};
+use fwos_fwd_setup::desired::{DesiredState, Iface, Qdisc, StaticRoute, Wg};
 use fwos_fwd_setup::identity::{self, Authentication, AuthenticationResult, Principal};
 use fwos_fwd_setup::{bootstrap_values, durable};
 
@@ -512,6 +512,7 @@ fn dispatch(req: &HttpRequest) -> HttpResponse {
         ("GET", "/api/lan-services") => lan_services(),
         ("GET", "/api/firewall") => firewall(),
         ("GET", "/api/wireguard") => wireguard(),
+        ("GET", "/api/qdiscs") => qdiscs(),
         ("GET", "/api/apply-confirmation") => apply_confirmation_status(),
         ("POST", "/api/apply-confirmation/configure") => {
             configure_apply_confirmation(req, authentication.as_ref())
@@ -535,6 +536,8 @@ fn dispatch(req: &HttpRequest) -> HttpResponse {
         ("POST", "/api/firewall/save-and-apply") => apply_firewall(req, authentication.as_ref()),
         ("POST", "/api/wireguard/apply") => apply_wireguard(req, authentication.as_ref()),
         ("POST", "/api/wireguard/save-and-apply") => apply_wireguard(req, authentication.as_ref()),
+        ("POST", "/api/qdiscs/apply") => apply_qdiscs(req, authentication.as_ref()),
+        ("POST", "/api/qdiscs/save-and-apply") => apply_qdiscs(req, authentication.as_ref()),
         ("POST", "/api/administrators") => create_administrator(req, authentication.as_ref()),
         ("POST", "/api/administrators/password") => {
             change_administrator_password(req, authentication.as_ref())
@@ -1457,6 +1460,7 @@ fn draft_status(authentication: Option<&Authentication>) -> HttpResponse {
                 "wan_pd": draft.desired.wan_pd,
                 "firewall": draft.desired.nft_extra,
                 "wireguard": redacted_wireguard(&draft.desired.wireguard),
+                "qdiscs": draft.desired.qdiscs,
             }),
         ),
         None => json_response(
@@ -1515,6 +1519,8 @@ struct DraftChange {
     firewall: Option<Vec<String>>,
     #[serde(default)]
     wireguard: Option<Vec<WgInput>>,
+    #[serde(default)]
+    qdiscs: Option<Vec<Qdisc>>,
 }
 
 fn save_draft(req: &HttpRequest, authentication: Option<&Authentication>) -> HttpResponse {
@@ -1577,6 +1583,7 @@ fn save_draft(req: &HttpRequest, authentication: Option<&Authentication>) -> Htt
         change.services,
         change.firewall,
         change.wireguard,
+        change.qdiscs,
     ) {
         return json_response(400, json!({"ok": false, "error": error}));
     }
@@ -1722,6 +1729,8 @@ struct DraftReconciliation {
     firewall: Option<Vec<String>>,
     #[serde(default)]
     wireguard: Option<Vec<WgInput>>,
+    #[serde(default)]
+    qdiscs: Option<Vec<Qdisc>>,
 }
 
 fn reconcile_draft(req: &HttpRequest, authentication: Option<&Authentication>) -> HttpResponse {
@@ -1785,6 +1794,7 @@ fn reconcile_draft(req: &HttpRequest, authentication: Option<&Authentication>) -
         request.services,
         request.firewall,
         request.wireguard,
+        request.qdiscs,
     ) {
         return json_response(409, json!({"ok": false, "error": error}));
     }
@@ -2081,6 +2091,7 @@ fn apply_draft_sections(
     services: Option<LanServices>,
     firewall: Option<Vec<String>>,
     wireguard: Option<Vec<WgInput>>,
+    qdiscs: Option<Vec<Qdisc>>,
 ) -> Result<(), String> {
     if routes.is_none()
         && interfaces.is_none()
@@ -2088,6 +2099,7 @@ fn apply_draft_sections(
         && services.is_none()
         && firewall.is_none()
         && wireguard.is_none()
+        && qdiscs.is_none()
     {
         return Err("invalid draft change".into());
     }
@@ -2121,6 +2133,10 @@ fn apply_draft_sections(
             remember_section(sections, "routes");
         }
     }
+    if let Some(qdiscs) = qdiscs {
+        store_qdiscs(desired, qdiscs)?;
+        remember_section(sections, "qdiscs");
+    }
     Ok(())
 }
 
@@ -2133,6 +2149,7 @@ fn apply_reviewed_sections(
     services: Option<LanServices>,
     firewall: Option<Vec<String>>,
     wireguard: Option<Vec<WgInput>>,
+    qdiscs: Option<Vec<Qdisc>>,
 ) -> Result<(), String> {
     if sections.iter().any(|section| section == "routes") {
         let Some(routes) = routes else {
@@ -2164,6 +2181,12 @@ fn apply_reviewed_sections(
         };
         let preserved = desired.wireguard.clone();
         store_wireguard(desired, wireguard, &preserved)?;
+    }
+    if sections.iter().any(|section| section == "qdiscs") {
+        let Some(qdiscs) = qdiscs else {
+            return Err("Draft qdiscs changed; review them again".into());
+        };
+        store_qdiscs(desired, qdiscs)?;
     }
     Ok(())
 }
@@ -2485,6 +2508,118 @@ fn apply_wireguard(req: &HttpRequest, authentication: Option<&Authentication>) -
     }
     let preserved = desired.wireguard.clone();
     if let Err(error) = store_wireguard(&mut desired, change.wireguard, &preserved) {
+        return json_response(
+            400,
+            json!({"ok": false, "outcome": "rejected", "error": error}),
+        );
+    }
+    submit_desired_apply(desired, change.base_revision, &authentication.principal)
+}
+
+fn store_qdiscs(desired: &mut DesiredState, updates: Vec<Qdisc>) -> Result<(), String> {
+    for update in &updates {
+        if update.dev.trim().is_empty() || update.kind.trim().is_empty() {
+            return Err("qdisc needs an interface and a kind".into());
+        }
+    }
+    for update in updates {
+        if let Some(existing) = desired.qdiscs.iter_mut().find(|qdisc| qdisc.dev == update.dev) {
+            existing.kind = update.kind;
+        } else {
+            desired.qdiscs.push(update);
+        }
+    }
+    Ok(())
+}
+
+fn qdiscs() -> HttpResponse {
+    if !Path::new(BOOTSTRAP).exists() {
+        return json_response(
+            409,
+            json!({"ok": false, "error": "complete Bootstrap first"}),
+        );
+    }
+    match complete_desired() {
+        Ok(desired) => {
+            let mut devices: Vec<String> = desired
+                .interfaces
+                .iter()
+                .map(|iface| iface.name.clone())
+                .collect();
+            for tunnel in &desired.wireguard {
+                if !devices.iter().any(|name| name == &tunnel.name) {
+                    devices.push(tunnel.name.clone());
+                }
+            }
+            let effective = netd_cmd(&json!({"op": "qdisc_show"}))
+                .ok()
+                .and_then(|reply| reply.get("qdiscs").and_then(|value| value.as_str()).map(str::to_owned))
+                .unwrap_or_default();
+            json_response(
+                200,
+                json!({
+                    "ok": true,
+                    "status": "accepted",
+                    "revision": desired.revision,
+                    "qdiscs": desired.qdiscs,
+                    "interfaces": devices,
+                    "effective": effective,
+                }),
+            )
+        }
+        Err(error) => json_response(502, json!({"ok": false, "error": error})),
+    }
+}
+
+fn apply_qdiscs(req: &HttpRequest, authentication: Option<&Authentication>) -> HttpResponse {
+    let authentication = match operator_session(authentication) {
+        Ok(authentication) => authentication,
+        Err(response) => return response,
+    };
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct QdiscChange {
+        base_revision: u64,
+        qdiscs: Vec<Qdisc>,
+    }
+    let change: QdiscChange = match serde_json::from_slice(&req.body) {
+        Ok(change) => change,
+        Err(error) => {
+            return json_response(
+                400,
+                json!({"ok": false, "outcome": "rejected", "error": format!("invalid qdisc change: {error}")}),
+            )
+        }
+    };
+    let path = draft_path(&authentication.principal);
+    let lock = draft_lock(&path);
+    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let snapshot = accepted_snapshot_for_drafting().ok();
+    match read_draft_reconciled(&path, &authentication.principal, snapshot.as_ref()) {
+        Ok(Some(_)) => {
+            return json_response(
+                409,
+                json!({
+                    "ok": false, "outcome": "rejected",
+                    "error": "Private pending draft exists; review and apply or reconcile it first"
+                }),
+            )
+        }
+        Ok(None) => (),
+        Err(error) => return json_response(502, json!({"ok": false, "error": error})),
+    }
+    let mut desired = match complete_desired() {
+        Ok(desired) => desired,
+        Err(error) => return json_response(502, json!({"ok": false, "error": error})),
+    };
+    if desired.revision != change.base_revision {
+        return json_response(
+            409,
+            json!({"ok": false, "outcome": "rejected", "revision": desired.revision,
+            "error": "Accepted Desired state changed; reload before applying"}),
+        );
+    }
+    if let Err(error) = store_qdiscs(&mut desired, change.qdiscs) {
         return json_response(
             400,
             json!({"ok": false, "outcome": "rejected", "error": error}),
@@ -2890,6 +3025,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(sections, vec!["interfaces".to_string()]);
@@ -2913,6 +3049,7 @@ mod tests {
                 via: "198.51.100.2".into(),
                 dev: Some("enp2s0".into()),
             }]),
+            None,
             None,
             None,
             None,
@@ -2966,6 +3103,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(accepted.interfaces[0].addresses, vec!["10.1.0.1/24".to_string()]);
@@ -2975,6 +3113,7 @@ mod tests {
             &mut accepted,
             &["routes".into(), "interfaces".into()],
             Some(routes),
+            None,
             None,
             None,
             None,
@@ -3002,6 +3141,7 @@ mod tests {
             }),
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(desired.routes[0].to, "198.51.100.0/24");
@@ -3012,6 +3152,35 @@ mod tests {
             sections,
             vec!["interfaces".to_string(), "services".to_string()]
         );
+    }
+
+    #[test]
+    fn qdisc_edit_keeps_routes_and_other_qdiscs() {
+        let mut desired = sample_state();
+        desired.qdiscs.push(Qdisc {
+            dev: "enp2s0".into(),
+            kind: "fq_codel".into(),
+        });
+        store_qdiscs(
+            &mut desired,
+            vec![Qdisc {
+                dev: "enp1s0".into(),
+                kind: "cake".into(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(desired.qdiscs.len(), 2);
+        assert_eq!(desired.qdiscs[0].kind, "fq_codel");
+        assert_eq!(desired.routes[0].to, "198.51.100.0/24");
+        let err = store_qdiscs(
+            &mut desired,
+            vec![Qdisc {
+                dev: "enp1s0".into(),
+                kind: String::new(),
+            }],
+        )
+        .unwrap_err();
+        assert!(err.contains("interface and a kind"), "{err}");
     }
 
     #[test]

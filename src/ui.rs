@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use fwos_fwd_setup::desired::{DesiredState, Iface, Qdisc, StaticRoute, Wg};
 use fwos_fwd_setup::identity::{self, Authentication, AuthenticationResult, Principal};
-use fwos_fwd_setup::{bootstrap_values, durable};
+use fwos_fwd_setup::{bootstrap_values, durable, host_image};
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 const SOCK: &str = "/var/lib/fwos/netd.sock";
+const UPDATE_SOCK: &str = "/var/lib/fwos/update.sock";
 const CERT: &str = "/var/lib/fwos/ui-cert.pem";
 const KEY: &str = "/var/lib/fwos/ui-key.pem";
 const BOOTSTRAP: &str = "/var/lib/fwos/bootstrapped";
@@ -554,6 +555,9 @@ fn dispatch(req: &HttpRequest) -> HttpResponse {
         ("POST", "/api/administrators/remove") => {
             remove_administrator(req, authentication.as_ref())
         }
+        ("GET", "/api/host-update") => host_update_status(authentication.as_ref()),
+        ("POST", "/api/host-update/stage") => stage_host_update(req, authentication.as_ref()),
+        ("POST", "/api/host-update/reboot") => reboot_host(authentication.as_ref()),
         ("POST", "/api/bootstrap") => bootstrap(&req.body),
         ("GET", _) if path.starts_with("/api/") => {
             json_response(404, json!({"ok": false, "error": "not found"}))
@@ -1232,8 +1236,12 @@ fn netd_cmd(body: &Value) -> Result<Value, String> {
 }
 
 fn netd_cmd_with_timeout(body: &Value, timeout: Duration) -> Result<Value, String> {
-    let raw = serde_json::to_vec(body).map_err(|e| format!("encode netd cmd: {e}"))?;
-    let mut stream = UnixStream::connect(SOCK).map_err(|e| format!("connect {SOCK}: {e}"))?;
+    socket_cmd(SOCK, body, timeout)
+}
+
+fn socket_cmd(sock: &str, body: &Value, timeout: Duration) -> Result<Value, String> {
+    let raw = serde_json::to_vec(body).map_err(|e| format!("encode {sock} cmd: {e}"))?;
+    let mut stream = UnixStream::connect(sock).map_err(|e| format!("connect {sock}: {e}"))?;
     let _ = stream.set_read_timeout(Some(timeout));
     let _ = stream.set_write_timeout(Some(timeout));
     stream
@@ -1246,7 +1254,91 @@ fn netd_cmd_with_timeout(body: &Value, timeout: Duration) -> Result<Value, Strin
     stream
         .read_to_end(&mut reply)
         .map_err(|e| format!("read socket: {e}"))?;
-    serde_json::from_slice(&reply).map_err(|e| format!("parse netd reply: {e}"))
+    serde_json::from_slice(&reply).map_err(|e| format!("parse {sock} reply: {e}"))
+}
+
+// Host update belongs to the Host update program (ADR-0022); the UI is only
+// its authenticated client and never runs bootc itself.
+fn update_cmd(body: &Value) -> Result<Value, String> {
+    socket_cmd(UPDATE_SOCK, body, Duration::from_secs(30))
+}
+
+/// Map a Host update program action reply: refusals are conflicts with its
+/// current state, and an unreachable program is unavailable.
+fn update_action(body: &Value) -> Result<Value, HttpResponse> {
+    match update_cmd(body) {
+        Ok(reply) if reply["ok"] == true => Ok(reply),
+        Ok(reply) => Err(json_response(
+            409,
+            json!({"ok": false, "error": reply["error"]}),
+        )),
+        Err(_) => Err(json_response(
+            503,
+            json!({"ok": false, "error": "Host update program unavailable"}),
+        )),
+    }
+}
+
+fn host_update_status(authentication: Option<&Authentication>) -> HttpResponse {
+    if let Err(response) = operator_session(authentication) {
+        return response;
+    }
+    match update_cmd(&json!({"op": "status"})) {
+        Ok(reply) if reply["ok"] == true => json_response(200, reply),
+        Ok(reply) => json_response(503, json!({"ok": false, "error": reply["error"]})),
+        Err(_) => json_response(
+            503,
+            json!({"ok": false, "error": "Host update program unavailable"}),
+        ),
+    }
+}
+
+fn stage_host_update(req: &HttpRequest, authentication: Option<&Authentication>) -> HttpResponse {
+    #[derive(Deserialize)]
+    struct StageRequest {
+        image: String,
+    }
+    let authentication = match operator_session(authentication) {
+        Ok(authentication) => authentication,
+        Err(response) => return response,
+    };
+    let image = match serde_json::from_slice::<StageRequest>(&req.body) {
+        Ok(request) => request.image.trim().to_string(),
+        Err(_) => String::new(),
+    };
+    if !host_image::valid_reference(&image) {
+        return json_response(
+            400,
+            json!({"ok": false, "error": "one Release image reference required"}),
+        );
+    }
+    match update_action(&json!({"op": "start_stage", "image": image})) {
+        Ok(reply) => {
+            eprintln!(
+                "fwos-ui: {} requested Host update staging of {image}",
+                authentication.principal.username
+            );
+            json_response(202, reply)
+        }
+        Err(response) => response,
+    }
+}
+
+fn reboot_host(authentication: Option<&Authentication>) -> HttpResponse {
+    let authentication = match operator_session(authentication) {
+        Ok(authentication) => authentication,
+        Err(response) => return response,
+    };
+    match update_action(&json!({"op": "reboot"})) {
+        Ok(_) => {
+            eprintln!(
+                "fwos-ui: {} requested an appliance reboot",
+                authentication.principal.username
+            );
+            json_response(200, json!({"ok": true, "rebooting": true}))
+        }
+        Err(response) => response,
+    }
 }
 
 fn complete_desired() -> Result<DesiredState, String> {
@@ -3396,18 +3488,24 @@ mod tests {
     }
 
     #[test]
-    fn ui_has_no_host_update_route() {
-        let req = HttpRequest {
-            method: "POST".into(),
-            path: "/api/update".into(),
-            body: b"{\"image\":\"10.0.2.2:5000/fwos:next\"}".to_vec(),
-            headers: HashMap::from([("content-type".into(), "application/json".into())]),
-        };
-        let resp = dispatch(&req);
-        assert_eq!(resp.status, 404);
-        let body = String::from_utf8_lossy(&resp.body);
-        assert!(!body.contains("update.sock"));
-        assert!(!body.contains("bootc"));
+    fn host_update_routes_need_a_signed_in_administrator() {
+        for (method, path) in [
+            ("GET", "/api/host-update"),
+            ("POST", "/api/host-update/stage"),
+            ("POST", "/api/host-update/reboot"),
+        ] {
+            let req = HttpRequest {
+                method: method.into(),
+                path: path.into(),
+                body: b"{\"image\":\"10.0.2.2:5000/fwos:next\"}".to_vec(),
+                headers: HashMap::from([("content-type".into(), "application/json".into())]),
+            };
+            let resp = dispatch(&req);
+            assert_eq!(resp.status, 401, "{method} {path}");
+            let body = String::from_utf8_lossy(&resp.body);
+            assert!(!body.contains("update.sock"));
+            assert!(!body.contains("bootc"));
+        }
     }
 
     fn sample_state() -> DesiredState {

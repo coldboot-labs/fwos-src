@@ -6,9 +6,11 @@ use std::os::unix::fs::{chown, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::process::{self, Command, Stdio};
+use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use fwos_fwd_setup::host_image;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -48,6 +50,7 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
+    record_staged_for_health();
     let path = Path::new(SOCK);
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
@@ -62,10 +65,29 @@ fn run() -> Result<(), String> {
         let (stream, _) = listener
             .accept()
             .map_err(|e| format!("accept {SOCK}: {e}"))?;
-        if let Err(err) = handle_client(stream) {
+        // A legacy synchronous stage can take minutes; status and reboot must
+        // still answer while it runs.
+        thread::spawn(move || {
+            if let Err(err) = handle_client(stream) {
+                eprintln!("fwos-update: {err}");
+            }
+        });
+    }
+}
+
+// A crash between `bootc switch` and writing the health-pending record would
+// leave a staged deployment that boots without post-update health checking.
+fn record_staged_for_health() {
+    let staged = bootc_images().staged;
+    if let Some(image) = missing_pending_record(&read_pending(), &staged) {
+        if let Err(err) = write_pending(&image) {
             eprintln!("fwos-update: {err}");
         }
     }
+}
+
+fn missing_pending_record(pending: &str, staged: &str) -> Option<String> {
+    (pending.is_empty() && !staged.is_empty()).then(|| staged.to_string())
 }
 
 fn handle_client(mut stream: UnixStream) -> Result<(), String> {
@@ -109,88 +131,203 @@ fn request_reboot() {
         .status();
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Deployments {
+    booted: String,
+    staged: String,
+    rollback: String,
+    /// `bootc rollback` makes the rollback deployment the next boot.
+    rollback_queued: bool,
+}
+
+/// The Host update operation this controller is running or last failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Operation {
+    Idle,
+    /// Deployments as they were when staging began; `bootc status` may wait
+    /// on the sysroot lock while `bootc switch` holds it.
+    Staging {
+        image: String,
+        before: Deployments,
+    },
+    Failed {
+        image: String,
+        error: String,
+    },
+}
+
+impl Operation {
+    fn before_staging(&self) -> Option<&Deployments> {
+        match self {
+            Self::Staging { before, .. } => Some(before),
+            _ => None,
+        }
+    }
+}
+
+static OPERATION: Mutex<Operation> = Mutex::new(Operation::Idle);
+
+fn lock_operation() -> MutexGuard<'static, Operation> {
+    OPERATION.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Reboot, rollback, and another stage wait until a running stage finishes.
+fn idle(op: &Operation) -> Result<(), String> {
+    match op {
+        Operation::Staging { image, .. } => Err(format!(
+            "Host update staging of {image} is already in progress"
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn begin_staging(op: &mut Operation, image: &str, before: Deployments) -> Result<(), String> {
+    idle(op)?;
+    *op = Operation::Staging {
+        image: image.to_string(),
+        before,
+    };
+    Ok(())
+}
+
+fn finish_staging(op: &mut Operation, image: &str, result: Result<(), String>) {
+    *op = match result {
+        Ok(()) => Operation::Idle,
+        Err(error) => Operation::Failed {
+            image: image.to_string(),
+            error,
+        },
+    };
+}
+
+fn operation_json(op: &Operation) -> Value {
+    match op {
+        Operation::Idle => json!({"state": "idle"}),
+        Operation::Staging { image, .. } => json!({"state": "staging", "image": image}),
+        Operation::Failed { image, error } => {
+            json!({"state": "failed", "image": image, "error": error})
+        }
+    }
+}
+
+fn status_reply(deployments: &Deployments, op: &Operation) -> Value {
+    json!({
+        "ok": true,
+        "reboot_required": !deployments.staged.is_empty() || deployments.rollback_queued,
+        "booted": deployments.booted,
+        "staged": deployments.staged,
+        "rollback": deployments.rollback,
+        "operation": operation_json(op),
+    })
+}
+
+fn current_status() -> Value {
+    let op = lock_operation().clone();
+    let deployments = match op.before_staging() {
+        Some(before) => before.clone(),
+        None => match bootc_status() {
+            Ok(deployments) => deployments,
+            Err(error) => return json!({"ok": false, "error": error}),
+        },
+    };
+    status_reply(&deployments, &op)
+}
+
+const NOT_BOOTSTRAPPED: &str = "Host update refused until Bootstrap has completed";
+
 fn handle_request(req: Request) -> String {
     match req.op.as_str() {
-        "status" => {
-            let (booted, staged, rollback) = bootc_images();
-            json!({
-                "ok": true,
-                "reboot_required": !staged.is_empty(),
-                "booted": booted,
-                "staged": staged,
-                "rollback": rollback,
-            })
-            .to_string()
-        }
+        "status" => current_status().to_string(),
         "reboot" => {
-            if !admin_exists() {
-                return json!({"ok": false, "error": "Host update refused until an admin exists"})
-                    .to_string();
+            if !bootstrap_completed() {
+                return json!({"ok": false, "error": NOT_BOOTSTRAPPED}).to_string();
+            }
+            if let Err(err) = idle(&lock_operation()) {
+                return json!({"ok": false, "error": err}).to_string();
             }
             json!({"ok": true, "rebooting": true}).to_string()
         }
         "rollback" => rollback_request(),
         "stage" => stage_request(&req.image),
+        "start_stage" => start_stage_request(&req.image),
         other => json!({"ok": false, "error": format!("unknown op {other}")}).to_string(),
     }
 }
 
 fn rollback_request() -> String {
-    if !admin_exists() {
-        return json!({"ok": false, "error": "Host update refused until an admin exists"})
-            .to_string();
+    if !bootstrap_completed() {
+        return json!({"ok": false, "error": NOT_BOOTSTRAPPED}).to_string();
+    }
+    if let Err(err) = idle(&lock_operation()) {
+        return json!({"ok": false, "error": err}).to_string();
     }
     match bootc_rollback() {
         Ok(()) => {
             clear_pending();
-            let (booted, staged, rollback) = bootc_images();
-            json!({
-                "ok": true,
-                "reboot_required": true,
-                "booted": booted,
-                "staged": staged,
-                "rollback": rollback,
-            })
-            .to_string()
+            current_status().to_string()
         }
         Err(err) => json!({"ok": false, "error": err}).to_string(),
     }
 }
 
-fn stage_request(image: &str) -> String {
-    if !admin_exists() {
-        return json!({"ok": false, "error": "Host update refused until an admin exists"})
-            .to_string();
+fn claim_staging(image: &str) -> Result<(), String> {
+    if !bootstrap_completed() {
+        return Err(NOT_BOOTSTRAPPED.into());
     }
-    if image.is_empty() {
-        return json!({"ok": false, "error": "Host image required"}).to_string();
+    if !host_image::valid_reference(image) {
+        return Err("one Release image reference required".into());
     }
-    if let Err(err) = write_pending(image) {
-        return json!({"ok": false, "error": err}).to_string();
-    }
-    match bootc_switch(image) {
-        Ok(()) => {
-            let (booted, staged, rollback) = bootc_images();
-            if !staged.is_empty() {
-                let _ = write_pending(&staged);
-            }
-            json!({
-                "ok": true,
-                "reboot_required": true,
-                "booted": booted,
-                "staged": staged,
-                "rollback": rollback,
-            })
-            .to_string()
-        }
-        Err(err) => {
-            clear_pending();
-            json!({"ok": false, "error": err}).to_string()
-        }
-    }
+    begin_staging(&mut lock_operation(), image, bootc_images())
 }
 
-fn admin_exists() -> bool {
+/// Legacy synchronous stage: the reply waits for the staged deployment.
+fn stage_request(image: &str) -> String {
+    if let Err(err) = claim_staging(image) {
+        return json!({"ok": false, "error": err}).to_string();
+    }
+    let result = stage(image);
+    let reply = match &result {
+        Ok(()) => None,
+        Err(err) => Some(json!({"ok": false, "error": err}).to_string()),
+    };
+    finish_staging(&mut lock_operation(), image, result);
+    reply.unwrap_or_else(|| current_status().to_string())
+}
+
+/// UI stage: accept the request, then pull and stage in the background.
+fn start_stage_request(image: &str) -> String {
+    if let Err(err) = claim_staging(image) {
+        return json!({"ok": false, "error": err}).to_string();
+    }
+    let owned = image.to_string();
+    thread::spawn(move || {
+        let result = stage(&owned);
+        if let Err(err) = &result {
+            eprintln!("fwos-update: staging {owned} failed: {err}");
+        }
+        finish_staging(&mut lock_operation(), &owned, result);
+    });
+    let mut reply = current_status();
+    reply["staging"] = json!(true);
+    reply.to_string()
+}
+
+// Pull and stage without touching the running deployment or networking. The
+// health-pending record is written only once a deployment is staged, so a registry or
+// download failure never makes the next boot look like a Host update boot.
+fn stage(image: &str) -> Result<(), String> {
+    bootc_switch(image)?;
+    let staged = bootc_status()?.staged;
+    if staged.is_empty() {
+        // `bootc switch` to the booted image reference stages nothing.
+        return Err(format!(
+            "no deployment was staged; {image} may already be active"
+        ));
+    }
+    write_pending(&staged)
+}
+
+fn bootstrap_completed() -> bool {
     Path::new(BOOTSTRAPPED).is_file()
 }
 
@@ -240,20 +377,43 @@ fn local_registry_host(image: &str) -> Option<String> {
     }
 }
 
-fn bootc_images() -> (String, String, String) {
-    let output = Command::new("bootc")
-        .args(["status", "--format", "json"])
-        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
-        .output();
-    let Ok(output) = output else {
-        return (String::new(), String::new(), String::new());
-    };
-    let v: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
-    (
-        image_ref(&v, "booted"),
-        image_ref(&v, "staged"),
-        image_ref(&v, "rollback"),
-    )
+fn bootc_images() -> Deployments {
+    bootc_status().unwrap_or_default()
+}
+
+// Every bootc system has a booted deployment; an answer without one is a
+// transient `bootc status` failure (seen right after a failed switch), not an
+// appliance with no Release.
+fn bootc_status() -> Result<Deployments, String> {
+    let mut last = String::new();
+    for _ in 0..10 {
+        match Command::new("bootc")
+            .args(["status", "--format", "json"])
+            .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+            .output()
+        {
+            Ok(output) => {
+                let found =
+                    deployments(&serde_json::from_slice(&output.stdout).unwrap_or(Value::Null));
+                if !found.booted.is_empty() {
+                    return Ok(found);
+                }
+                last = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            }
+            Err(err) => last = err.to_string(),
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+    Err(format!("bootc status unavailable: {last}"))
+}
+
+fn deployments(status: &Value) -> Deployments {
+    Deployments {
+        booted: image_ref(status, "booted"),
+        staged: image_ref(status, "staged"),
+        rollback: image_ref(status, "rollback"),
+        rollback_queued: status["status"]["rollbackQueued"] == true,
+    }
 }
 
 fn image_ref(status: &Value, which: &str) -> String {
@@ -387,7 +547,9 @@ fn run_health() -> Result<(), String> {
     }
     let deadline = Instant::now() + HEALTH_TIMEOUT;
     loop {
-        let (booted, _, rollback) = bootc_images();
+        let Deployments {
+            booted, rollback, ..
+        } = bootc_images();
         if !booted.is_empty() && !pending_is_this_boot(&pending, &booted) {
             return Ok(());
         }
@@ -466,15 +628,19 @@ mod tests {
 
     #[test]
     fn status_op_reports_bootc_deployments() {
-        let s = handle_request(Request {
-            op: "status".into(),
-            image: String::new(),
-        });
-        assert!(s.contains("\"ok\":true") || s.contains("\"ok\": true"));
-        assert!(s.contains("booted"));
-        assert!(s.contains("staged"));
-        assert!(s.contains("rollback"));
-        assert!(!s.contains("unknown op"));
+        let reply = status_reply(
+            &Deployments {
+                booted: "a:1".into(),
+                rollback: "a:0".into(),
+                ..Deployments::default()
+            },
+            &Operation::Idle,
+        );
+        assert_eq!(reply["ok"], true);
+        assert_eq!(reply["booted"], "a:1");
+        assert_eq!(reply["staged"], "");
+        assert_eq!(reply["rollback"], "a:0");
+        assert_eq!(reply["operation"]["state"], "idle");
     }
 
     #[test]
@@ -499,6 +665,88 @@ mod tests {
         let l = s.to_ascii_lowercase();
         assert!(l.contains("admin") || l.contains("refus"));
         assert!(!s.contains("\"ok\":true") && !s.contains("\"ok\": true"));
+    }
+
+    #[test]
+    fn start_stage_without_completed_bootstrap_is_refused() {
+        let s = handle_request(Request {
+            op: "start_stage".into(),
+            image: "10.0.2.2:5000/fwos:next".into(),
+        });
+        assert!(!s.contains("unknown op"));
+        assert!(s.contains("Bootstrap"));
+        assert!(!s.contains("\"ok\":true"));
+    }
+
+    #[test]
+    fn only_one_staging_operation_runs_at_a_time() {
+        let before = Deployments {
+            booted: "localhost/fwos:dev".into(),
+            ..Deployments::default()
+        };
+        let mut op = Operation::Idle;
+        begin_staging(&mut op, "10.0.2.2:5000/fwos:next", before.clone()).unwrap();
+        let busy = begin_staging(&mut op, "10.0.2.2:5000/fwos:other", before.clone());
+        assert!(busy.unwrap_err().contains("in progress"));
+        let json = operation_json(&op);
+        assert_eq!(json["state"], "staging");
+        assert_eq!(json["image"], "10.0.2.2:5000/fwos:next");
+        assert_eq!(op.before_staging(), Some(&before));
+
+        finish_staging(
+            &mut op,
+            "10.0.2.2:5000/fwos:next",
+            Err("registry unreachable".into()),
+        );
+        let json = operation_json(&op);
+        assert_eq!(json["state"], "failed");
+        assert_eq!(json["error"], "registry unreachable");
+        assert_eq!(op.before_staging(), None);
+
+        begin_staging(&mut op, "10.0.2.2:5000/fwos:next", before).unwrap();
+        finish_staging(&mut op, "10.0.2.2:5000/fwos:next", Ok(()));
+        assert_eq!(operation_json(&op)["state"], "idle");
+    }
+
+    #[test]
+    fn staged_or_queued_rollback_deployments_require_a_reboot() {
+        let idle = Operation::Idle;
+        let status = |v: Value| status_reply(&deployments(&v), &idle)["reboot_required"].clone();
+        let booted = json!({"status": {"booted": {"image": {"image": {"image": "a:1"}}}}});
+        assert_eq!(status(booted), false);
+        let staged = json!({"status": {"staged": {"image": {"image": {"image": "a:2"}}}}});
+        assert_eq!(status(staged), true);
+        let queued = json!({"status": {"rollbackQueued": true,
+            "rollback": {"image": {"image": {"image": "a:0"}}}}});
+        assert_eq!(status(queued), true);
+    }
+
+    #[test]
+    fn reboot_and_rollback_wait_for_a_running_stage() {
+        assert!(idle(&Operation::Idle).is_ok());
+        let failed = Operation::Failed {
+            image: "a:2".into(),
+            error: "registry unreachable".into(),
+        };
+        assert!(idle(&failed).is_ok());
+        let staging = Operation::Staging {
+            image: "a:2".into(),
+            before: Deployments::default(),
+        };
+        assert!(idle(&staging).unwrap_err().contains("in progress"));
+    }
+
+    #[test]
+    fn a_staged_deployment_without_a_health_record_gets_one() {
+        assert_eq!(
+            missing_pending_record("", "10.0.2.2:5000/fwos:next").as_deref(),
+            Some("10.0.2.2:5000/fwos:next")
+        );
+        assert_eq!(
+            missing_pending_record("10.0.2.2:5000/fwos:next", "10.0.2.2:5000/fwos:next"),
+            None
+        );
+        assert_eq!(missing_pending_record("", ""), None);
     }
 
     #[test]

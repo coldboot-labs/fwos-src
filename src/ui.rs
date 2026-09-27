@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use fwos_fwd_setup::desired::{DesiredState, Iface, StaticRoute};
+use fwos_fwd_setup::desired::{DesiredState, Iface, StaticRoute, Wg};
 use fwos_fwd_setup::identity::{self, Authentication, AuthenticationResult, Principal};
 use fwos_fwd_setup::{bootstrap_values, durable};
 
@@ -511,6 +511,7 @@ fn dispatch(req: &HttpRequest) -> HttpResponse {
         ("GET", "/api/interfaces") => interfaces(),
         ("GET", "/api/lan-services") => lan_services(),
         ("GET", "/api/firewall") => firewall(),
+        ("GET", "/api/wireguard") => wireguard(),
         ("GET", "/api/apply-confirmation") => apply_confirmation_status(),
         ("POST", "/api/apply-confirmation/configure") => {
             configure_apply_confirmation(req, authentication.as_ref())
@@ -532,6 +533,8 @@ fn dispatch(req: &HttpRequest) -> HttpResponse {
         }
         ("POST", "/api/firewall/apply") => apply_firewall(req, authentication.as_ref()),
         ("POST", "/api/firewall/save-and-apply") => apply_firewall(req, authentication.as_ref()),
+        ("POST", "/api/wireguard/apply") => apply_wireguard(req, authentication.as_ref()),
+        ("POST", "/api/wireguard/save-and-apply") => apply_wireguard(req, authentication.as_ref()),
         ("POST", "/api/administrators") => create_administrator(req, authentication.as_ref()),
         ("POST", "/api/administrators/password") => {
             change_administrator_password(req, authentication.as_ref())
@@ -1453,6 +1456,7 @@ fn draft_status(authentication: Option<&Authentication>) -> HttpResponse {
                 "dhcp_pool": draft.desired.dhcp_pool,
                 "wan_pd": draft.desired.wan_pd,
                 "firewall": draft.desired.nft_extra,
+                "wireguard": redacted_wireguard(&draft.desired.wireguard),
             }),
         ),
         None => json_response(
@@ -1509,6 +1513,8 @@ struct DraftChange {
     services: Option<LanServices>,
     #[serde(default)]
     firewall: Option<Vec<String>>,
+    #[serde(default)]
+    wireguard: Option<Vec<WgInput>>,
 }
 
 fn save_draft(req: &HttpRequest, authentication: Option<&Authentication>) -> HttpResponse {
@@ -1570,6 +1576,7 @@ fn save_draft(req: &HttpRequest, authentication: Option<&Authentication>) -> Htt
         change.ui_exposure,
         change.services,
         change.firewall,
+        change.wireguard,
     ) {
         return json_response(400, json!({"ok": false, "error": error}));
     }
@@ -1713,6 +1720,8 @@ struct DraftReconciliation {
     services: Option<LanServices>,
     #[serde(default)]
     firewall: Option<Vec<String>>,
+    #[serde(default)]
+    wireguard: Option<Vec<WgInput>>,
 }
 
 fn reconcile_draft(req: &HttpRequest, authentication: Option<&Authentication>) -> HttpResponse {
@@ -1764,6 +1773,9 @@ fn reconcile_draft(req: &HttpRequest, authentication: Option<&Authentication>) -
         );
     }
     let sections = effective_sections(&previous);
+    if sections.iter().any(|section| section == "wireguard") {
+        accepted.wireguard = previous.desired.wireguard.clone();
+    }
     if let Err(error) = apply_reviewed_sections(
         &mut accepted,
         &sections,
@@ -1772,6 +1784,7 @@ fn reconcile_draft(req: &HttpRequest, authentication: Option<&Authentication>) -
         request.ui_exposure,
         request.services,
         request.firewall,
+        request.wireguard,
     ) {
         return json_response(409, json!({"ok": false, "error": error}));
     }
@@ -2067,12 +2080,14 @@ fn apply_draft_sections(
     ui_exposure: Option<Vec<String>>,
     services: Option<LanServices>,
     firewall: Option<Vec<String>>,
+    wireguard: Option<Vec<WgInput>>,
 ) -> Result<(), String> {
     if routes.is_none()
         && interfaces.is_none()
         && ui_exposure.is_none()
         && services.is_none()
         && firewall.is_none()
+        && wireguard.is_none()
     {
         return Err("invalid draft change".into());
     }
@@ -2095,6 +2110,17 @@ fn apply_draft_sections(
         desired.nft_extra = firewall;
         remember_section(sections, "firewall");
     }
+    if let Some(wireguard) = wireguard {
+        let adds_route = wireguard.iter().any(|tunnel| {
+            !tunnel.route_to.trim().is_empty() && !tunnel.route_via.trim().is_empty()
+        });
+        let preserved = desired.wireguard.clone();
+        store_wireguard(desired, wireguard, &preserved)?;
+        remember_section(sections, "wireguard");
+        if adds_route {
+            remember_section(sections, "routes");
+        }
+    }
     Ok(())
 }
 
@@ -2106,6 +2132,7 @@ fn apply_reviewed_sections(
     ui_exposure: Option<Vec<String>>,
     services: Option<LanServices>,
     firewall: Option<Vec<String>>,
+    wireguard: Option<Vec<WgInput>>,
 ) -> Result<(), String> {
     if sections.iter().any(|section| section == "routes") {
         let Some(routes) = routes else {
@@ -2130,6 +2157,13 @@ fn apply_reviewed_sections(
             return Err("Draft firewall policy changed; review it again".into());
         };
         desired.nft_extra = firewall;
+    }
+    if sections.iter().any(|section| section == "wireguard") {
+        let Some(wireguard) = wireguard else {
+            return Err("Draft WireGuard changed; review it again".into());
+        };
+        let preserved = desired.wireguard.clone();
+        store_wireguard(desired, wireguard, &preserved)?;
     }
     Ok(())
 }
@@ -2295,6 +2329,167 @@ fn apply_firewall(req: &HttpRequest, authentication: Option<&Authentication>) ->
         );
     }
     desired.nft_extra = change.rules;
+    submit_desired_apply(desired, change.base_revision, &authentication.principal)
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WgInput {
+    name: String,
+    #[serde(default)]
+    private_key: String,
+    #[serde(default)]
+    listen_port: Option<u16>,
+    #[serde(default)]
+    addresses: Vec<String>,
+    #[serde(default)]
+    route_to: String,
+    #[serde(default)]
+    route_via: String,
+}
+
+fn redacted_wireguard(tunnels: &[Wg]) -> Vec<serde_json::Value> {
+    tunnels
+        .iter()
+        .map(|tunnel| {
+            json!({
+                "name": tunnel.name,
+                "listen_port": tunnel.listen_port,
+                "addresses": tunnel.addresses,
+                "private_key_set": !tunnel.private_key.is_empty(),
+            })
+        })
+        .collect()
+}
+
+fn store_wireguard(
+    desired: &mut DesiredState,
+    tunnels: Vec<WgInput>,
+    preserved: &[Wg],
+) -> Result<(), String> {
+    let mut next = preserved.to_vec();
+    let mut tunnel_routes = Vec::new();
+    for tunnel in tunnels {
+        let route_to = tunnel.route_to.trim().to_string();
+        let route_via = tunnel.route_via.trim().to_string();
+        if route_to.is_empty() != route_via.is_empty() {
+            return Err(format!(
+                "WireGuard {} route needs both a destination and a next hop",
+                tunnel.name
+            ));
+        }
+        if !route_to.is_empty() {
+            tunnel_routes.push(StaticRoute {
+                to: route_to,
+                via: route_via,
+                dev: Some(tunnel.name.clone()),
+            });
+        }
+        if let Some(existing) = next.iter_mut().find(|existing| existing.name == tunnel.name) {
+            if !tunnel.private_key.trim().is_empty() {
+                existing.private_key = tunnel.private_key;
+            }
+            if tunnel.listen_port.is_some() {
+                existing.listen_port = tunnel.listen_port;
+            }
+            if !tunnel.addresses.is_empty() {
+                existing.addresses = tunnel.addresses;
+            }
+        } else {
+            next.push(Wg {
+                name: tunnel.name,
+                private_key: tunnel.private_key,
+                listen_port: tunnel.listen_port,
+                addresses: tunnel.addresses,
+            });
+        }
+    }
+    desired.wireguard = next;
+    for route in tunnel_routes {
+        desired.routes.retain(|existing| {
+            !(existing.to == route.to && existing.dev.as_deref() == route.dev.as_deref())
+        });
+        desired.routes.push(route);
+    }
+    Ok(())
+}
+
+fn wireguard() -> HttpResponse {
+    if !Path::new(BOOTSTRAP).exists() {
+        return json_response(
+            409,
+            json!({"ok": false, "error": "complete Bootstrap first"}),
+        );
+    }
+    match complete_desired() {
+        Ok(desired) => json_response(
+            200,
+            json!({
+                "ok": true,
+                "status": "accepted",
+                "revision": desired.revision,
+                "wireguard": redacted_wireguard(&desired.wireguard),
+            }),
+        ),
+        Err(error) => json_response(502, json!({"ok": false, "error": error})),
+    }
+}
+
+fn apply_wireguard(req: &HttpRequest, authentication: Option<&Authentication>) -> HttpResponse {
+    let authentication = match operator_session(authentication) {
+        Ok(authentication) => authentication,
+        Err(response) => return response,
+    };
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct WireGuardChange {
+        base_revision: u64,
+        wireguard: Vec<WgInput>,
+    }
+    let change: WireGuardChange = match serde_json::from_slice(&req.body) {
+        Ok(change) => change,
+        Err(error) => {
+            return json_response(
+                400,
+                json!({"ok": false, "outcome": "rejected", "error": format!("invalid WireGuard change: {error}")}),
+            )
+        }
+    };
+    let path = draft_path(&authentication.principal);
+    let lock = draft_lock(&path);
+    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let snapshot = accepted_snapshot_for_drafting().ok();
+    match read_draft_reconciled(&path, &authentication.principal, snapshot.as_ref()) {
+        Ok(Some(_)) => {
+            return json_response(
+                409,
+                json!({
+                    "ok": false, "outcome": "rejected",
+                    "error": "Private pending draft exists; review and apply or reconcile it first"
+                }),
+            )
+        }
+        Ok(None) => (),
+        Err(error) => return json_response(502, json!({"ok": false, "error": error})),
+    }
+    let mut desired = match complete_desired() {
+        Ok(desired) => desired,
+        Err(error) => return json_response(502, json!({"ok": false, "error": error})),
+    };
+    if desired.revision != change.base_revision {
+        return json_response(
+            409,
+            json!({"ok": false, "outcome": "rejected", "revision": desired.revision,
+            "error": "Accepted Desired state changed; reload before applying"}),
+        );
+    }
+    let preserved = desired.wireguard.clone();
+    if let Err(error) = store_wireguard(&mut desired, change.wireguard, &preserved) {
+        return json_response(
+            400,
+            json!({"ok": false, "outcome": "rejected", "error": error}),
+        );
+    }
     submit_desired_apply(desired, change.base_revision, &authentication.principal)
 }
 
@@ -2694,6 +2889,7 @@ mod tests {
             Some(vec!["enp1s0".into()]),
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(sections, vec!["interfaces".to_string()]);
@@ -2717,6 +2913,7 @@ mod tests {
                 via: "198.51.100.2".into(),
                 dev: Some("enp2s0".into()),
             }]),
+            None,
             None,
             None,
             None,
@@ -2768,6 +2965,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(accepted.interfaces[0].addresses, vec!["10.1.0.1/24".to_string()]);
@@ -2777,6 +2975,7 @@ mod tests {
             &mut accepted,
             &["routes".into(), "interfaces".into()],
             Some(routes),
+            None,
             None,
             None,
             None,
@@ -2802,6 +3001,7 @@ mod tests {
                 wan_pd: String::new(),
             }),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(desired.routes[0].to, "198.51.100.0/24");
@@ -2812,6 +3012,63 @@ mod tests {
             sections,
             vec!["interfaces".to_string(), "services".to_string()]
         );
+    }
+
+    #[test]
+    fn wireguard_edit_keeps_an_omitted_private_key_and_other_settings() {
+        let mut desired = sample_state();
+        desired.wireguard.push(Wg {
+            name: "wg0".into(),
+            private_key: "yAnz5TF+lXXJte14tji3dzMe2arW8mOcy4V+1RU4hQE=".into(),
+            listen_port: Some(51820),
+            addresses: vec!["10.13.13.1/24".into()],
+        });
+        desired.wireguard.push(Wg {
+            name: "wg1".into(),
+            private_key: "another-key".into(),
+            listen_port: Some(1),
+            addresses: vec!["10.13.14.1/24".into()],
+        });
+        let preserved = desired.wireguard.clone();
+        store_wireguard(
+            &mut desired,
+            vec![WgInput {
+                name: "wg0".into(),
+                private_key: String::new(),
+                listen_port: Some(51821),
+                addresses: vec!["10.13.13.1/24".into()],
+                route_to: "198.51.100.0/24".into(),
+                route_via: "10.13.13.2".into(),
+            }],
+            &preserved,
+        )
+        .unwrap();
+        assert_eq!(
+            desired.wireguard[0].private_key,
+            "yAnz5TF+lXXJte14tji3dzMe2arW8mOcy4V+1RU4hQE="
+        );
+        assert_eq!(desired.wireguard[0].listen_port, Some(51821));
+        assert_eq!(desired.wireguard[1].private_key, "another-key");
+        assert_eq!(desired.routes[1].dev.as_deref(), Some("wg0"));
+        let preserved = desired.wireguard.clone();
+        let err = store_wireguard(
+            &mut desired,
+            vec![WgInput {
+                name: "wg0".into(),
+                private_key: String::new(),
+                listen_port: None,
+                addresses: Vec::new(),
+                route_to: String::new(),
+                route_via: "10.13.13.2".into(),
+            }],
+            &preserved,
+        )
+        .unwrap_err();
+        assert!(err.contains("destination and a next hop"), "{err}");
+        assert_eq!(desired.nft_extra, vec!["ip saddr 203.0.113.50 drop".to_string()]);
+        let shown = serde_json::to_string(&redacted_wireguard(&desired.wireguard)).unwrap();
+        assert!(!shown.contains("yAnz5TF"));
+        assert!(shown.contains("\"private_key_set\":true"));
     }
 
     #[test]

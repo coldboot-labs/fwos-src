@@ -1765,7 +1765,14 @@ fn validate(state: &DesiredState) -> Result<(), String> {
     )?;
     lan_services_match_interface(state)?;
     validate_policy(state)?;
+    let mut wireguard_names = HashSet::new();
     for wg in &state.wireguard {
+        if !wireguard_names.insert(wg.name.clone()) {
+            return Err(format!("duplicate WireGuard {}", wg.name));
+        }
+        if wg.listen_port == Some(0) {
+            return Err(format!("WireGuard {} needs a usable listen port", wg.name));
+        }
         bootstrap_values::interface(&wg.name, None, None, &wg.addresses)?;
         let key = base64::engine::general_purpose::STANDARD
             .decode(&wg.private_key)
@@ -1848,7 +1855,9 @@ fn validate(state: &DesiredState) -> Result<(), String> {
             ));
         }
         if let Some(dev) = route.dev.as_deref() {
-            if !state.interfaces.iter().any(|iface| iface.name == dev) {
+            let known = state.interfaces.iter().any(|iface| iface.name == dev)
+                || state.wireguard.iter().any(|tunnel| tunnel.name == dev);
+            if !known {
                 return Err(format!("route {} uses unknown interface {dev}", route.to));
             }
         }
@@ -1959,6 +1968,18 @@ fn route_next_hop_on_link(state: &DesiredState, gateway: IpAddr, device: Option<
             }
         }
         if addresses
+            .iter()
+            .any(|address| gateway_in_cidr(gateway, address))
+        {
+            return true;
+        }
+    }
+    for tunnel in &state.wireguard {
+        if device.is_some_and(|name| name != tunnel.name) {
+            continue;
+        }
+        if tunnel
+            .addresses
             .iter()
             .any(|address| gateway_in_cidr(gateway, address))
         {
@@ -3662,6 +3683,26 @@ mod tests {
         let unbound = unbound_conf("192.168.1.1", "192.168.1.0/24");
         assert!(unbound.contains("interface: 192.168.1.1"), "{unbound}");
         assert!(!unbound.contains("10.0.2.15"), "{unbound}");
+    }
+
+    #[test]
+    fn wireguard_route_uses_the_tunnel_address() {
+        let mut state = wan_lan();
+        state.wireguard.push(fwos_fwd_setup::desired::Wg {
+            name: "wg0".into(),
+            private_key: "yAnz5TF+lXXJte14tji3dzMe2arW8mOcy4V+1RU4hQE=".into(),
+            listen_port: Some(51820),
+            addresses: vec!["10.13.13.1/24".into()],
+        });
+        state.routes.push(fwos_fwd_setup::desired::StaticRoute {
+            to: "198.51.100.0/24".into(),
+            via: "10.13.13.2".into(),
+            dev: Some("wg0".into()),
+        });
+        assert!(validate(&state).is_ok(), "{:?}", validate(&state).err());
+        state.wireguard[0].private_key = "not-a-key".into();
+        let err = validate(&state).unwrap_err();
+        assert!(err.contains("invalid private key"), "{err}");
     }
 
     #[test]

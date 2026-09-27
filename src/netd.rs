@@ -502,6 +502,7 @@ fn handle_cmd(v: &Value) -> String {
             Ok(qdiscs) => json!({"ok": true, "qdiscs": qdiscs}).to_string(),
             Err(error) => json!({"ok": false, "error": error}).to_string(),
         },
+        "validate_desired" => validate_desired_request(v.get("desired").unwrap_or(&Value::Null)).to_string(),
         "was_draft_accepted" => was_draft_accepted(v).to_string(),
         "confirm_apply" => confirm_apply(v).to_string(),
         "restore_previous" => {
@@ -792,6 +793,26 @@ fn restore_previous_request(actor: Option<Principal>) -> Value {
     )
 }
 
+/// Every check a proposed complete Desired state passes before any apply mutates.
+fn check_proposed(proposed: &DesiredState) -> Result<(), String> {
+    validate(proposed)?;
+    nft_check(&nft_rules(proposed))
+}
+
+/// Validate a complete Desired state, such as an import, without applying it.
+fn validate_desired_request(input: &Value) -> Value {
+    let proposed: DesiredState = match serde_json::from_value(input.clone()) {
+        Ok(state) => state,
+        Err(error) => {
+            return json!({"ok": false, "outcome": "rejected", "error": format!("invalid complete Desired state: {error}")})
+        }
+    };
+    match check_proposed(&proposed) {
+        Ok(()) => json!({"ok": true}),
+        Err(error) => json!({"ok": false, "outcome": "rejected", "error": error}),
+    }
+}
+
 fn apply_desired_request(
     input: &Value,
     base_revision: Option<u64>,
@@ -816,10 +837,7 @@ fn apply_desired_request(
             return json!({"ok": false, "outcome": "rejected", "revision": current.revision, "error": format!("invalid complete Desired state: {error}")})
         }
     };
-    if let Err(error) = validate(&proposed) {
-        return json!({"ok": false, "outcome": "rejected", "revision": current.revision, "error": error});
-    }
-    if let Err(error) = nft_check(&nft_rules(&proposed)) {
+    if let Err(error) = check_proposed(&proposed) {
         return json!({"ok": false, "outcome": "rejected", "revision": current.revision, "error": error});
     }
     let Some(next_revision) = current.revision.checked_add(1) else {
@@ -3625,6 +3643,21 @@ mod tests {
         assert!(v.get("op").and_then(Value::as_str).is_some());
         let desired = serde_json::from_value::<DesiredState>(v.clone());
         assert!(desired.is_err());
+    }
+
+    #[test]
+    fn validate_desired_rejects_an_invalid_import_before_any_apply() {
+        for desired in [
+            json!({"wireguard": [{"name": "wg0", "private_key": "not-a-key"}]}),
+            json!({"administrators": ["mallory"]}),
+        ] {
+            let reply: Value = serde_json::from_str(&handle_cmd(
+                &json!({"op": "validate_desired", "desired": desired}),
+            ))
+            .unwrap();
+            assert_eq!(reply["ok"], false, "{reply}");
+            assert_eq!(reply["outcome"], "rejected", "{reply}");
+        }
     }
 
     #[test]

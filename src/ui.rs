@@ -527,6 +527,8 @@ fn dispatch(req: &HttpRequest) -> HttpResponse {
         ("POST", "/api/draft/save") => save_draft(req, authentication.as_ref()),
         ("POST", "/api/draft/apply") => apply_draft(req, authentication.as_ref()),
         ("POST", "/api/draft/reconcile") => reconcile_draft(req, authentication.as_ref()),
+        ("POST", "/api/desired-state/export") => export_desired(req, authentication.as_ref()),
+        ("POST", "/api/desired-state/import") => import_desired(req, authentication.as_ref()),
         ("POST", "/api/routes/apply") => apply_routes(req, authentication.as_ref()),
         ("POST", "/api/routes/save-and-apply") => {
             save_and_apply_route(req, authentication.as_ref())
@@ -1469,6 +1471,8 @@ fn draft_status(authentication: Option<&Authentication>) -> HttpResponse {
                 "wireguard": redacted_wireguard(&draft.desired.wireguard),
                 "qdiscs": draft.desired.qdiscs,
                 "ipv6": wan_ipv6_settings(&draft.desired),
+                "hostname": draft.desired.hostname,
+                "apply_confirmation": draft.desired.apply_confirmation,
             }),
         ),
         None => json_response(
@@ -1787,7 +1791,7 @@ fn reconcile_draft(req: &HttpRequest, authentication: Option<&Authentication>) -
             json!({"ok": false, "error": "Draft changed; review it again"}),
         );
     }
-    let mut accepted = match snapshot {
+    let accepted = match snapshot {
         Ok(desired) => desired,
         Err(error) => return json_response(502, json!({"ok": false, "error": error})),
     };
@@ -1798,15 +1802,51 @@ fn reconcile_draft(req: &HttpRequest, authentication: Option<&Authentication>) -
             json!({"ok": false, "error": "Accepted revision changed; review reconciliation again"}),
         );
     }
-    let sections = effective_sections(&previous);
+    let desired = match reconciled_desired(&previous, accepted, request) {
+        Ok(desired) => desired,
+        Err(error) => return json_response(409, json!({"ok": false, "error": error})),
+    };
+    let version = match identity::random_token() {
+        Ok(version) => version,
+        Err(error) => return json_response(502, json!({"ok": false, "error": error})),
+    };
+    let draft = Draft {
+        base_revision: desired.revision,
+        version,
+        desired,
+        sections: effective_sections(&previous),
+        wireguard_edits: previous.wireguard_edits,
+    };
+    if let Err(error) = write_draft(&path, &draft) {
+        return json_response(502, json!({"ok": false, "error": error}));
+    }
+    json_response(
+        200,
+        json!({"ok": true, "status": "pending", "base_revision": draft.base_revision, "version": draft.version}),
+    )
+}
+
+fn reconciled_desired(
+    previous: &Draft,
+    mut accepted: DesiredState,
+    request: DraftReconciliation,
+) -> Result<DesiredState, String> {
+    let sections = effective_sections(previous);
+    // An import proposes the whole network, so reviewing it against a newer
+    // base carries it, with any edits saved on top, instead of merging.
+    if sections.iter().any(|section| section == "import") {
+        let mut desired = previous.desired.clone();
+        desired.revision = accepted.revision;
+        return Ok(desired);
+    }
     let mut reviewed_wireguard = request.wireguard;
     if sections.iter().any(|section| section == "wireguard") {
-        carry_wireguard_edits(&mut accepted, &previous);
+        carry_wireguard_edits(&mut accepted, previous);
         if let Some(tunnels) = reviewed_wireguard.as_mut() {
-            tunnels.retain(|tunnel| edited_tunnel(&previous, &tunnel.name));
+            tunnels.retain(|tunnel| edited_tunnel(previous, &tunnel.name));
         }
     }
-    if let Err(error) = apply_reviewed_sections(
+    apply_reviewed_sections(
         &mut accepted,
         &sections,
         request.routes,
@@ -1817,20 +1857,166 @@ fn reconcile_draft(req: &HttpRequest, authentication: Option<&Authentication>) -
         reviewed_wireguard,
         request.qdiscs,
         request.ipv6,
+    )?;
+    Ok(accepted)
+}
+
+const EXPORT_FORMAT: &str = "fwos-network-desired-state";
+const EXPORT_FORMAT_VERSION: u32 = 1;
+const EXPORT_WARNING: &str = "\
+# SENSITIVE: plaintext FWOS network Desired state export.
+# It contains network secrets such as WireGuard private keys; store it like a password.
+# It contains no administrator accounts, passwords, or Authentication settings.
+";
+
+/// The file an administrator exports and imports. Unknown keys are rejected,
+/// so a file cannot carry Identity configuration into a network import.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NetworkExport {
+    format: String,
+    format_version: u32,
+    desired: DesiredState,
+}
+
+fn network_export(desired: &DesiredState) -> Result<String, String> {
+    let file = NetworkExport {
+        format: EXPORT_FORMAT.into(),
+        format_version: EXPORT_FORMAT_VERSION,
+        desired: desired.clone(),
+    };
+    let body = toml::to_string(&file).map_err(|_| "encode network export")?;
+    Ok(format!("{EXPORT_WARNING}{body}"))
+}
+
+fn parse_network_export(text: &str) -> Result<DesiredState, String> {
+    let file: NetworkExport =
+        toml::from_str(text).map_err(|error| format!("invalid network export: {}", error.message()))?;
+    if file.format != EXPORT_FORMAT || file.format_version != EXPORT_FORMAT_VERSION {
+        return Err(format!(
+            "not an FWOS network Desired state export (format version {EXPORT_FORMAT_VERSION})"
+        ));
+    }
+    Ok(file.desired)
+}
+
+/// A private draft proposing the imported network in full on the Accepted base.
+fn imported_draft(mut desired: DesiredState, base_revision: u64, version: String) -> Draft {
+    desired.revision = base_revision;
+    let wireguard_edits = desired.wireguard.iter().map(|tunnel| tunnel.name.clone()).collect();
+    Draft {
+        base_revision,
+        version,
+        desired,
+        sections: vec!["import".into()],
+        wireguard_edits,
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExportRequest {
+    acknowledge_sensitive: bool,
+}
+
+fn export_desired(req: &HttpRequest, authentication: Option<&Authentication>) -> HttpResponse {
+    if let Err(response) = operator_session(authentication) {
+        return response;
+    }
+    let request: ExportRequest = match serde_json::from_slice(&req.body) {
+        Ok(request) => request,
+        Err(_) => return json_response(400, json!({"ok": false, "error": "invalid export request"})),
+    };
+    if !request.acknowledge_sensitive {
+        return json_response(
+            400,
+            json!({"ok": false, "error": "acknowledge that the export contains network secrets"}),
+        );
+    }
+    let desired = match complete_desired() {
+        Ok(desired) => desired,
+        Err(error) => return json_response(502, json!({"ok": false, "error": error})),
+    };
+    match network_export(&desired) {
+        Ok(content) => json_response(
+            200,
+            json!({
+                "ok": true, "revision": desired.revision,
+                "filename": format!("fwos-network-r{}.toml", desired.revision),
+                "content": content,
+            }),
+        ),
+        Err(error) => json_response(502, json!({"ok": false, "error": error})),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImportRequest {
+    base_revision: u64,
+    content: String,
+}
+
+fn import_desired(req: &HttpRequest, authentication: Option<&Authentication>) -> HttpResponse {
+    let authentication = match operator_session(authentication) {
+        Ok(authentication) => authentication,
+        Err(response) => return response,
+    };
+    let request: ImportRequest = match serde_json::from_slice(&req.body) {
+        Ok(request) => request,
+        Err(_) => return json_response(400, json!({"ok": false, "error": "invalid network import"})),
+    };
+    let imported = match parse_network_export(&request.content) {
+        Ok(imported) => imported,
+        Err(error) => {
+            return json_response(400, json!({"ok": false, "outcome": "rejected", "error": error}))
+        }
+    };
+    // The same checks netd runs before an apply; nothing live changes here.
+    match netd_cmd_with_timeout(
+        &json!({"op": "validate_desired", "desired": imported}),
+        Duration::from_secs(30),
     ) {
-        return json_response(409, json!({"ok": false, "error": error}));
+        Ok(reply) if reply["ok"] == true => (),
+        Ok(reply) => {
+            return json_response(
+                400,
+                json!({"ok": false, "outcome": "rejected",
+                    "error": reply["error"].as_str().unwrap_or("imported Desired state is invalid")}),
+            )
+        }
+        Err(error) => return json_response(502, json!({"ok": false, "error": error})),
+    }
+    let path = draft_path(&authentication.principal);
+    let lock = draft_lock(&path);
+    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let accepted = match accepted_snapshot_for_drafting() {
+        Ok(accepted) => accepted,
+        Err(error) => return json_response(502, json!({"ok": false, "error": error})),
+    };
+    match read_draft_reconciled(&path, &authentication.principal, Some(&accepted)) {
+        Ok(Some(_)) => {
+            return json_response(
+                409,
+                json!({"ok": false, "outcome": "rejected",
+                    "error": "Private pending draft exists; review and apply or reconcile it before importing"}),
+            )
+        }
+        Ok(None) => (),
+        Err(error) => return json_response(502, json!({"ok": false, "error": error})),
+    }
+    if request.base_revision != accepted.revision {
+        return json_response(
+            409,
+            json!({"ok": false, "outcome": "rejected", "revision": accepted.revision,
+                "error": "Accepted Desired state changed; reload before importing"}),
+        );
     }
     let version = match identity::random_token() {
         Ok(version) => version,
         Err(error) => return json_response(502, json!({"ok": false, "error": error})),
     };
-    let draft = Draft {
-        base_revision: accepted.revision,
-        version,
-        desired: accepted,
-        sections,
-        wireguard_edits: previous.wireguard_edits,
-    };
+    let draft = imported_draft(imported, accepted.revision, version);
     if let Err(error) = write_draft(&path, &draft) {
         return json_response(502, json!({"ok": false, "error": error}));
     }
@@ -3595,5 +3781,72 @@ mod tests {
         assert_eq!(accepted.wireguard[1].private_key, "rotated-key");
         assert_eq!(accepted.wireguard[1].listen_port, Some(51831));
         assert!(!edited_tunnel(&draft, "wg1"));
+    }
+
+    const EXPORT_KEY: &str = "yAnz5TF+lXXJte14tji3dzMe2arW8mOcy4V+1RU4hQE=";
+
+    #[test]
+    fn export_carries_the_complete_network_and_a_sensitive_warning() {
+        let mut state = sample_state();
+        state.revision = 7;
+        state.wireguard = vec![tunnel("wg0", EXPORT_KEY, 51820)];
+        state.apply_confirmation = true;
+        let text = network_export(&state).unwrap();
+        assert!(text.contains(EXPORT_KEY), "restoration needs the private key: {text}");
+        assert!(text.starts_with("# SENSITIVE"), "{text}");
+        assert!(text.contains("no administrator accounts"), "{text}");
+        let imported = parse_network_export(&text).unwrap();
+        assert_eq!(
+            serde_json::to_value(&imported).unwrap(),
+            serde_json::to_value(&state).unwrap()
+        );
+    }
+
+    #[test]
+    fn import_rejects_malformed_foreign_and_identity_bearing_files() {
+        let good = network_export(&sample_state()).unwrap();
+        for bad in [
+            String::new(),
+            "not toml [".to_string(),
+            good.replace("fwos-network-desired-state", "something-else"),
+            good.replace("format_version = 1", "format_version = 2"),
+            format!("administrators = [\"mallory\"]\n{good}"),
+            good.replace("[desired]", "[desired]\npassword = \"hunter2\""),
+            good.replace("[desired]", "[desired.identity]\nadmin = \"mallory\"\n[desired]"),
+        ] {
+            assert!(parse_network_export(&bad).is_err(), "accepted: {bad}");
+        }
+    }
+
+    #[test]
+    fn imported_draft_proposes_the_whole_network_on_the_accepted_base() {
+        let mut imported = sample_state();
+        imported.revision = 99;
+        imported.wireguard = vec![tunnel("wg0", EXPORT_KEY, 51820)];
+        let draft = imported_draft(imported, 4, "v1".into());
+        assert_eq!(draft.base_revision, 4);
+        assert_eq!(draft.desired.revision, 4);
+        assert_eq!(draft.sections, vec!["import".to_string()]);
+        assert_eq!(draft.wireguard_edits, vec!["wg0".to_string()]);
+        assert_eq!(draft.desired.wireguard[0].private_key, EXPORT_KEY);
+    }
+
+    #[test]
+    fn reconciling_an_import_keeps_the_imported_network_on_the_new_base() {
+        let mut imported = sample_state();
+        imported.routes.clear();
+        let mut previous = imported_draft(imported, 4, "v1".into());
+        remember_section(&mut previous.sections, "routes");
+        let mut accepted = sample_state();
+        accepted.revision = 6;
+        accepted.hostname = Some("elsewhere".into());
+        let review = serde_json::from_value(json!({
+            "base_revision": 4, "version": "v1", "accepted_revision": 6,
+        }))
+        .unwrap();
+        let reconciled = reconciled_desired(&previous, accepted, review).unwrap();
+        assert_eq!(reconciled.revision, 6);
+        assert!(reconciled.routes.is_empty(), "the import replaces Accepted routes");
+        assert_eq!(reconciled.hostname.as_deref(), Some("fwos-box"));
     }
 }

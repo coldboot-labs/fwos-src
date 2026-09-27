@@ -10,13 +10,20 @@ use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use fwos_fwd_setup::durable;
 use fwos_fwd_setup::host_image;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 const SOCK: &str = "/var/lib/fwos/update.sock";
 const BOOTSTRAPPED: &str = "/var/lib/fwos/bootstrapped";
 const PENDING: &str = "/var/lib/fwos/health-pending";
+/// The deployments of a staged Host update, kept until its boot is accepted.
+const UPDATE_RECORD: &str = "/var/lib/fwos/host-update.json";
+/// The last post-update health outcome, for status.
+const UPDATE_OUTCOME: &str = "/var/lib/fwos/host-update-outcome.json";
+/// Asks netd to restore the pre-update Accepted revision (netd owns it).
+const RESTORE_PRE_UPDATE: &str = "/var/lib/fwos/restore-pre-update";
 const NETD_SOCK: &str = "/var/lib/fwos/netd.sock";
 const REGISTRIES_DROPIN: &str = "/etc/containers/registries.conf.d/fwos-update.conf";
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(180);
@@ -32,6 +39,12 @@ fn main() {
     match env::args().nth(1).as_deref() {
         Some("health") => {
             if let Err(err) = run_health() {
+                eprintln!("fwos-update: {err}");
+                process::exit(1);
+            }
+        }
+        Some("restore-check") => {
+            if let Err(err) = run_restore_check() {
                 eprintln!("fwos-update: {err}");
                 process::exit(1);
             }
@@ -136,8 +149,48 @@ struct Deployments {
     booted: String,
     staged: String,
     rollback: String,
+    booted_digest: String,
+    staged_digest: String,
+    rollback_digest: String,
     /// `bootc rollback` makes the rollback deployment the next boot.
     rollback_queued: bool,
+}
+
+/// One bootc deployment: its image reference and, when bootc reports it, the
+/// image digest that distinguishes two pulls of the same tag.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct DeploymentId {
+    image: String,
+    #[serde(default)]
+    digest: String,
+}
+
+impl DeploymentId {
+    fn matches(&self, image: &str, digest: &str) -> bool {
+        if !self.digest.is_empty() && !digest.is_empty() {
+            return self.digest == digest;
+        }
+        pending_is_this_boot(&self.image, image)
+    }
+}
+
+/// A staged Host update: the Release it replaces and the Release it stages.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct UpdateRecord {
+    previous: DeploymentId,
+    update: DeploymentId,
+}
+
+/// After `bootc rollback` from the update boot, the previous Release is booted
+/// and the update is its rollback deployment. A staged update that was never
+/// activated leaves an older rollback deployment instead.
+fn returned_from_update(record: &UpdateRecord, deployments: &Deployments) -> bool {
+    record
+        .previous
+        .matches(&deployments.booted, &deployments.booted_digest)
+        && record
+            .update
+            .matches(&deployments.rollback, &deployments.rollback_digest)
 }
 
 /// The Host update operation this controller is running or last failed.
@@ -210,7 +263,7 @@ fn operation_json(op: &Operation) -> Value {
     }
 }
 
-fn status_reply(deployments: &Deployments, op: &Operation) -> Value {
+fn status_reply(deployments: &Deployments, op: &Operation, last_update: Option<Value>) -> Value {
     json!({
         "ok": true,
         "reboot_required": !deployments.staged.is_empty() || deployments.rollback_queued,
@@ -218,6 +271,7 @@ fn status_reply(deployments: &Deployments, op: &Operation) -> Value {
         "staged": deployments.staged,
         "rollback": deployments.rollback,
         "operation": operation_json(op),
+        "last_update": last_update,
     })
 }
 
@@ -230,7 +284,7 @@ fn current_status() -> Value {
             Err(error) => return json!({"ok": false, "error": error}),
         },
     };
-    status_reply(&deployments, &op)
+    status_reply(&deployments, &op, read_outcome())
 }
 
 const NOT_BOOTSTRAPPED: &str = "Host update refused until Bootstrap has completed";
@@ -245,6 +299,7 @@ fn handle_request(req: Request) -> String {
             if let Err(err) = idle(&lock_operation()) {
                 return json!({"ok": false, "error": err}).to_string();
             }
+            refresh_pre_update();
             json!({"ok": true, "rebooting": true}).to_string()
         }
         "rollback" => rollback_request(),
@@ -316,15 +371,92 @@ fn start_stage_request(image: &str) -> String {
 // health-pending record is written only once a deployment is staged, so a registry or
 // download failure never makes the next boot look like a Host update boot.
 fn stage(image: &str) -> Result<(), String> {
+    // The previous Release restores this revision if the update boot fails.
+    preserve_pre_update()?;
+    let before = bootc_status()?;
     bootc_switch(image)?;
-    let staged = bootc_status()?.staged;
-    if staged.is_empty() {
+    let after = bootc_status()?;
+    if after.staged.is_empty() {
         // `bootc switch` to the booted image reference stages nothing.
         return Err(format!(
             "no deployment was staged; {image} may already be active"
         ));
     }
-    write_pending(&staged)
+    write_update_record(&UpdateRecord {
+        previous: DeploymentId {
+            image: before.booted,
+            digest: before.booted_digest,
+        },
+        update: DeploymentId {
+            image: after.staged.clone(),
+            digest: after.staged_digest,
+        },
+    })?;
+    write_pending(&after.staged)
+}
+
+fn preserve_pre_update() -> Result<(), String> {
+    match netd_cmd(&json!({"op": "preserve_pre_update"})) {
+        Ok(reply) if reply["ok"] == true => Ok(()),
+        Ok(reply) => Err(format!(
+            "could not preserve the Accepted network before the update: {}",
+            reply["error"].as_str().unwrap_or("netd refused")
+        )),
+        Err(err) => Err(format!(
+            "could not preserve the Accepted network before the update: {err}"
+        )),
+    }
+}
+
+/// Reboot activates a staged update: preserve the Accepted revision as of now,
+/// not as of staging. A failure keeps the revision preserved at staging.
+fn refresh_pre_update() {
+    if bootc_images().staged.is_empty() {
+        return;
+    }
+    if let Err(err) = preserve_pre_update() {
+        eprintln!("fwos-update: {err}; keeping the revision preserved at staging");
+    }
+}
+
+fn netd_cmd(body: &Value) -> Result<Value, String> {
+    let mut stream = UnixStream::connect(NETD_SOCK).map_err(|e| format!("connect netd: {e}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .map_err(|e| format!("netd timeout: {e}"))?;
+    stream
+        .write_all(body.to_string().as_bytes())
+        .and_then(|_| stream.shutdown(std::net::Shutdown::Write))
+        .map_err(|e| format!("write netd: {e}"))?;
+    let mut reply = Vec::new();
+    stream
+        .read_to_end(&mut reply)
+        .map_err(|e| format!("read netd: {e}"))?;
+    serde_json::from_slice(&reply).map_err(|e| format!("parse netd reply: {e}"))
+}
+
+fn write_update_record(record: &UpdateRecord) -> Result<(), String> {
+    let raw = serde_json::to_vec(record).map_err(|e| format!("encode Host update record: {e}"))?;
+    durable::write(Path::new(UPDATE_RECORD), &raw)
+}
+
+fn read_update_record() -> Option<UpdateRecord> {
+    fs::read(UPDATE_RECORD)
+        .ok()
+        .and_then(|raw| serde_json::from_slice(&raw).ok())
+}
+
+fn write_outcome(release: &str, outcome: &str, reason: Option<&str>) {
+    let record = json!({"release": release, "outcome": outcome, "reason": reason});
+    if let Err(err) = durable::write(Path::new(UPDATE_OUTCOME), record.to_string().as_bytes()) {
+        eprintln!("fwos-update: record Host update outcome: {err}");
+    }
+}
+
+fn read_outcome() -> Option<Value> {
+    fs::read(UPDATE_OUTCOME)
+        .ok()
+        .and_then(|raw| serde_json::from_slice(&raw).ok())
 }
 
 fn bootstrap_completed() -> bool {
@@ -412,8 +544,18 @@ fn deployments(status: &Value) -> Deployments {
         booted: image_ref(status, "booted"),
         staged: image_ref(status, "staged"),
         rollback: image_ref(status, "rollback"),
+        booted_digest: image_digest(status, "booted"),
+        staged_digest: image_digest(status, "staged"),
+        rollback_digest: image_digest(status, "rollback"),
         rollback_queued: status["status"]["rollbackQueued"] == true,
     }
+}
+
+fn image_digest(status: &Value, which: &str) -> String {
+    status["status"][which]["image"]["imageDigest"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
 }
 
 fn image_ref(status: &Value, which: &str) -> String {
@@ -450,47 +592,94 @@ fn wheel_gid() -> Option<u32> {
     None
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ApplianceHealth {
     Ok,
     DefaultTargetNotReached,
     FwdMissing,
     MgmtMissing,
     NetdNotRunning,
+    DesiredStateNotRestored(String),
+    UiNotRunning,
 }
 
 impl ApplianceHealth {
-    fn as_str(self) -> &'static str {
+    fn describe(&self) -> String {
         match self {
-            Self::Ok => "ok",
-            Self::DefaultTargetNotReached => "default target not reached",
-            Self::FwdMissing => "fwd missing",
-            Self::MgmtMissing => "mgmt missing",
-            Self::NetdNotRunning => "netd not running",
+            Self::Ok => "ok".into(),
+            Self::DefaultTargetNotReached => "default target not reached".into(),
+            Self::FwdMissing => "fwd missing".into(),
+            Self::MgmtMissing => "mgmt missing".into(),
+            Self::NetdNotRunning => "netd not running".into(),
+            Self::DesiredStateNotRestored(reason) => {
+                format!("Desired state not restored: {reason}")
+            }
+            Self::UiNotRunning => "UI not running".into(),
         }
     }
 }
 
-fn assess_health(default_target: bool, fwd: bool, mgmt: bool, netd: bool) -> ApplianceHealth {
-    if !default_target {
-        ApplianceHealth::DefaultTargetNotReached
-    } else if !fwd {
-        ApplianceHealth::FwdMissing
-    } else if !mgmt {
-        ApplianceHealth::MgmtMissing
-    } else if !netd {
-        ApplianceHealth::NetdNotRunning
-    } else {
-        ApplianceHealth::Ok
+/// What netd reports about restoring Accepted Desired state on this boot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NetdRestoration {
+    NotRunning,
+    Unrestored(String),
+    Restored,
+}
+
+fn netd_restoration(reply: Result<Value, String>) -> NetdRestoration {
+    match reply {
+        Err(_) => NetdRestoration::NotRunning,
+        Ok(reply) if reply["ok"] == true && reply["restored"] == true => NetdRestoration::Restored,
+        Ok(reply) => NetdRestoration::Unrestored(
+            reply["reason"]
+                .as_str()
+                .or_else(|| reply["error"].as_str())
+                .unwrap_or("netd did not report restoration")
+                .to_string(),
+        ),
     }
+}
+
+/// Upstream reachability is deliberately absent: an unplugged WAN or an ISP
+/// outage is not a failed Release.
+struct HealthChecks {
+    default_target: bool,
+    fwd: bool,
+    mgmt: bool,
+    netd: NetdRestoration,
+    ui: bool,
+}
+
+fn assess_health(checks: &HealthChecks) -> ApplianceHealth {
+    if !checks.default_target {
+        return ApplianceHealth::DefaultTargetNotReached;
+    }
+    if !checks.fwd {
+        return ApplianceHealth::FwdMissing;
+    }
+    if !checks.mgmt {
+        return ApplianceHealth::MgmtMissing;
+    }
+    match &checks.netd {
+        NetdRestoration::NotRunning => return ApplianceHealth::NetdNotRunning,
+        NetdRestoration::Unrestored(reason) => {
+            return ApplianceHealth::DesiredStateNotRestored(reason.clone())
+        }
+        NetdRestoration::Restored => (),
+    }
+    if !checks.ui {
+        return ApplianceHealth::UiNotRunning;
+    }
+    ApplianceHealth::Ok
 }
 
 fn should_auto_rollback(
     pending_this_boot: bool,
     has_rollback: bool,
-    health: ApplianceHealth,
+    health: &ApplianceHealth,
 ) -> bool {
-    pending_this_boot && has_rollback && health != ApplianceHealth::Ok
+    pending_this_boot && has_rollback && *health != ApplianceHealth::Ok
 }
 
 fn pending_is_this_boot(pending: &str, booted: &str) -> bool {
@@ -555,23 +744,26 @@ fn run_health() -> Result<(), String> {
         }
         let this_boot = pending_is_this_boot(&pending, &booted);
         let has_rollback = !rollback.is_empty();
-        let health = assess_health(
-            default_target_reached(),
-            netns_exists("fwd"),
-            netns_exists("mgmt"),
-            netd_running(),
-        );
+        let health = assess_health(&HealthChecks {
+            default_target: default_target_reached(),
+            fwd: netns_exists("fwd"),
+            mgmt: netns_exists("mgmt"),
+            netd: netd_restoration(netd_cmd(&json!({"op": "restoration_status"}))),
+            ui: unit_active("fwos-ui-mgmt.service"),
+        });
         if this_boot && health == ApplianceHealth::Ok {
+            accept_update(&booted);
             clear_pending();
             console_log("appliance health ok");
             return Ok(());
         }
         if Instant::now() >= deadline {
-            if should_auto_rollback(this_boot, has_rollback, health) {
-                console_log(&format!(
-                    "appliance health failed ({}); rolling back",
-                    health.as_str()
-                ));
+            if should_auto_rollback(this_boot, has_rollback, &health) {
+                let reason = health.describe();
+                console_log(&format!("appliance health failed ({reason}); rolling back"));
+                write_outcome(&booted, "rolled_back", Some(&reason));
+                // The previous Release restores the preserved network itself,
+                // from the Host update record this boot leaves in place.
                 bootc_rollback()?;
                 clear_pending();
                 request_reboot();
@@ -584,9 +776,47 @@ fn run_health() -> Result<(), String> {
     }
 }
 
+/// The update boot is a working appliance: the pre-update network is no longer
+/// a rollback restoration target.
+fn accept_update(booted: &str) {
+    if let Err(err) = netd_cmd(&json!({"op": "discard_pre_update"})) {
+        eprintln!("fwos-update: discard pre-update network: {err}");
+    }
+    if let Err(err) = durable::remove(Path::new(UPDATE_RECORD)) {
+        eprintln!("fwos-update: {err}");
+    }
+    write_outcome(booted, "accepted", None);
+}
+
+/// Before netd starts: on the previous Release after a rollback from the
+/// update boot, ask netd to restore the network preserved before the update.
+fn run_restore_check() -> Result<(), String> {
+    let Some(record) = read_update_record() else {
+        return Ok(());
+    };
+    let deployments = bootc_status()?;
+    if !returned_from_update(&record, &deployments) {
+        return Ok(());
+    }
+    durable::write(
+        Path::new(RESTORE_PRE_UPDATE),
+        record.update.image.as_bytes(),
+    )?;
+    durable::remove(Path::new(UPDATE_RECORD))?;
+    console_log(&format!(
+        "Host update to {} was rolled back; restoring the pre-update network",
+        record.update.image
+    ));
+    Ok(())
+}
+
 fn default_target_reached() -> bool {
+    unit_active("default.target")
+}
+
+fn unit_active(unit: &str) -> bool {
     Command::new("systemctl")
-        .args(["is-active", "--quiet", "default.target"])
+        .args(["is-active", "--quiet", unit])
         .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
         .status()
         .map(|s| s.success())
@@ -595,10 +825,6 @@ fn default_target_reached() -> bool {
 
 fn netns_exists(name: &str) -> bool {
     Path::new("/run/netns").join(name).exists()
-}
-
-fn netd_running() -> bool {
-    UnixStream::connect(NETD_SOCK).is_ok()
 }
 
 fn console_log(msg: &str) {
@@ -635,6 +861,7 @@ mod tests {
                 ..Deployments::default()
             },
             &Operation::Idle,
+            None,
         );
         assert_eq!(reply["ok"], true);
         assert_eq!(reply["booted"], "a:1");
@@ -711,7 +938,8 @@ mod tests {
     #[test]
     fn staged_or_queued_rollback_deployments_require_a_reboot() {
         let idle = Operation::Idle;
-        let status = |v: Value| status_reply(&deployments(&v), &idle)["reboot_required"].clone();
+        let status =
+            |v: Value| status_reply(&deployments(&v), &idle, None)["reboot_required"].clone();
         let booted = json!({"status": {"booted": {"image": {"image": {"image": "a:1"}}}}});
         assert_eq!(status(booted), false);
         let staged = json!({"status": {"staged": {"image": {"image": {"image": "a:2"}}}}});
@@ -749,25 +977,133 @@ mod tests {
         assert_eq!(missing_pending_record("", ""), None);
     }
 
+    fn checks() -> HealthChecks {
+        HealthChecks {
+            default_target: true,
+            fwd: true,
+            mgmt: true,
+            netd: NetdRestoration::Restored,
+            ui: true,
+        }
+    }
+
     #[test]
-    fn appliance_health_is_target_netns_and_netd_not_desired_state() {
-        assert_eq!(assess_health(true, true, true, true), ApplianceHealth::Ok);
+    fn appliance_health_requires_restored_desired_state_and_local_services() {
+        assert_eq!(assess_health(&checks()), ApplianceHealth::Ok);
+        let failed = |change: fn(&mut HealthChecks)| {
+            let mut checks = checks();
+            change(&mut checks);
+            assess_health(&checks)
+        };
         assert_eq!(
-            assess_health(false, true, true, true),
+            failed(|c| c.default_target = false),
             ApplianceHealth::DefaultTargetNotReached
         );
+        assert_eq!(failed(|c| c.fwd = false), ApplianceHealth::FwdMissing);
+        assert_eq!(failed(|c| c.mgmt = false), ApplianceHealth::MgmtMissing);
         assert_eq!(
-            assess_health(true, false, true, true),
-            ApplianceHealth::FwdMissing
-        );
-        assert_eq!(
-            assess_health(true, true, false, true),
-            ApplianceHealth::MgmtMissing
-        );
-        assert_eq!(
-            assess_health(true, true, true, false),
+            failed(|c| c.netd = NetdRestoration::NotRunning),
             ApplianceHealth::NetdNotRunning
         );
+        // A running netd that has not restored the network and its LAN
+        // services is not a working appliance.
+        assert_eq!(
+            failed(|c| c.netd = NetdRestoration::Unrestored("LAN services failed".into())),
+            ApplianceHealth::DesiredStateNotRestored("LAN services failed".into())
+        );
+        assert_eq!(failed(|c| c.ui = false), ApplianceHealth::UiNotRunning);
+    }
+
+    #[test]
+    fn netd_restoration_reply_is_read_strictly() {
+        let restored = json!({"ok": true, "restored": true, "revision": 3});
+        assert_eq!(netd_restoration(Ok(restored)), NetdRestoration::Restored);
+        let unrestored =
+            json!({"ok": true, "restored": false, "reason": "LAN services are starting"});
+        assert_eq!(
+            netd_restoration(Ok(unrestored)),
+            NetdRestoration::Unrestored("LAN services are starting".into())
+        );
+        let unknown = json!({"ok": false, "error": "unknown op restoration_status"});
+        assert!(matches!(
+            netd_restoration(Ok(unknown)),
+            NetdRestoration::Unrestored(_)
+        ));
+        assert_eq!(
+            netd_restoration(Err("connect: refused".into())),
+            NetdRestoration::NotRunning
+        );
+    }
+
+    fn id(image: &str, digest: &str) -> DeploymentId {
+        DeploymentId {
+            image: image.into(),
+            digest: digest.into(),
+        }
+    }
+
+    #[test]
+    fn a_rollback_from_the_update_boot_is_recognized_on_the_previous_release() {
+        let record = UpdateRecord {
+            previous: id("localhost/fwos:dev", "sha256:a"),
+            update: id("10.0.2.2:5000/fwos:next", "sha256:b"),
+        };
+        let back = Deployments {
+            booted: "localhost/fwos:dev".into(),
+            booted_digest: "sha256:a".into(),
+            rollback: "10.0.2.2:5000/fwos:next".into(),
+            rollback_digest: "sha256:b".into(),
+            ..Deployments::default()
+        };
+        assert!(returned_from_update(&record, &back));
+        // The update boot itself, and a previous Release whose staged update
+        // was never activated, are not a return from the update.
+        let update_boot = Deployments {
+            booted: "10.0.2.2:5000/fwos:next".into(),
+            booted_digest: "sha256:b".into(),
+            rollback: "localhost/fwos:dev".into(),
+            rollback_digest: "sha256:a".into(),
+            ..Deployments::default()
+        };
+        assert!(!returned_from_update(&record, &update_boot));
+        let never_activated = Deployments {
+            rollback: "10.0.2.2:5000/fwos:next".into(),
+            rollback_digest: "sha256:older".into(),
+            ..back.clone()
+        };
+        assert!(!returned_from_update(&record, &never_activated));
+        // Without digests, image references decide.
+        let refs = UpdateRecord {
+            previous: id("localhost/fwos:dev", ""),
+            update: id("docker://10.0.2.2:5000/fwos:next", ""),
+        };
+        assert!(returned_from_update(&refs, &back));
+    }
+
+    #[test]
+    fn host_update_outcome_is_reported_in_status() {
+        let outcome = json!({"release": "10.0.2.2:5000/fwos:next", "outcome": "rolled_back",
+            "reason": "Desired state not restored: LAN services failed"});
+        let reply = status_reply(
+            &Deployments::default(),
+            &Operation::Idle,
+            Some(outcome.clone()),
+        );
+        assert_eq!(reply["last_update"], outcome);
+        let reply = status_reply(&Deployments::default(), &Operation::Idle, None);
+        assert_eq!(reply["last_update"], Value::Null);
+    }
+
+    #[test]
+    fn bootc_status_reports_deployment_digests() {
+        let status = json!({"status": {
+            "booted": {"image": {"image": {"image": "localhost/fwos:dev"}, "imageDigest": "sha256:a"}},
+            "rollback": {"image": {"image": {"image": "localhost/fwos:old"}, "imageDigest": "sha256:0"}}
+        }});
+        let found = deployments(&status);
+        assert_eq!(found.booted_digest, "sha256:a");
+        assert_eq!(found.rollback_digest, "sha256:0");
+        assert_eq!(found.staged_digest, "");
     }
 
     #[test]
@@ -775,28 +1111,28 @@ mod tests {
         assert!(!should_auto_rollback(
             false,
             true,
-            ApplianceHealth::NetdNotRunning
+            &ApplianceHealth::NetdNotRunning
         ));
         assert!(!should_auto_rollback(
             true,
             false,
-            ApplianceHealth::NetdNotRunning
+            &ApplianceHealth::NetdNotRunning
         ));
-        assert!(!should_auto_rollback(true, true, ApplianceHealth::Ok));
+        assert!(!should_auto_rollback(true, true, &ApplianceHealth::Ok));
         assert!(should_auto_rollback(
             true,
             true,
-            ApplianceHealth::NetdNotRunning
-        ));
-        assert!(should_auto_rollback(
-            true,
-            true,
-            ApplianceHealth::FwdMissing
+            &ApplianceHealth::NetdNotRunning
         ));
         assert!(should_auto_rollback(
             true,
             true,
-            ApplianceHealth::DefaultTargetNotReached
+            &ApplianceHealth::FwdMissing
+        ));
+        assert!(should_auto_rollback(
+            true,
+            true,
+            &ApplianceHealth::DesiredStateNotRestored("LAN services failed".into())
         ));
     }
 

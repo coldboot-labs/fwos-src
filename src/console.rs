@@ -380,10 +380,22 @@ fn admin_handle_with_principal(
             write_cmd(out, super::update_client(rest))?;
             Ok(AdminAct::Continue)
         }
+        "rollback-image" => {
+            if !rest.is_empty() {
+                writeln!(out, "usage: rollback-image").map_err(|e| e.to_string())?;
+                out.flush().map_err(|e| e.to_string())?;
+                return Ok(AdminAct::Continue);
+            }
+            write!(out, "{}", describe_image_rollback(super::rollback_client()))
+                .map_err(|e| e.to_string())?;
+            out.flush().map_err(|e| e.to_string())?;
+            Ok(AdminAct::Continue)
+        }
         "reboot" => {
             write_cmd(out, super::reboot_client())?;
             Ok(AdminAct::Continue)
         }
+        // Legacy JSON adapter for the same Host update program operation.
         "rollback" => {
             write_cmd(out, super::rollback_client())?;
             Ok(AdminAct::Continue)
@@ -410,8 +422,130 @@ fn write_cmd(out: &mut impl Write, result: Result<String, String>) -> Result<(),
 }
 
 fn print_admin_help(out: &mut impl Write) -> Result<(), String> {
-    writeln!(out, "status\nrestore-previous\nreboot\nhelp\nlogout").map_err(|e| e.to_string())?;
+    write!(
+        out,
+        "\
+status            appliance, network revision, and Host image status
+restore-previous  restore the previous Accepted network revision; the Host image is unchanged
+rollback-image    boot the previous Host image at the next reboot; the network is unchanged
+reboot            reboot, activating a staged Host update or a queued Host image rollback
+help
+logout
+"
+    )
+    .map_err(|e| e.to_string())?;
     out.flush().map_err(|e| e.to_string())
+}
+
+/// The outcome of a manual Host image rollback request to the Host update
+/// program, and the explicit reboot it needs. The rollback changes only the
+/// bootc deployment: network revisions and Identity configuration stay.
+fn describe_image_rollback(result: Result<String, String>) -> String {
+    let reply = match result.and_then(|raw| {
+        serde_json::from_str::<serde_json::Value>(&raw)
+            .map_err(|e| format!("unreadable Host update program reply: {e}"))
+    }) {
+        Ok(reply) => reply,
+        Err(err) => {
+            return format!(
+                "Host image rollback failed: {err}\nThe running Host image and network are unchanged.\n"
+            )
+        }
+    };
+    let text = |key: &str| reply[key].as_str().unwrap_or_default().to_string();
+    if reply["ok"] != true {
+        let error = reply["error"]
+            .as_str()
+            .unwrap_or("refused by the Host update program");
+        return format!(
+            "Host image rollback refused: {error}\nThe running Host image and network are unchanged.\n"
+        );
+    }
+    if reply["rollback_queued"] != true {
+        return format!(
+            "Host image rollback cancelled: the next boot runs the current Host image {}.\nNo reboot is required.\n",
+            text("booted")
+        );
+    }
+    let mut s = format!(
+        "Host image rollback queued: the next boot runs the previous Host image {}.\n\
+         The current Host image {} stays active until then.\n",
+        text("rollback"),
+        text("booted")
+    );
+    if let Some(discarded) = reply["discarded_staged"].as_str() {
+        s.push_str(&format!(
+            "The staged Host update {discarded} was discarded.\n"
+        ));
+    }
+    s.push_str(
+        "Reboot required: enter reboot to boot the previous Host image.\n\
+         The Accepted network revision is unchanged; restore-previous restores the previous network revision separately.\n\
+         Current administrator accounts and passwords stay in effect.\n",
+    );
+    s
+}
+
+/// Host image lines of the recovery status, from the Host update program.
+fn write_host_image_status(out: &mut impl Write, v: &serde_json::Value) -> Result<(), String> {
+    let text = |key: &str| {
+        v[key]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let mut s = String::from("Host image (bootc deployments):\n");
+    for key in ["booted", "staged", "rollback"] {
+        if let Some(image) = text(key) {
+            s.push_str(&format!("  {key}: {image}\n"));
+        }
+    }
+    match (text("rollback"), v["rollback_queued"] == true) {
+        (Some(previous), true) => s.push_str(&format!(
+            "Host image rollback queued: the next boot runs {previous}\n"
+        )),
+        (Some(previous), false) => s.push_str(&format!(
+            "Previous Host image available for rollback-image: {previous}\n"
+        )),
+        (None, _) => s.push_str("No previous Host image is available for rollback-image\n"),
+    }
+    if let (Some(staged), false) = (text("staged"), v["rollback_queued"] == true) {
+        s.push_str(&format!(
+            "Host update staged: the next boot runs {staged}\n"
+        ));
+    }
+    if v["reboot_required"] == true {
+        s.push_str("Reboot required: enter reboot to activate it\n");
+    }
+    let last = &v["last_update"];
+    if let Some(release) = last["release"].as_str() {
+        let outcome = match last["outcome"].as_str() {
+            Some("accepted") => "accepted".to_string(),
+            Some("rolled_back") => format!(
+                "rolled back ({})",
+                last["reason"].as_str().unwrap_or("no reason recorded")
+            ),
+            other => other.unwrap_or("unknown").to_string(),
+        };
+        let network = &last["network"];
+        let network = match network["outcome"].as_str() {
+            Some("restored") => format!(
+                "; pre-update network restored as Accepted revision {}",
+                network["revision"]
+            ),
+            Some("unchanged") => format!(
+                "; pre-update network remained Accepted (revision {})",
+                network["revision"]
+            ),
+            Some("failed") => format!(
+                "; pre-update network not restored: {}",
+                network["error"].as_str().unwrap_or("unknown error")
+            ),
+            _ => String::new(),
+        };
+        s.push_str(&format!("Last Host update: {release} {outcome}{network}\n"));
+    }
+    write!(out, "{s}").map_err(|e| e.to_string())
 }
 
 fn print_admin_status(out: &mut impl Write) -> Result<(), String> {
@@ -583,15 +717,7 @@ fn print_admin_status(out: &mut impl Write) -> Result<(), String> {
     .map_err(|e| e.to_string())?;
     if let Ok(raw) = super::update_status() {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
-            for key in ["booted", "staged", "rollback"] {
-                if let Some(s) = v
-                    .get(key)
-                    .and_then(|x| x.as_str())
-                    .filter(|s| !s.is_empty())
-                {
-                    writeln!(out, "{key}: {s}").map_err(|e| e.to_string())?;
-                }
-            }
+            write_host_image_status(out, &v)?;
         }
     }
     out.flush().map_err(|e| e.to_string())
@@ -843,7 +969,145 @@ mod tests {
         assert!(!s.contains("apply <"));
         assert!(!s.contains("show"));
         assert!(!s.contains("update <image>"));
-        assert!(!s.contains("rollback"));
+        assert!(!s.lines().any(|l| l.trim() == "rollback"));
+    }
+
+    #[test]
+    fn admin_help_distinguishes_network_restoration_from_image_rollback() {
+        let mut out = Vec::new();
+        print_admin_help(&mut out).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        let line = |cmd: &str| {
+            s.lines()
+                .find(|l| l.split_whitespace().next() == Some(cmd))
+                .unwrap_or_else(|| panic!("{cmd} missing from help: {s}"))
+                .to_string()
+        };
+        let restore = line("restore-previous");
+        assert!(restore.contains("network revision"), "{restore}");
+        assert!(restore.contains("Host image is unchanged"), "{restore}");
+        let rollback = line("rollback-image");
+        assert!(rollback.contains("previous Host image"), "{rollback}");
+        assert!(rollback.contains("network is unchanged"), "{rollback}");
+        assert!(line("reboot").contains("Host image rollback"));
+        // The legacy JSON adapter is callable but not the menu entry.
+        assert!(!s.lines().any(|l| l.trim() == "rollback"), "{s}");
+    }
+
+    #[test]
+    fn image_rollback_outcome_names_the_next_boot_and_the_required_reboot() {
+        let queued = serde_json::json!({"ok": true, "reboot_required": true,
+            "rollback_queued": true, "booted": "reg/fwos:next", "staged": "",
+            "rollback": "localhost/fwos:dev"});
+        let s = describe_image_rollback(Ok(queued.to_string()));
+        assert!(s.contains("Host image rollback queued"), "{s}");
+        assert!(s.contains("localhost/fwos:dev"), "{s}");
+        assert!(s.contains("reg/fwos:next"), "{s}");
+        assert!(s.contains("Reboot required: enter reboot"), "{s}");
+        assert!(s.contains("Accepted network revision is unchanged"), "{s}");
+        assert!(s.contains("restore-previous"), "{s}");
+        assert!(s.contains("administrator"), "{s}");
+        assert!(!s.contains("discarded"), "{s}");
+
+        let discarded = serde_json::json!({"ok": true, "reboot_required": true,
+            "rollback_queued": true, "booted": "a:2", "staged": "",
+            "rollback": "a:1", "discarded_staged": "a:3"});
+        let s = describe_image_rollback(Ok(discarded.to_string()));
+        assert!(s.contains("staged Host update a:3 was discarded"), "{s}");
+
+        // bootc rollback on a queued rollback puts the booted image first again.
+        let cancelled = serde_json::json!({"ok": true, "reboot_required": false,
+            "rollback_queued": false, "booted": "a:2", "staged": "", "rollback": "a:1"});
+        let s = describe_image_rollback(Ok(cancelled.to_string()));
+        assert!(s.contains("Host image rollback cancelled"), "{s}");
+        assert!(s.contains("No reboot is required"), "{s}");
+
+        let refused = serde_json::json!({"ok": false, "error": "no rollback deployment"});
+        let s = describe_image_rollback(Ok(refused.to_string()));
+        assert!(
+            s.contains("Host image rollback refused: no rollback deployment"),
+            "{s}"
+        );
+        assert!(s.contains("unchanged"), "{s}");
+
+        let s = describe_image_rollback(Err("connect /var/lib/fwos/update.sock: x".into()));
+        assert!(s.contains("Host image rollback failed"), "{s}");
+        assert!(s.contains("update.sock"), "{s}");
+    }
+
+    #[test]
+    fn admin_rollback_image_is_a_host_update_socket_client_not_network_restoration() {
+        let mut out = Vec::new();
+        assert_eq!(
+            admin_handle(&mut out, "rollback-image").unwrap(),
+            AdminAct::Continue
+        );
+        let s = String::from_utf8(out).unwrap();
+        assert!(!s.contains("unknown command"), "{s}");
+        assert!(s.contains("Host image rollback"), "{s}");
+        assert!(s.contains("update.sock"), "{s}");
+        assert!(!s.contains("netd.sock"), "{s}");
+
+        let mut out = Vec::new();
+        admin_handle(&mut out, "rollback-image now").unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("usage: rollback-image"), "{s}");
+        assert!(!s.contains("update.sock"), "{s}");
+    }
+
+    #[test]
+    fn host_image_status_shows_the_rollback_target_and_what_the_next_boot_runs() {
+        let render = |v: serde_json::Value| {
+            let mut out = Vec::new();
+            write_host_image_status(&mut out, &v).unwrap();
+            String::from_utf8(out).unwrap()
+        };
+        let s = render(
+            serde_json::json!({"ok": true, "booted": "a:2", "staged": "",
+            "rollback": "a:1", "rollback_queued": false, "reboot_required": false,
+            "last_update": {"release": "a:2", "outcome": "accepted", "network": null}}),
+        );
+        // Legacy status lines stay parseable.
+        assert!(s.lines().any(|l| l.trim() == "booted: a:2"), "{s}");
+        assert!(s.lines().any(|l| l.trim() == "rollback: a:1"), "{s}");
+        assert!(
+            s.contains("Previous Host image available for rollback-image: a:1"),
+            "{s}"
+        );
+        assert!(s.contains("Last Host update: a:2 accepted"), "{s}");
+        assert!(!s.contains("Reboot required"), "{s}");
+
+        let s = render(
+            serde_json::json!({"ok": true, "booted": "a:2", "staged": "",
+            "rollback": "a:1", "rollback_queued": true, "reboot_required": true}),
+        );
+        assert!(
+            s.contains("Host image rollback queued: the next boot runs a:1"),
+            "{s}"
+        );
+        assert!(s.contains("Reboot required"), "{s}");
+
+        let s = render(
+            serde_json::json!({"ok": true, "booted": "a:1", "staged": "",
+            "rollback": "a:2", "rollback_queued": false, "reboot_required": false,
+            "last_update": {"release": "a:2", "outcome": "rolled_back",
+                "reason": "netd not running",
+                "network": {"outcome": "restored", "revision": 5}}}),
+        );
+        assert!(
+            s.contains("Last Host update: a:2 rolled back (netd not running); pre-update network restored as Accepted revision 5"),
+            "{s}"
+        );
+
+        let s = render(
+            serde_json::json!({"ok": true, "booted": "a:1", "staged": "a:2",
+            "rollback": "", "rollback_queued": false, "reboot_required": true}),
+        );
+        assert!(
+            s.contains("Host update staged: the next boot runs a:2"),
+            "{s}"
+        );
+        assert!(s.contains("No previous Host image"), "{s}");
     }
 
     #[test]

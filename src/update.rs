@@ -26,6 +26,8 @@ const UPDATE_OUTCOME: &str = "/var/lib/fwos/host-update-outcome.json";
 const NETD_SOCK: &str = "/var/lib/fwos/netd.sock";
 const REGISTRIES_DROPIN: &str = "/etc/containers/registries.conf.d/fwos-update.conf";
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(180);
+/// Runs `fwos-update health` on every boot; active while it decides an update boot.
+const HEALTH_UNIT: &str = "fwos-health.service";
 
 #[derive(Debug, Deserialize)]
 struct Request {
@@ -263,6 +265,8 @@ fn status_reply(deployments: &Deployments, op: &Operation, last_update: Option<V
     json!({
         "ok": true,
         "reboot_required": !deployments.staged.is_empty() || deployments.rollback_queued,
+        // The next boot runs the rollback deployment, not the booted one.
+        "rollback_queued": deployments.rollback_queued,
         "booted": deployments.booted.image,
         "staged": deployments.staged.image,
         "rollback": deployments.rollback.image,
@@ -309,20 +313,87 @@ fn handle_request(req: Request) -> String {
     }
 }
 
+/// What a manual Host image rollback returns from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManualRollback {
+    /// An accepted Release, or one that was never a Host update boot. Only
+    /// the bootc deployment changes: the Accepted network revision stays.
+    Image,
+    /// An update boot whose appliance health check ended without accepting
+    /// it. Returning from it is a rejected update: the previous Release
+    /// restores the network preserved before the update, as after an
+    /// automatic rollback.
+    UnacceptedUpdate,
+}
+
+/// While appliance health is deciding an update boot, it owns the rollback:
+/// a manual rollback then could be undone by its own `bootc rollback`.
+fn manual_rollback(
+    update_boot_pending: bool,
+    health_running: bool,
+) -> Result<ManualRollback, String> {
+    match (update_boot_pending, health_running) {
+        (true, true) => Err(format!(
+            "appliance health is still checking this Host update boot and rolls it back \
+             automatically if it fails; try again when it has finished (within {} seconds)",
+            HEALTH_TIMEOUT.as_secs()
+        )),
+        (true, false) => Ok(ManualRollback::UnacceptedUpdate),
+        (false, _) => Ok(ManualRollback::Image),
+    }
+}
+
+/// Manual Host image rollback: queue the previous bootc deployment for the
+/// next boot. Reboot is the operator's separate step, as after staging.
+/// Identity configuration in shared `/var` is untouched, and restoring a
+/// previous network revision is netd's separate operation.
 fn rollback_request() -> String {
     if !bootstrap_completed() {
         return json!({"ok": false, "error": NOT_BOOTSTRAPPED}).to_string();
     }
-    if let Err(err) = idle(&lock_operation()) {
+    // Hold the operation so no stage starts while the boot order changes.
+    let op = lock_operation();
+    if let Err(err) = idle(&op) {
         return json!({"ok": false, "error": err}).to_string();
     }
-    match bootc_rollback() {
-        Ok(()) => {
-            clear_pending();
-            current_status().to_string()
-        }
-        Err(err) => json!({"ok": false, "error": err}).to_string(),
+    let before = match bootc_status() {
+        Ok(before) => before,
+        Err(err) => return json!({"ok": false, "error": err}).to_string(),
+    };
+    let kind = match manual_rollback(
+        pending_is_this_boot(&read_pending(), &before.booted.image),
+        unit_active(HEALTH_UNIT),
+    ) {
+        Ok(kind) => kind,
+        Err(err) => return json!({"ok": false, "error": err}).to_string(),
+    };
+    if let Err(err) = bootc_rollback() {
+        return json!({"ok": false, "error": err}).to_string();
     }
+    clear_pending();
+    if kind == ManualRollback::UnacceptedUpdate {
+        // The Host update record stays, so the previous Release recognizes
+        // the return and reports its network restoration with this outcome.
+        write_outcome(&UpdateOutcome {
+            release: before.booted.image.clone(),
+            outcome: Outcome::RolledBack,
+            reason: Some(
+                "rolled back manually from the Appliance console before appliance health accepted it"
+                    .into(),
+            ),
+            manual: true,
+        });
+    }
+    drop(op);
+    rollback_reply(&before, current_status()).to_string()
+}
+
+/// `bootc rollback` discards a staged, never-activated update; say so.
+fn rollback_reply(before: &Deployments, mut status: Value) -> Value {
+    if status["ok"] == true && !before.staged.is_empty() && status["staged"] == "" {
+        status["discarded_staged"] = json!(before.staged.image);
+    }
+    status
 }
 
 fn claim_staging(image: &str) -> Result<(), String> {
@@ -455,6 +526,10 @@ struct UpdateOutcome {
     outcome: Outcome,
     #[serde(default)]
     reason: Option<String>,
+    /// An administrator rolled back from the Appliance console before
+    /// appliance health decided. Omitted otherwise; an older Release ignores it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    manual: bool,
 }
 
 fn write_outcome(outcome: &UpdateOutcome) {
@@ -796,6 +871,7 @@ fn run_health() -> Result<(), String> {
                     release: booted.clone(),
                     outcome: Outcome::RolledBack,
                     reason: Some(reason),
+                    manual: false,
                 });
                 // The previous Release restores the preserved network itself,
                 // from the Host update record this boot leaves in place.
@@ -835,6 +911,7 @@ fn accept_update(booted: &str) {
         release: booted.to_string(),
         outcome: Outcome::Accepted,
         reason: None,
+        manual: false,
     });
 }
 
@@ -1000,6 +1077,58 @@ mod tests {
     }
 
     #[test]
+    fn status_reports_a_queued_image_rollback() {
+        let queued = json!({"status": {"rollbackQueued": true,
+            "booted": {"image": {"image": {"image": "a:2"}}},
+            "rollback": {"image": {"image": {"image": "a:1"}}}}});
+        let reply = status_reply(&deployments(&queued), &Operation::Idle, None);
+        assert_eq!(reply["rollback_queued"], true);
+        assert_eq!(reply["rollback"], "a:1");
+        let not_queued = status_reply(&Deployments::default(), &Operation::Idle, None);
+        assert_eq!(not_queued["rollback_queued"], false);
+    }
+
+    #[test]
+    fn manual_rollback_waits_for_a_running_update_health_check() {
+        // Appliance health owns the decision on an update boot while it runs:
+        // a manual rollback then could be undone by its own rollback.
+        let refused = manual_rollback(true, true).unwrap_err();
+        assert!(refused.contains("appliance health"), "{refused}");
+        // An accepted update, or no update at all, is a plain image rollback:
+        // no network revision is restored.
+        assert_eq!(manual_rollback(false, false), Ok(ManualRollback::Image));
+        assert_eq!(manual_rollback(false, true), Ok(ManualRollback::Image));
+        // An update boot whose health check ended without a decision was never
+        // accepted: returning from it is a rejected update.
+        assert_eq!(
+            manual_rollback(true, false),
+            Ok(ManualRollback::UnacceptedUpdate)
+        );
+    }
+
+    #[test]
+    fn manual_rollback_reply_names_a_discarded_staged_update() {
+        let before = Deployments {
+            booted: id("a:2", ""),
+            staged: id("a:3", ""),
+            rollback: id("a:1", ""),
+            rollback_queued: false,
+        };
+        let after = Deployments {
+            staged: DeploymentId::default(),
+            rollback_queued: true,
+            ..before.clone()
+        };
+        let reply = rollback_reply(&before, status_reply(&after, &Operation::Idle, None));
+        assert_eq!(reply["ok"], true);
+        assert_eq!(reply["rollback_queued"], true);
+        assert_eq!(reply["reboot_required"], true);
+        assert_eq!(reply["discarded_staged"], "a:3");
+        let plain = rollback_reply(&after, status_reply(&after, &Operation::Idle, None));
+        assert_eq!(plain["discarded_staged"], Value::Null);
+    }
+
+    #[test]
     fn reboot_and_rollback_wait_for_a_running_stage() {
         assert!(idle(&Operation::Idle).is_ok());
         let failed = Operation::Failed {
@@ -1131,11 +1260,32 @@ mod tests {
     }
 
     #[test]
+    fn a_manual_rollback_outcome_stays_readable_by_the_previous_release() {
+        let manual = UpdateOutcome {
+            release: "10.0.2.2:5000/fwos:next".into(),
+            outcome: Outcome::RolledBack,
+            reason: Some("rolled back manually".into()),
+            manual: true,
+        };
+        let last = last_update_json(Some(manual), None).unwrap();
+        assert_eq!(last["outcome"], "rolled_back");
+        assert_eq!(last["manual"], true);
+        // Written by a Release without the flag: an automatic rollback.
+        let older: UpdateOutcome = serde_json::from_value(
+            json!({"release": "a:2", "outcome": "rolled_back", "reason": "netd not running"}),
+        )
+        .unwrap();
+        assert!(!older.manual);
+        assert_eq!(serde_json::to_value(&older).unwrap().get("manual"), None);
+    }
+
+    #[test]
     fn host_update_outcome_is_reported_in_status() {
         let rolled_back = UpdateOutcome {
             release: "10.0.2.2:5000/fwos:next".into(),
             outcome: Outcome::RolledBack,
             reason: Some("Desired state not restored: LAN services failed".into()),
+            manual: false,
         };
         let network = NetworkRestoration::Restored { revision: 5 };
         let last = last_update_json(Some(rolled_back.clone()), Some(network.clone())).unwrap();
@@ -1159,6 +1309,7 @@ mod tests {
             release: "10.0.2.2:5000/fwos:next".into(),
             outcome: Outcome::Accepted,
             reason: None,
+            manual: false,
         };
         let last = last_update_json(Some(accepted), Some(network)).unwrap();
         assert_eq!(last["outcome"], "accepted");

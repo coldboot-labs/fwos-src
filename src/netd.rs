@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 use fwos_fwd_setup::desired::{DesiredState, Iface};
 use fwos_fwd_setup::identity::Principal;
+use fwos_fwd_setup::host_update::{NetworkRestoration, NETWORK_RESTORATION, RESTORE_PRE_UPDATE};
 use fwos_fwd_setup::{bootstrap_values, durable, identity};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -32,10 +33,9 @@ const APPLY_OPERATION: &str = "/var/lib/fwos/apply-operation.json";
 const APPLY_PREVIOUS: &str = "/var/lib/fwos/apply-previous.toml";
 const APPLY_ATTRIBUTION: &str = "/var/lib/fwos/apply-attribution.json";
 const PREVIOUS_ACCEPTED: &str = "/var/lib/fwos/previous-accepted.toml";
-// Host update: the Accepted revision before the update boot, and the Host
-// update program's request to restore it after a Host image rollback.
+// Host update: the Accepted revision before the update boot, in this
+// Release's format, restored if the Host image is rolled back to it.
 const PRE_UPDATE_ACCEPTED: &str = "/var/lib/fwos/pre-update-accepted.toml";
-const RESTORE_PRE_UPDATE: &str = "/var/lib/fwos/restore-pre-update";
 const LAN_SERVICES_READY: &str = "/var/lib/fwos/lan-services-ready";
 const LAN_SERVICES_RESULT: &str = "/var/lib/fwos/lan-services-result";
 const OPT_FILE: &str = "/var/lib/fwos/first-boot-opt.json";
@@ -315,11 +315,9 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    if Path::new(BOOTSTRAPPED).exists() && Path::new(RESTORE_PRE_UPDATE).exists() {
-        if let Err(error) = restore_pre_update() {
-            eprintln!("netd: restore pre-update network after Host image rollback: {error}");
-        }
-    }
+    let restore_pre_update =
+        Path::new(BOOTSTRAPPED).exists() && Path::new(RESTORE_PRE_UPDATE).exists();
+    let restored_at_recovery = restore_pre_update && stage_unreadable_accepted_restoration();
     let interrupted = Path::new(BOOTSTRAPPED).exists()
         && (operation_requires_recovery()
             || matches!(pending_operation(), Ok(Some(_)) | Err(_))
@@ -356,6 +354,9 @@ fn run() -> Result<(), String> {
         if let Some(opt) = load_opt() {
             apply_opt(&opt)?;
         }
+    }
+    if restore_pre_update {
+        finish_pre_update_restoration(restored_at_recovery);
     }
     let path = Path::new(SOCK);
     if let Some(dir) = path.parent() {
@@ -611,20 +612,25 @@ fn apply_confirmation_status() -> Value {
 fn restoration_status() -> Value {
     let ready = fs::read_to_string(LAN_SERVICES_READY).ok();
     let result = fs::read_to_string(LAN_SERVICES_RESULT).ok();
-    let restored = restoration(
-        Path::new(BOOTSTRAPPED).exists(),
-        recovery_pending(),
-        ready.as_deref(),
-        result.as_deref(),
+    restoration_reply(
+        accepted_state_restored(
+            Path::new(BOOTSTRAPPED).exists(),
+            recovery_pending(),
+            ready.as_deref(),
+            result.as_deref(),
+        )
+        .and_then(|()| accepted_desired().map(|accepted| accepted.revision)),
     )
-    .and_then(|()| accepted_desired());
+}
+
+fn restoration_reply(restored: Result<u64, String>) -> Value {
     match restored {
-        Ok(accepted) => json!({"ok": true, "restored": true, "revision": accepted.revision}),
+        Ok(revision) => json!({"ok": true, "restored": true, "revision": revision}),
         Err(reason) => json!({"ok": true, "restored": false, "reason": reason}),
     }
 }
 
-fn restoration(
+fn accepted_state_restored(
     bootstrapped: bool,
     recovery_required: bool,
     lan_ready: Option<&str>,
@@ -654,74 +660,126 @@ fn preserve_pre_update() -> Value {
     if recovery_pending() {
         return json!({"ok": false, "error": "Accepted Desired state needs recovery before a Host update"});
     }
-    match accepted_desired().and_then(|accepted| {
-        persist_at(Path::new(PRE_UPDATE_ACCEPTED), &accepted).map(|()| accepted.revision)
-    }) {
+    let preserved = accepted_desired().and_then(|accepted| {
+        persist_at(Path::new(PRE_UPDATE_ACCEPTED), &accepted)?;
+        // A new update gets its own restoration outcome.
+        durable::remove(Path::new(NETWORK_RESTORATION))?;
+        Ok(accepted.revision)
+    });
+    match preserved {
         Ok(revision) => json!({"ok": true, "revision": revision}),
         Err(error) => json!({"ok": false, "error": error}),
     }
 }
 
-/// The previous Release, after a Host image rollback, restores the network
-/// it preserved before the update. Identity configuration is not Desired
-/// state and stays current. Every step is idempotent across a restart.
-fn restore_pre_update() -> Result<(), String> {
-    match fs::read_to_string(PRE_UPDATE_ACCEPTED) {
-        Ok(raw) => {
-            let preserved: DesiredState = toml::from_str(&raw)
-                .map_err(|e| format!("parse pre-update Accepted Desired state: {e}"))?;
-            // The failed Release may have written state this one cannot read.
-            let current = fs::read_to_string(DESIRED)
-                .ok()
-                .and_then(|raw| toml::from_str::<DesiredState>(&raw).ok());
-            if let Some(restored) = pre_update_restoration(preserved, current.as_ref()) {
-                if let Some(current) = current.as_ref() {
-                    persist_at(Path::new(PREVIOUS_ACCEPTED), current)?;
-                }
-                persist(&restored)?;
-                write_attribution(&ApplyAttribution {
-                    revision: restored.revision,
-                    applying: None,
-                    confirming: None,
-                    draft_version: None,
-                    draft_receipts: Vec::new(),
-                })?;
-                eprintln!(
-                    "netd: restored pre-update network as Accepted revision {}",
-                    restored.revision
-                );
-            }
-            // Boot starts from a clean network; an apply the failed Release
-            // left in flight is superseded by the preserved revision.
-            durable::remove(Path::new(APPLY_OPERATION))?;
-            durable::remove(Path::new(APPLY_PREVIOUS))?;
-            durable::remove(Path::new(PRE_UPDATE_ACCEPTED))?;
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
-        Err(error) => return Err(format!("read pre-update Accepted Desired state: {error}")),
-    }
-    durable::remove(Path::new(RESTORE_PRE_UPDATE))
+fn read_pre_update_accepted() -> Result<DesiredState, String> {
+    let raw = fs::read_to_string(PRE_UPDATE_ACCEPTED)
+        .map_err(|e| format!("read pre-update Accepted Desired state: {e}"))?;
+    toml::from_str(&raw).map_err(|e| format!("parse pre-update Accepted Desired state: {e}"))
 }
 
-fn pre_update_restoration(
-    preserved: DesiredState,
-    current: Option<&DesiredState>,
-) -> Option<DesiredState> {
-    let network = |state: &DesiredState| {
+/// The failed Release may leave Accepted state this Release cannot read, so
+/// there is no readable revision to retain. The preserved revision then
+/// becomes the target of interrupted-apply recovery, which applies it behind
+/// the forwarding guard at startup before accepting it. Returns whether it did.
+fn stage_unreadable_accepted_restoration() -> bool {
+    if accepted_desired().is_ok()
+        || Path::new(APPLY_OPERATION).exists()
+        || Path::new(APPLY_PREVIOUS).exists()
+    {
+        return false;
+    }
+    let staged = read_pre_update_accepted().and_then(|mut preserved| {
+        preserved.revision = preserved.revision.saturating_add(1);
+        persist_at(Path::new(APPLY_PREVIOUS), &preserved)
+    });
+    if let Err(error) = &staged {
+        eprintln!("netd: stage pre-update network for recovery: {error}");
+    }
+    staged.is_ok()
+}
+
+/// After startup restored Accepted state, the previous Release brings back
+/// the network it preserved before the update. A change goes through the
+/// normal apply transaction, which keeps the displaced revision as the
+/// recovery target and restores it if this attempt fails. Identity
+/// configuration is not Desired state and stays current.
+fn finish_pre_update_restoration(restored_at_recovery: bool) {
+    let outcome = restore_pre_update(restored_at_recovery);
+    match &outcome {
+        NetworkRestoration::Failed { error } => {
+            eprintln!("netd: pre-update network not restored after Host image rollback: {error}")
+        }
+        _ => {
+            if let Err(error) = durable::remove(Path::new(PRE_UPDATE_ACCEPTED)) {
+                eprintln!("netd: {error}");
+            }
+        }
+    }
+    let written = serde_json::to_vec(&outcome)
+        .map_err(|e| format!("encode pre-update network restoration: {e}"))
+        .and_then(|raw| durable::write(Path::new(NETWORK_RESTORATION), &raw));
+    if let Err(error) = written.and_then(|()| durable::remove(Path::new(RESTORE_PRE_UPDATE))) {
+        eprintln!("netd: record pre-update network restoration: {error}");
+    }
+}
+
+fn restore_pre_update(restored_at_recovery: bool) -> NetworkRestoration {
+    let failed = |error: String| NetworkRestoration::Failed { error };
+    let preserved = match read_pre_update_accepted() {
+        Ok(preserved) => preserved,
+        Err(error) => return failed(error),
+    };
+    if recovery_pending() {
+        return failed("Accepted Desired state needs recovery from the Appliance console".into());
+    }
+    let current = match accepted_desired() {
+        Ok(current) => current,
+        Err(error) => return failed(error),
+    };
+    match same_network_ignoring_revision(&preserved, &current) {
+        Err(error) => failed(error),
+        Ok(true) if restored_at_recovery => NetworkRestoration::Restored {
+            revision: current.revision,
+        },
+        Ok(true) => NetworkRestoration::Unchanged {
+            revision: current.revision,
+        },
+        Ok(false) => {
+            let input = match serde_json::to_value(&preserved) {
+                Ok(input) => input,
+                Err(error) => return failed(format!("encode pre-update network: {error}")),
+            };
+            let reply = apply_desired_request(
+                &input,
+                Some(current.revision),
+                None,
+                None,
+                ApplyIntent::RecoveryRestore,
+            );
+            match reply["revision"].as_u64() {
+                Some(revision) if reply["ok"] == true => NetworkRestoration::Restored { revision },
+                _ => failed(
+                    reply["error"]
+                        .as_str()
+                        .unwrap_or("apply of the pre-update network failed")
+                        .to_string(),
+                ),
+            }
+        }
+    }
+}
+
+fn same_network_ignoring_revision(
+    left: &DesiredState,
+    right: &DesiredState,
+) -> Result<bool, String> {
+    let without_revision = |state: &DesiredState| {
         let mut state = state.clone();
         state.revision = 0;
-        serde_json::to_value(state).ok()
+        serde_json::to_value(state).map_err(|e| format!("compare Desired state: {e}"))
     };
-    if current.is_some_and(|current| network(current) == network(&preserved)) {
-        return None;
-    }
-    let latest = current.map_or(preserved.revision, |current| {
-        current.revision.max(preserved.revision)
-    });
-    Some(DesiredState {
-        revision: latest.saturating_add(1),
-        ..preserved
-    })
+    Ok(without_revision(left)? == without_revision(right)?)
 }
 
 fn was_draft_accepted(request: &Value) -> Value {
@@ -4584,58 +4642,51 @@ mod tests {
 
     #[test]
     fn restoration_needs_accepted_state_and_current_lan_services_not_liveness() {
-        let ok = restoration(true, false, Some("gen2"), Some("gen2 ok\n"));
-        assert!(ok.is_ok(), "{ok:?}");
-        let error = restoration(false, false, Some("gen2"), Some("gen2 ok\n")).unwrap_err();
+        let restored = |bootstrapped, recovery, ready, result| {
+            accepted_state_restored(bootstrapped, recovery, ready, result)
+        };
+        assert!(restored(true, false, Some("gen2"), Some("gen2 ok\n")).is_ok());
+        let error = restored(false, false, Some("gen2"), Some("gen2 ok\n")).unwrap_err();
         assert!(error.contains("Bootstrap"), "{error}");
-        let error = restoration(true, true, Some("gen2"), Some("gen2 ok\n")).unwrap_err();
+        let error = restored(true, true, Some("gen2"), Some("gen2 ok\n")).unwrap_err();
         assert!(error.contains("recovery"), "{error}");
-        let error = restoration(true, false, None, Some("gen1 ok\n")).unwrap_err();
+        let error = restored(true, false, None, Some("gen1 ok\n")).unwrap_err();
         assert!(error.contains("LAN services"), "{error}");
         // A result from before this boot's restoration does not count.
-        let error = restoration(true, false, Some("gen2"), Some("gen1 ok\n")).unwrap_err();
+        let error = restored(true, false, Some("gen2"), Some("gen1 ok\n")).unwrap_err();
         assert!(error.contains("starting"), "{error}");
-        let error = restoration(true, false, Some("gen2"), None).unwrap_err();
+        let error = restored(true, false, Some("gen2"), None).unwrap_err();
         assert!(error.contains("starting"), "{error}");
         let error =
-            restoration(true, false, Some("gen2"), Some("gen2 failed:fwos-kea-dhcp4\n")).unwrap_err();
+            restored(true, false, Some("gen2"), Some("gen2 failed:fwos-kea-dhcp4\n")).unwrap_err();
         assert!(error.contains("fwos-kea-dhcp4"), "{error}");
     }
 
     #[test]
-    fn restoration_status_is_a_netd_operation() {
-        let reply: Value = serde_json::from_str(&handle_cmd(&json!({"op": "restoration_status"})))
-            .expect("netd response");
-        assert_eq!(reply["ok"], true, "{reply}");
-        assert_eq!(reply["restored"], false, "{reply}");
+    fn restoration_reply_reports_the_revision_or_the_reason() {
+        assert_eq!(
+            restoration_reply(Ok(3)),
+            json!({"ok": true, "restored": true, "revision": 3})
+        );
+        assert_eq!(
+            restoration_reply(Err("LAN services are starting".into())),
+            json!({"ok": true, "restored": false, "reason": "LAN services are starting"})
+        );
     }
 
     #[test]
-    fn unchanged_network_after_host_image_rollback_keeps_its_revision() {
-        let mut preserved = wan_lan();
-        preserved.revision = 4;
-        let current = preserved.clone();
-        assert!(pre_update_restoration(preserved, Some(&current)).is_none());
-    }
-
-    #[test]
-    fn changed_network_after_host_image_rollback_restores_the_preserved_revision_as_a_new_one() {
+    fn pre_update_network_comparison_ignores_only_the_revision() {
         let mut preserved = wan_lan();
         preserved.revision = 4;
         let mut current = preserved.clone();
         current.revision = 6;
+        assert_eq!(same_network_ignoring_revision(&preserved, &current), Ok(true));
         current.routes.push(StaticRoute {
             to: "198.51.100.0/24".into(),
             via: "192.0.2.2".into(),
             dev: Some("enp2s0".into()),
         });
-        let restored = pre_update_restoration(preserved.clone(), Some(&current)).unwrap();
-        assert_eq!(restored.revision, 7);
-        assert!(restored.routes.is_empty());
-        // A failed Release may leave Accepted state the previous one cannot read.
-        let restored = pre_update_restoration(preserved, None).unwrap();
-        assert_eq!(restored.revision, 5);
-        assert!(restored.routes.is_empty());
+        assert_eq!(same_network_ignoring_revision(&preserved, &current), Ok(false));
     }
 
     #[test]

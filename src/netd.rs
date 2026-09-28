@@ -379,6 +379,7 @@ fn run() -> Result<(), String> {
             refresh_at = Instant::now() + Duration::from_secs(1);
         }
         ipv6.advertiser.poll();
+        ipv6.rdnss.poll();
         // Keep command application and address observation on the same thread:
         // an old observation must never republish a replaced selection.
         let mut ready = libc::pollfd {
@@ -2582,6 +2583,9 @@ fn dhcp6_file(dev: &str, kind: &str) -> String {
 #[derive(Default)]
 struct Ipv6Runtime {
     advertiser: ra::Advertiser,
+    rdnss: ra::RdnssListener,
+    /// The Forwarding netns resolvers last published.
+    resolvers: Option<String>,
     observed: Option<(Option<String>, Option<(String, String)>)>,
 }
 
@@ -2603,6 +2607,7 @@ impl Ipv6Runtime {
             },
             Err(_) => return,
         };
+        self.follow_wan_resolvers(&state);
         let delegated = routed_lan_prefix(&state);
         let address = lan_l2(&state)
             .map(|lan| lan.name.clone())
@@ -2637,6 +2642,33 @@ impl Ipv6Runtime {
             }
         }
         self.advertiser.configure(lans);
+    }
+}
+
+impl Ipv6Runtime {
+    /// Keep the Forwarding netns resolvers (`fwd_resolvers::PATH`) matched to
+    /// what the Accepted WANs learned from DHCPv6 and Router Advertisements.
+    fn follow_wan_resolvers(&mut self, state: &DesiredState) {
+        let wans: Vec<&Iface> = state
+            .interfaces
+            .iter()
+            .filter(|iface| iface.role.as_deref() == Some("wan"))
+            .collect();
+        let accepting_ra: Vec<String> = wans
+            .iter()
+            .filter(|wan| wan.ipv6.is_some())
+            .map(|wan| wan.name.clone())
+            .collect();
+        self.rdnss.configure(&accepting_ra);
+        let names: Vec<String> = wans.iter().map(|wan| wan.name.clone()).collect();
+        let conf = learned_resolvers(Path::new(DHCP6_DIR), &names, &self.rdnss);
+        if self.resolvers.as_ref() == Some(&conf) {
+            return;
+        }
+        match fwd_resolvers::publish(Path::new(fwd_resolvers::PATH), &conf) {
+            Ok(()) => self.resolvers = Some(conf),
+            Err(error) => eprintln!("netd: publish WAN resolvers: {error}"),
+        }
     }
 }
 
@@ -2849,29 +2881,19 @@ fn stop_dhclient6(dev: &str) {
     for kind in ["pid", "args", "pd", "addr", "dns"] {
         let _ = fs::remove_file(dhcp6_file(dev, kind));
     }
-    if let Err(err) = publish_fwd_resolvers_in(Path::new(DHCP6_DIR), Path::new(fwd_resolvers::PATH)) {
-        eprintln!("netd: {err}");
-    }
 }
 
-/// Merge every WAN lease's `<wan>.dns` into the Forwarding netns resolvers,
-/// as the DHCPv6 client script does after each lease event.
-fn publish_fwd_resolvers_in(dir: &Path, resolvers: &Path) -> Result<(), String> {
-    let mut leases: Vec<_> = fs::read_dir(dir)
-        .map_err(|e| format!("read {}: {e}", dir.display()))?
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "dns"))
-        .collect();
-    leases.sort();
-    let learned: String = leases
-        .iter()
-        .filter_map(|path| fs::read_to_string(path).ok())
-        .collect();
-    let temporary = resolvers.with_extension("conf.tmp");
-    fs::write(&temporary, learned)
-        .and_then(|_| fs::rename(&temporary, resolvers))
-        .map_err(|e| format!("publish {}: {e}", resolvers.display()))
+/// The resolvers each WAN learned: its DHCPv6 lease's `nameserver` lines
+/// and the RDNSS resolvers of its Router Advertisements.
+fn learned_resolvers(dir: &Path, wans: &[String], rdnss: &ra::RdnssListener) -> String {
+    let mut learned = String::new();
+    for wan in wans {
+        learned += &fs::read_to_string(fwd_resolvers::lease_file(dir, wan)).unwrap_or_default();
+        for server in rdnss.servers(wan) {
+            learned += &format!("nameserver {server}\n");
+        }
+    }
+    fwd_resolvers::resolv_conf(&learned)
 }
 
 // dhclient cannot bind the DHCPv6 client port until link-local DAD finishes.
@@ -2897,22 +2919,20 @@ fn write_dhclient6_script() -> Result<(), String> {
 }
 
 fn dhclient6_script() -> String {
-    dhclient6_script_in(DHCP6_DIR, fwd_resolvers::PATH)
+    dhclient6_script_in(DHCP6_DIR)
 }
 
-/// Also publishes the DNS servers WAN leases name as the Forwarding netns
-/// resolvers (one `<wan>.dns` file per lease, merged into `resolvers`).
-fn dhclient6_script_in(dir: &str, resolvers: &str) -> String {
+/// Also records the DNS servers a WAN lease names in that WAN's lease file
+/// (see `fwd_resolvers`); netd merges them into the Forwarding netns resolvers.
+fn dhclient6_script_in(dir: &str) -> String {
+    let dns_extension = fwd_resolvers::LEASE_EXTENSION;
     format!(
         r#"#!/bin/sh
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
+set -f
 pd="{dir}/${{interface}}.pd"
 addr="{dir}/${{interface}}.addr"
-dns="{dir}/${{interface}}.dns"
-publish_resolvers() {{
-  cat "{dir}"/*.dns > "{resolvers}.tmp" 2>/dev/null
-  mv -f "{resolvers}.tmp" "{resolvers}"
-}}
+dns="{dir}/${{interface}}.{dns_extension}"
 case "${{reason}}" in
 BOUND6|RENEW6|REBIND6|REBOOT6)
   if [ -n "${{new_ip6_address}}" ] && [ -n "${{new_ip6_prefixlen}}" ]; then
@@ -2926,14 +2946,12 @@ BOUND6|RENEW6|REBIND6|REBOOT6)
     printf '%s
 ' "${{new_ip6_prefix}}" > "${{pd}}.tmp" && mv -f "${{pd}}.tmp" "${{pd}}"
   fi
-  if [ -n "${{new_dhcp6_name_servers}}" ]; then
-    for server in ${{new_dhcp6_name_servers}}; do
-      printf 'nameserver %s\n' "${{server}}"
-    done > "${{dns}}.tmp" && mv -f "${{dns}}.tmp" "${{dns}}"
-  else
-    rm -f "${{dns}}"
-  fi
-  publish_resolvers
+  for server in ${{new_dhcp6_name_servers}}; do
+    case "${{server}}" in
+    *[!0-9A-Fa-f:.]*) ;;
+    *:*) printf 'nameserver %s\n' "${{server}}" ;;
+    esac
+  done > "${{dns}}.$$" && mv -f "${{dns}}.$$" "${{dns}}"
   ;;
 EXPIRE6|RELEASE6|STOP6)
   if [ -n "${{old_ip6_address}}" ]; then
@@ -2944,7 +2962,6 @@ EXPIRE6|RELEASE6|STOP6)
     rm -f "${{pd}}"
   fi
   rm -f "${{dns}}"
-  publish_resolvers
   ;;
 esac
 exit 0
@@ -4137,10 +4154,9 @@ mod tests {
         assert!(script.contains("/var/lib/fwos/dhcp6/${interface}.pd"), "{script}");
     }
 
-    fn run_dhclient6_script(dir: &Path, resolvers: &Path, env: &[(&str, &str)]) {
-        let script = dhclient6_script_in(&dir.to_string_lossy(), &resolvers.to_string_lossy());
+    fn run_dhclient6_script(dir: &Path, env: &[(&str, &str)]) {
         let status = Command::new("sh")
-            .args(["-c", &script])
+            .args(["-c", &dhclient6_script_in(&dir.to_string_lossy())])
             .env_clear()
             .envs(env.iter().copied())
             .status()
@@ -4153,37 +4169,45 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fwos-dhcp6-dns-{}", process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        let resolvers = dir.join("fwd-resolv.conf");
+        let wans = ["wan0".to_string(), "wan1".to_string()];
+        let rdnss = ra::RdnssListener::default();
         run_dhclient6_script(
             &dir,
-            &resolvers,
             &[
                 ("reason", "BOUND6"),
                 ("interface", "wan0"),
-                ("new_dhcp6_name_servers", "2001:db8:ff::53 2001:db8:ff::54"),
+                // Word-split, never globbed; only address-shaped words are kept.
+                ("new_dhcp6_name_servers", "2001:db8:ff::53 * 2001:db8:ff::54 $(reboot) 192.0.2.1"),
             ],
         );
         run_dhclient6_script(
             &dir,
-            &resolvers,
             &[
                 ("reason", "BOUND6"),
                 ("interface", "wan1"),
                 ("new_dhcp6_name_servers", "2001:db8:ee::53"),
             ],
         );
-        let learned = fs::read_to_string(&resolvers).unwrap();
-        for server in ["2001:db8:ff::53", "2001:db8:ff::54", "2001:db8:ee::53"] {
-            assert!(learned.contains(&format!("nameserver {server}\n")), "{learned}");
-        }
+        assert_eq!(
+            fs::read_to_string(fwd_resolvers::lease_file(&dir, "wan0")).unwrap(),
+            "nameserver 2001:db8:ff::53\nnameserver 2001:db8:ff::54\n"
+        );
+        assert_eq!(
+            learned_resolvers(&dir, &wans, &rdnss),
+            "nameserver 2001:db8:ff::53\nnameserver 2001:db8:ff::54\nnameserver 2001:db8:ee::53\n"
+        );
+        // Only the Accepted WANs count.
+        assert_eq!(
+            learned_resolvers(&dir, &wans[1..], &rdnss),
+            "nameserver 2001:db8:ee::53\n"
+        );
 
-        // A lease that ends withdraws its resolvers; so does stopping the client.
-        run_dhclient6_script(&dir, &resolvers, &[("reason", "EXPIRE6"), ("interface", "wan0")]);
-        let learned = fs::read_to_string(&resolvers).unwrap();
-        assert_eq!(learned, "nameserver 2001:db8:ee::53\n");
-        let _ = fs::remove_file(dir.join("wan1.dns"));
-        publish_fwd_resolvers_in(&dir, &resolvers).unwrap();
-        assert_eq!(fs::read_to_string(&resolvers).unwrap(), "");
+        // A lease that ends withdraws its resolvers.
+        run_dhclient6_script(&dir, &[("reason", "EXPIRE6"), ("interface", "wan0")]);
+        assert_eq!(
+            learned_resolvers(&dir, &wans, &rdnss),
+            "nameserver 2001:db8:ee::53\n"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

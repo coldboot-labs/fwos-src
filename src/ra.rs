@@ -266,6 +266,158 @@ impl Advertiser {
     }
 }
 
+/// RDNSS option (RFC 8106) in a Router Advertisement.
+const RDNSS: u8 = 25;
+
+/// The recursive DNS servers and their lifetimes (seconds) that one Router
+/// Advertisement names. A malformed option ends parsing.
+pub fn rdnss_servers(packet: &[u8]) -> Vec<(Ipv6Addr, u32)> {
+    let mut servers = Vec::new();
+    if packet.first() != Some(&ROUTER_ADVERT) || packet.len() < 16 {
+        return servers;
+    }
+    let mut options = &packet[16..];
+    while options.len() >= 8 {
+        let length = usize::from(options[1]) * 8;
+        if length == 0 || length > options.len() {
+            break;
+        }
+        if options[0] == RDNSS && length >= 24 {
+            let lifetime = u32::from_be_bytes([options[4], options[5], options[6], options[7]]);
+            for address in options[8..length].chunks_exact(16) {
+                let octets: [u8; 16] = address.try_into().expect("16-byte chunk");
+                servers.push((Ipv6Addr::from(octets), lifetime));
+            }
+        }
+        options = &options[length..];
+    }
+    servers
+}
+
+/// Learns RDNSS resolvers from the Router Advertisements each WAN receives.
+/// It only listens: the kernel still processes the same RAs for addresses and
+/// routes.
+#[derive(Default)]
+pub struct RdnssListener {
+    links: Vec<(String, OwnedFd)>,
+    learned: Vec<(String, Ipv6Addr, Instant)>,
+    failed: Vec<String>,
+}
+
+impl RdnssListener {
+    /// Listen on exactly these WANs; resolvers of other WANs are forgotten.
+    pub fn configure(&mut self, wans: &[String]) {
+        self.links.retain(|(dev, _)| wans.contains(dev));
+        self.learned.retain(|(dev, _, _)| wans.contains(dev));
+        for wan in wans {
+            if self.links.iter().any(|(dev, _)| dev == wan) {
+                continue;
+            }
+            match rdnss_socket(wan) {
+                Ok(fd) => {
+                    self.failed.retain(|failed| failed != wan);
+                    self.links.push((wan.clone(), fd));
+                }
+                Err(error) => {
+                    if !self.failed.contains(wan) {
+                        eprintln!("netd: {error}");
+                        self.failed.push(wan.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn poll(&mut self) {
+        let now = Instant::now();
+        let mut received = Vec::new();
+        for (dev, fd) in &self.links {
+            while let Some(packet) = receive_advertisement(fd) {
+                received.push((dev.clone(), packet));
+            }
+        }
+        for (dev, packet) in received {
+            self.learn(&dev, &packet, now);
+        }
+    }
+
+    fn learn(&mut self, dev: &str, packet: &[u8], now: Instant) {
+        for (server, lifetime) in rdnss_servers(packet) {
+            self.learned.retain(|(d, s, _)| !(d == dev && *s == server));
+            if lifetime > 0 {
+                let expires = now + Duration::from_secs(u64::from(lifetime));
+                self.learned.push((dev.to_string(), server, expires));
+            }
+        }
+    }
+
+    /// Unexpired resolvers learned on `dev`, as resolv.conf addresses
+    /// (link-local ones scoped to the WAN).
+    pub fn servers(&self, dev: &str) -> Vec<String> {
+        let now = Instant::now();
+        self.learned
+            .iter()
+            .filter(|(d, _, expires)| d == dev && *expires > now)
+            .map(|(_, server, _)| {
+                if server.is_unicast_link_local() {
+                    format!("{server}%{dev}")
+                } else {
+                    server.to_string()
+                }
+            })
+            .collect()
+    }
+}
+
+fn rdnss_socket(dev: &str) -> Result<OwnedFd, String> {
+    let name = std::ffi::CString::new(dev).map_err(|_| format!("invalid WAN name {dev}"))?;
+    let raw = unsafe {
+        libc::socket(
+            libc::AF_INET6,
+            libc::SOCK_RAW | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            libc::IPPROTO_ICMPV6,
+        )
+    };
+    if raw < 0 {
+        return Err(format!(
+            "RDNSS socket on {dev}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    set_option(&fd, libc::SOL_SOCKET, libc::SO_BINDTODEVICE, name.as_bytes_with_nul())?;
+    let mut filter = [u32::MAX; 8];
+    filter[usize::from(ROUTER_ADVERT >> 5)] &= !(1 << (ROUTER_ADVERT & 31));
+    set_option(&fd, libc::IPPROTO_ICMPV6, ICMP6_FILTER, as_bytes(&filter))?;
+    Ok(fd)
+}
+
+/// One pending Router Advertisement from a link-local router, if any.
+fn receive_advertisement(fd: &OwnedFd) -> Option<Vec<u8>> {
+    loop {
+        let mut buffer = [0u8; 1500];
+        let mut source: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+        let mut length = std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t;
+        let received = unsafe {
+            libc::recvfrom(
+                fd.as_raw_fd(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                0,
+                (&mut source as *mut libc::sockaddr_in6).cast(),
+                &mut length,
+            )
+        };
+        if received <= 0 {
+            return None;
+        }
+        // Routers send RAs from their link-local address (RFC 4861 6.1.2).
+        if Ipv6Addr::from(source.sin6_addr.s6_addr).is_unicast_link_local() {
+            return Some(buffer[..received as usize].to_vec());
+        }
+    }
+}
+
 fn as_bytes<T>(value: &T) -> &[u8] {
     unsafe { std::slice::from_raw_parts((value as *const T).cast(), std::mem::size_of::<T>()) }
 }
@@ -340,6 +492,52 @@ mod tests {
         let option = &packet[16..];
         assert_eq!(u32::from_be_bytes(option[4..8].try_into().unwrap()), 0);
         assert_eq!(u32::from_be_bytes(option[8..12].try_into().unwrap()), 0);
+    }
+
+    fn advertisement_with_rdnss(lifetime: u32, servers: &[&str]) -> Vec<u8> {
+        let mut packet = advertisement(&[], false, Some([2, 0, 0, 0, 0, 1]), false);
+        packet.extend_from_slice(&[RDNSS, (1 + 2 * servers.len()) as u8, 0, 0]);
+        packet.extend_from_slice(&lifetime.to_be_bytes());
+        for server in servers {
+            packet.extend_from_slice(&server.parse::<Ipv6Addr>().unwrap().octets());
+        }
+        packet
+    }
+
+    #[test]
+    fn router_advertisement_rdnss_names_resolvers() {
+        let packet = advertisement_with_rdnss(600, &["2001:db8:ff::53", "2001:db8:ff::54"]);
+        assert_eq!(
+            rdnss_servers(&packet),
+            vec![
+                ("2001:db8:ff::53".parse().unwrap(), 600),
+                ("2001:db8:ff::54".parse().unwrap(), 600)
+            ]
+        );
+        assert!(rdnss_servers(&advertisement(&[], false, None, false)).is_empty());
+        let mut truncated = packet.clone();
+        truncated.truncate(packet.len() - 4);
+        assert_eq!(rdnss_servers(&truncated).len(), 0, "a truncated option is ignored");
+        assert!(rdnss_servers(&[ROUTER_SOLICIT, 0, 0, 0]).is_empty());
+    }
+
+    #[test]
+    fn wan_rdnss_expires_and_a_zero_lifetime_withdraws() {
+        let mut listener = RdnssListener::default();
+        let now = Instant::now();
+        listener.learn("wan0", &advertisement_with_rdnss(600, &["2001:db8:ff::53"]), now);
+        listener.learn("wan0", &advertisement_with_rdnss(600, &["fe80::1"]), now);
+        assert_eq!(listener.servers("wan0"), ["2001:db8:ff::53", "fe80::1%wan0"]);
+        assert!(listener.servers("wan1").is_empty());
+        listener.learn("wan0", &advertisement_with_rdnss(0, &["fe80::1"]), now);
+        assert_eq!(listener.servers("wan0"), ["2001:db8:ff::53"]);
+        let past = now - Duration::from_secs(601);
+        listener.learned.clear();
+        listener.learn("wan0", &advertisement_with_rdnss(600, &["2001:db8:ff::53"]), past);
+        assert!(listener.servers("wan0").is_empty(), "expired");
+        listener.learn("wan0", &advertisement_with_rdnss(600, &["2001:db8:ff::53"]), now);
+        listener.configure(&[]);
+        assert!(listener.servers("wan0").is_empty(), "a removed WAN forgets its resolvers");
     }
 
     #[test]

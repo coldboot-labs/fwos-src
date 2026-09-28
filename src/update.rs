@@ -26,8 +26,10 @@ const UPDATE_OUTCOME: &str = "/var/lib/fwos/host-update-outcome.json";
 const NETD_SOCK: &str = "/var/lib/fwos/netd.sock";
 const REGISTRIES_DROPIN: &str = "/etc/containers/registries.conf.d/fwos-update.conf";
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(180);
-/// Runs `fwos-update health` on every boot; active while it decides an update boot.
+/// Runs `fwos-update health` on every boot and exits once it has decided.
 const HEALTH_UNIT: &str = "fwos-health.service";
+/// A queued manual Host image rollback, until the next boot.
+const MANUAL_ROLLBACK: &str = "/var/lib/fwos/host-image-rollback.json";
 
 #[derive(Debug, Deserialize)]
 struct Request {
@@ -317,36 +319,118 @@ fn handle_request(req: Request) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ManualRollback {
     /// An accepted Release, or one that was never a Host update boot. Only
-    /// the bootc deployment changes: the Accepted network revision stays.
+    /// the bootc deployment changes: the Accepted Desired state stays.
     Image,
-    /// An update boot whose appliance health check ended without accepting
+    /// An update boot whose appliance health check finished without accepting
     /// it. Returning from it is a rejected update: the previous Release
     /// restores the network preserved before the update, as after an
     /// automatic rollback.
     UnacceptedUpdate,
 }
 
-/// While appliance health is deciding an update boot, it owns the rollback:
-/// a manual rollback then could be undone by its own `bootc rollback`.
+/// Until appliance health has finished on an update boot, it owns the
+/// rollback: a manual rollback before or while it runs could be undone by
+/// its own `bootc rollback`.
 fn manual_rollback(
     update_boot_pending: bool,
-    health_running: bool,
+    health_finished: bool,
 ) -> Result<ManualRollback, String> {
-    match (update_boot_pending, health_running) {
-        (true, true) => Err(format!(
-            "appliance health is still checking this Host update boot and rolls it back \
-             automatically if it fails; try again when it has finished (within {} seconds)",
+    match (update_boot_pending, health_finished) {
+        (true, false) => Err(format!(
+            "appliance health has not finished checking this Host update boot and rolls it \
+             back automatically if it fails; try again when it has finished (within {} seconds)",
             HEALTH_TIMEOUT.as_secs()
         )),
-        (true, false) => Ok(ManualRollback::UnacceptedUpdate),
+        (true, true) => Ok(ManualRollback::UnacceptedUpdate),
         (false, _) => Ok(ManualRollback::Image),
     }
 }
 
+/// A queued manual rollback, kept until the next boot shows whether it
+/// happened. Cancelling it before the reboot removes it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ManualRollbackRecord {
+    from: DeploymentId,
+    to: DeploymentId,
+}
+
+/// The boot order a manual rollback changes; `bootc` on the appliance.
+trait BootOrder {
+    fn status(&mut self) -> Result<Deployments, String>;
+    fn rollback(&mut self) -> Result<(), String>;
+}
+
+struct Bootc;
+
+impl BootOrder for Bootc {
+    fn status(&mut self) -> Result<Deployments, String> {
+        bootc_status()
+    }
+
+    fn rollback(&mut self) -> Result<(), String> {
+        bootc_rollback()
+    }
+}
+
+/// Files a manual rollback keeps: its record, and the health-pending record
+/// of an update boot.
+struct ManualRollbackFiles<'a> {
+    record: &'a Path,
+    pending: &'a Path,
+}
+
+/// Queue the rollback deployment for the next boot, or cancel a queued manual
+/// rollback (`bootc rollback` swaps the order back). Nothing else is written:
+/// the outcome is recorded once the previous Release has booted, so a
+/// cancelled or never-activated rollback leaves no trace. Returns the
+/// deployments as they were before, and whether the queued rollback returns
+/// from an unaccepted update.
+fn manual_rollback_step(
+    bootc: &mut impl BootOrder,
+    files: &ManualRollbackFiles<'_>,
+    health_finished: impl Fn() -> bool,
+) -> Result<(Deployments, bool), String> {
+    let before = bootc.status()?;
+    let pending = read_pending_at(files.pending);
+    let kind = manual_rollback(
+        pending_is_this_boot(&pending, &before.booted.image),
+        health_finished(),
+    )?;
+    if before.rollback_queued {
+        if !files.record.exists() {
+            return Err(
+                "the queued Host image rollback was not requested manually and cannot be cancelled"
+                    .into(),
+            );
+        }
+        bootc.rollback()?;
+        durable::remove(files.record)?;
+        return Ok((before, false));
+    }
+    let record = ManualRollbackRecord {
+        from: before.booted.clone(),
+        to: before.rollback.clone(),
+    };
+    let raw = serde_json::to_vec(&record).map_err(|e| format!("encode rollback record: {e}"))?;
+    durable::write(files.record, &raw)?;
+    if let Err(err) = bootc.rollback() {
+        let _ = durable::remove(files.record);
+        return Err(err);
+    }
+    // An unaccepted update keeps its health-pending record, so a cancelled
+    // rollback leaves it checked again on its next boot. Otherwise the only
+    // pending record is that of a staged update, which `bootc rollback`
+    // discarded.
+    if kind == ManualRollback::Image {
+        let _ = fs::remove_file(files.pending);
+    }
+    Ok((before, kind == ManualRollback::UnacceptedUpdate))
+}
+
 /// Manual Host image rollback: queue the previous bootc deployment for the
-/// next boot. Reboot is the operator's separate step, as after staging.
-/// Identity configuration in shared `/var` is untouched, and restoring a
-/// previous network revision is netd's separate operation.
+/// next boot, or cancel a queued one. Reboot is the operator's separate step,
+/// as after staging. Identity configuration in shared `/var` is untouched,
+/// and restoring a previous network revision is netd's separate operation.
 fn rollback_request() -> String {
     if !bootstrap_completed() {
         return json!({"ok": false, "error": NOT_BOOTSTRAPPED}).to_string();
@@ -356,43 +440,51 @@ fn rollback_request() -> String {
     if let Err(err) = idle(&op) {
         return json!({"ok": false, "error": err}).to_string();
     }
-    let before = match bootc_status() {
-        Ok(before) => before,
-        Err(err) => return json!({"ok": false, "error": err}).to_string(),
+    let files = ManualRollbackFiles {
+        record: Path::new(MANUAL_ROLLBACK),
+        pending: Path::new(PENDING),
     };
-    let kind = match manual_rollback(
-        pending_is_this_boot(&read_pending(), &before.booted.image),
-        unit_active(HEALTH_UNIT),
-    ) {
-        Ok(kind) => kind,
-        Err(err) => return json!({"ok": false, "error": err}).to_string(),
-    };
-    if let Err(err) = bootc_rollback() {
-        return json!({"ok": false, "error": err}).to_string();
-    }
-    clear_pending();
-    if kind == ManualRollback::UnacceptedUpdate {
-        // The Host update record stays, so the previous Release recognizes
-        // the return and reports its network restoration with this outcome.
-        write_outcome(&UpdateOutcome {
-            release: before.booted.image.clone(),
-            outcome: Outcome::RolledBack,
-            reason: Some(
-                "rolled back manually from the Appliance console before appliance health accepted it"
-                    .into(),
-            ),
-            manual: true,
-        });
-    }
+    let (before, pre_update_network) =
+        match manual_rollback_step(&mut Bootc, &files, health_finished) {
+            Ok(step) => step,
+            Err(err) => return json!({"ok": false, "error": err}).to_string(),
+        };
     drop(op);
-    rollback_reply(&before, current_status()).to_string()
+    rollback_reply(&before, pre_update_network, current_status()).to_string()
 }
 
-/// `bootc rollback` discards a staged, never-activated update; say so.
-fn rollback_reply(before: &Deployments, mut status: Value) -> Value {
-    if status["ok"] == true && !before.staged.is_empty() && status["staged"] == "" {
+/// At boot: the outcome of a manual rollback that actually took effect.
+/// `pre_update_network` is whether this boot returns from an unaccepted
+/// update, whose preserved network the previous Release restores.
+fn manual_rollback_outcome(
+    record: &ManualRollbackRecord,
+    deployments: &Deployments,
+    pre_update_network: bool,
+) -> Option<UpdateOutcome> {
+    (record.to.matches(&deployments.booted) && record.from.matches(&deployments.rollback)).then(
+        || UpdateOutcome {
+            release: record.from.image.clone(),
+            outcome: Outcome::RolledBack,
+            reason: Some("manual rollback".into()),
+            manual: Some(ManualOutcome {
+                to: record.to.image.clone(),
+                pre_update_network,
+            }),
+        },
+    )
+}
+
+/// `bootc rollback` discards a staged, never-activated update; say so, and
+/// whether the previous Release restores the pre-update network.
+fn rollback_reply(before: &Deployments, pre_update_network: bool, mut status: Value) -> Value {
+    if status["ok"] != true {
+        return status;
+    }
+    if !before.staged.is_empty() && status["staged"] == "" {
         status["discarded_staged"] = json!(before.staged.image);
     }
+    status["restores_pre_update_network"] =
+        json!(pre_update_network && status["rollback_queued"] == true);
     status
 }
 
@@ -526,10 +618,20 @@ struct UpdateOutcome {
     outcome: Outcome,
     #[serde(default)]
     reason: Option<String>,
-    /// An administrator rolled back from the Appliance console before
-    /// appliance health decided. Omitted otherwise; an older Release ignores it.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    manual: bool,
+    /// Set when an administrator rolled the Host image back, rather than
+    /// appliance health. Omitted otherwise; an older Release ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    manual: Option<ManualOutcome>,
+}
+
+/// A manual Host image rollback from `release` to `to`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ManualOutcome {
+    to: String,
+    /// The rollback left an unaccepted update, so the previous Release
+    /// restores the pre-update network. Otherwise the Accepted Desired state
+    /// was kept and no restoration belongs to this rollback.
+    pre_update_network: bool,
 }
 
 fn write_outcome(outcome: &UpdateOutcome) {
@@ -558,7 +660,12 @@ fn last_update_json(
     network: Option<NetworkRestoration>,
 ) -> Option<Value> {
     let outcome = outcome?;
-    let network = network.filter(|_| outcome.outcome == Outcome::RolledBack);
+    let restores_network = outcome.outcome == Outcome::RolledBack
+        && outcome
+            .manual
+            .as_ref()
+            .is_none_or(|manual| manual.pre_update_network);
+    let network = network.filter(|_| restores_network);
     let mut json = serde_json::to_value(&outcome).ok()?;
     json["network"] = serde_json::to_value(network).ok()?;
     Some(json)
@@ -805,7 +912,11 @@ fn write_pending(image: &str) -> Result<(), String> {
 }
 
 fn read_pending() -> String {
-    fs::read_to_string(PENDING)
+    read_pending_at(Path::new(PENDING))
+}
+
+fn read_pending_at(path: &Path) -> String {
+    fs::read_to_string(path)
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
@@ -871,7 +982,7 @@ fn run_health() -> Result<(), String> {
                     release: booted.clone(),
                     outcome: Outcome::RolledBack,
                     reason: Some(reason),
-                    manual: false,
+                    manual: None,
                 });
                 // The previous Release restores the preserved network itself,
                 // from the Host update record this boot leaves in place.
@@ -911,20 +1022,36 @@ fn accept_update(booted: &str) {
         release: booted.to_string(),
         outcome: Outcome::Accepted,
         reason: None,
-        manual: false,
+        manual: None,
     });
 }
 
-/// Before netd starts: on the previous Release after a rollback from the
-/// update boot, ask netd to restore the network preserved before the update.
+/// Before netd starts: record a manual rollback that took effect, and, on the
+/// previous Release after a rollback from the update boot, ask netd to restore
+/// the network preserved before the update.
 fn run_restore_check() -> Result<(), String> {
-    let Some(record) = read_update_record() else {
-        return Ok(());
-    };
-    let deployments = bootc_status()?;
-    if !returned_from_update(&record, &deployments) {
+    let manual: Option<ManualRollbackRecord> = read_json(MANUAL_ROLLBACK);
+    let record = read_update_record();
+    if manual.is_none() && record.is_none() {
         return Ok(());
     }
+    let deployments = bootc_status()?;
+    let returned = record
+        .as_ref()
+        .is_some_and(|record| returned_from_update(record, &deployments));
+    if let Some(manual) = manual {
+        if let Some(outcome) = manual_rollback_outcome(&manual, &deployments, returned) {
+            write_outcome(&outcome);
+            console_log(&format!(
+                "Host image manually rolled back from {} to {}",
+                manual.from.image, manual.to.image
+            ));
+        }
+        durable::remove(Path::new(MANUAL_ROLLBACK))?;
+    }
+    let Some(record) = record.filter(|_| returned) else {
+        return Ok(());
+    };
     durable::write(
         Path::new(RESTORE_PRE_UPDATE),
         record.update.image.as_bytes(),
@@ -935,6 +1062,30 @@ fn run_restore_check() -> Result<(), String> {
         record.update.image
     ));
     Ok(())
+}
+
+/// Whether `fwos-health.service` has run and exited on this boot.
+fn health_finished() -> bool {
+    Command::new("systemctl")
+        .args([
+            "show",
+            "--property=ExecMainExitTimestampMonotonic",
+            "--value",
+            HEALTH_UNIT,
+        ])
+        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+        .output()
+        .map(|output| exited_this_boot(&String::from_utf8_lossy(&output.stdout)))
+        .unwrap_or(false)
+}
+
+/// systemd's exit timestamp of a unit's main process, 0 until it exits;
+/// unit state does not survive a reboot.
+fn exited_this_boot(exit_timestamp: &str) -> bool {
+    exit_timestamp
+        .trim()
+        .parse::<u64>()
+        .is_ok_and(|timestamp| timestamp > 0)
 }
 
 fn default_target_reached() -> bool {
@@ -1089,21 +1240,179 @@ mod tests {
     }
 
     #[test]
-    fn manual_rollback_waits_for_a_running_update_health_check() {
-        // Appliance health owns the decision on an update boot while it runs:
-        // a manual rollback then could be undone by its own rollback.
-        let refused = manual_rollback(true, true).unwrap_err();
+    fn manual_rollback_waits_until_update_health_has_finished_on_this_boot() {
+        // Appliance health owns the decision on an update boot until it has
+        // run: a manual rollback before or while it runs could be undone by
+        // its own rollback.
+        let refused = manual_rollback(true, false).unwrap_err();
         assert!(refused.contains("appliance health"), "{refused}");
         // An accepted update, or no update at all, is a plain image rollback:
         // no network revision is restored.
         assert_eq!(manual_rollback(false, false), Ok(ManualRollback::Image));
         assert_eq!(manual_rollback(false, true), Ok(ManualRollback::Image));
-        // An update boot whose health check ended without a decision was never
-        // accepted: returning from it is a rejected update.
+        // An update boot whose health check finished without accepting it.
         assert_eq!(
-            manual_rollback(true, false),
+            manual_rollback(true, true),
             Ok(ManualRollback::UnacceptedUpdate)
         );
+    }
+
+    #[test]
+    fn health_has_finished_only_once_its_unit_exited_this_boot() {
+        assert!(!exited_this_boot("0\n"), "not started or still running");
+        assert!(!exited_this_boot(""));
+        assert!(!exited_this_boot("[not set]"));
+        assert!(exited_this_boot("48213377\n"));
+    }
+
+    /// `bootc rollback`: swaps the boot order and discards a staged update.
+    struct FakeBootc(Deployments);
+
+    impl BootOrder for FakeBootc {
+        fn status(&mut self) -> Result<Deployments, String> {
+            Ok(self.0.clone())
+        }
+
+        fn rollback(&mut self) -> Result<(), String> {
+            if self.0.rollback.is_empty() {
+                return Err("No rollback available".into());
+            }
+            self.0.staged = DeploymentId::default();
+            self.0.rollback_queued = !self.0.rollback_queued;
+            Ok(())
+        }
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("fwos-update-test-{name}-{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_cancelled_manual_rollback_of_an_unaccepted_update_leaves_nothing_behind() {
+        let dir = scratch("cancel");
+        let (record, pending) = (dir.join("rollback.json"), dir.join("health-pending"));
+        let files = ManualRollbackFiles {
+            record: &record,
+            pending: &pending,
+        };
+        fs::write(&pending, "reg/fwos:next\n").unwrap();
+        let update_boot = Deployments {
+            booted: id("reg/fwos:next", "sha256:b"),
+            rollback: id("localhost/fwos:dev", "sha256:a"),
+            ..Deployments::default()
+        };
+        let mut bootc = FakeBootc(update_boot.clone());
+
+        // Before or while appliance health runs: refused, nothing changes.
+        let refused = manual_rollback_step(&mut bootc, &files, || false).unwrap_err();
+        assert!(refused.contains("appliance health"), "{refused}");
+        assert_eq!(bootc.0, update_boot);
+        assert!(!record.exists());
+
+        // Queued: only the rollback record is written; the update's
+        // health-pending record stays.
+        let (_, pre_update_network) = manual_rollback_step(&mut bootc, &files, || true).unwrap();
+        assert!(pre_update_network);
+        assert!(bootc.0.rollback_queued);
+        let queued: ManualRollbackRecord =
+            serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
+        assert_eq!(queued.from, update_boot.booted);
+        assert_eq!(queued.to, update_boot.rollback);
+        assert_eq!(read_pending_at(&pending), "reg/fwos:next");
+
+        // Cancelled before the reboot: everything is as it was.
+        let (_, pre_update_network) = manual_rollback_step(&mut bootc, &files, || true).unwrap();
+        assert!(!pre_update_network);
+        assert_eq!(bootc.0, update_boot);
+        assert!(!record.exists());
+        assert_eq!(read_pending_at(&pending), "reg/fwos:next");
+        // Rebooting then records no rollback outcome.
+        assert_eq!(manual_rollback_outcome(&queued, &bootc.0, true), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_manual_rollback_takes_effect_only_when_the_previous_release_boots() {
+        let dir = scratch("boot");
+        let (record, pending) = (dir.join("rollback.json"), dir.join("health-pending"));
+        let files = ManualRollbackFiles {
+            record: &record,
+            pending: &pending,
+        };
+        // An accepted update, with a newer update staged but not activated.
+        fs::write(&pending, "reg/fwos:later\n").unwrap();
+        let accepted = Deployments {
+            booted: id("reg/fwos:next", "sha256:b"),
+            staged: id("reg/fwos:later", "sha256:c"),
+            rollback: id("localhost/fwos:dev", "sha256:a"),
+            rollback_queued: false,
+        };
+        let mut bootc = FakeBootc(accepted.clone());
+        let (before, pre_update_network) =
+            manual_rollback_step(&mut bootc, &files, || false).unwrap();
+        assert_eq!(before, accepted);
+        assert!(!pre_update_network);
+        // The discarded staged update is no longer awaiting a health check.
+        assert_eq!(read_pending_at(&pending), "");
+        let queued: ManualRollbackRecord =
+            serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
+
+        // Not rebooted yet: the next boot of the same deployment is no rollback.
+        assert_eq!(manual_rollback_outcome(&queued, &accepted, false), None);
+        let previous_booted = Deployments {
+            booted: id("localhost/fwos:dev", "sha256:a"),
+            rollback: id("reg/fwos:next", "sha256:b"),
+            ..Deployments::default()
+        };
+        let outcome = manual_rollback_outcome(&queued, &previous_booted, false).unwrap();
+        assert_eq!(outcome.release, "reg/fwos:next");
+        assert_eq!(outcome.outcome, Outcome::RolledBack);
+        assert_eq!(outcome.reason.as_deref(), Some("manual rollback"));
+        assert_eq!(
+            outcome.manual,
+            Some(ManualOutcome {
+                to: "localhost/fwos:dev".into(),
+                pre_update_network: false
+            })
+        );
+        // A plain image rollback owns no network restoration, even a stale one.
+        let last = last_update_json(
+            Some(outcome),
+            Some(NetworkRestoration::Restored { revision: 3 }),
+        )
+        .unwrap();
+        assert_eq!(
+            last,
+            json!({"release": "reg/fwos:next", "outcome": "rolled_back",
+                "reason": "manual rollback",
+                "manual": {"to": "localhost/fwos:dev", "pre_update_network": false},
+                "network": null})
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_a_manually_queued_rollback_can_be_cancelled() {
+        let dir = scratch("health-queued");
+        let (record, pending) = (dir.join("rollback.json"), dir.join("health-pending"));
+        let files = ManualRollbackFiles {
+            record: &record,
+            pending: &pending,
+        };
+        let queued_by_health = Deployments {
+            booted: id("reg/fwos:next", "sha256:b"),
+            rollback: id("localhost/fwos:dev", "sha256:a"),
+            rollback_queued: true,
+            ..Deployments::default()
+        };
+        let mut bootc = FakeBootc(queued_by_health.clone());
+        let refused = manual_rollback_step(&mut bootc, &files, || true).unwrap_err();
+        assert!(refused.contains("cannot be cancelled"), "{refused}");
+        assert_eq!(bootc.0, queued_by_health);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1119,13 +1428,15 @@ mod tests {
             rollback_queued: true,
             ..before.clone()
         };
-        let reply = rollback_reply(&before, status_reply(&after, &Operation::Idle, None));
+        let reply = rollback_reply(&before, false, status_reply(&after, &Operation::Idle, None));
         assert_eq!(reply["ok"], true);
         assert_eq!(reply["rollback_queued"], true);
         assert_eq!(reply["reboot_required"], true);
         assert_eq!(reply["discarded_staged"], "a:3");
-        let plain = rollback_reply(&after, status_reply(&after, &Operation::Idle, None));
+        assert_eq!(reply["restores_pre_update_network"], false);
+        let plain = rollback_reply(&after, true, status_reply(&after, &Operation::Idle, None));
         assert_eq!(plain["discarded_staged"], Value::Null);
+        assert_eq!(plain["restores_pre_update_network"], true);
     }
 
     #[test]
@@ -1262,21 +1573,42 @@ mod tests {
     #[test]
     fn a_manual_rollback_outcome_stays_readable_by_the_previous_release() {
         let manual = UpdateOutcome {
-            release: "10.0.2.2:5000/fwos:next".into(),
+            release: "reg/fwos:next".into(),
             outcome: Outcome::RolledBack,
-            reason: Some("rolled back manually".into()),
-            manual: true,
+            reason: Some("manual rollback".into()),
+            manual: Some(ManualOutcome {
+                to: "localhost/fwos:dev".into(),
+                pre_update_network: true,
+            }),
         };
-        let last = last_update_json(Some(manual), None).unwrap();
+        // Returning from an unaccepted update: netd's restoration belongs to it.
+        let network = NetworkRestoration::Unchanged { revision: 4 };
+        let last = last_update_json(Some(manual.clone()), Some(network)).unwrap();
         assert_eq!(last["outcome"], "rolled_back");
-        assert_eq!(last["manual"], true);
-        // Written by a Release without the flag: an automatic rollback.
-        let older: UpdateOutcome = serde_json::from_value(
+        assert_eq!(last["manual"]["to"], "localhost/fwos:dev");
+        assert_eq!(last["network"]["outcome"], "unchanged");
+        // An older Release reads it as a plain rollback outcome.
+        #[derive(Deserialize)]
+        struct OlderOutcome {
+            release: String,
+            outcome: Outcome,
+            reason: Option<String>,
+        }
+        let older: OlderOutcome =
+            serde_json::from_value(serde_json::to_value(&manual).unwrap()).unwrap();
+        assert_eq!(older.release, "reg/fwos:next");
+        assert_eq!(older.outcome, Outcome::RolledBack);
+        assert_eq!(older.reason.as_deref(), Some("manual rollback"));
+        // Written by a Release without the field: an automatic rollback.
+        let automatic: UpdateOutcome = serde_json::from_value(
             json!({"release": "a:2", "outcome": "rolled_back", "reason": "netd not running"}),
         )
         .unwrap();
-        assert!(!older.manual);
-        assert_eq!(serde_json::to_value(&older).unwrap().get("manual"), None);
+        assert_eq!(automatic.manual, None);
+        assert_eq!(
+            serde_json::to_value(&automatic).unwrap().get("manual"),
+            None
+        );
     }
 
     #[test]
@@ -1285,7 +1617,7 @@ mod tests {
             release: "10.0.2.2:5000/fwos:next".into(),
             outcome: Outcome::RolledBack,
             reason: Some("Desired state not restored: LAN services failed".into()),
-            manual: false,
+            manual: None,
         };
         let network = NetworkRestoration::Restored { revision: 5 };
         let last = last_update_json(Some(rolled_back.clone()), Some(network.clone())).unwrap();
@@ -1309,7 +1641,7 @@ mod tests {
             release: "10.0.2.2:5000/fwos:next".into(),
             outcome: Outcome::Accepted,
             reason: None,
-            manual: false,
+            manual: None,
         };
         let last = last_update_json(Some(accepted), Some(network)).unwrap();
         assert_eq!(last["outcome"], "accepted");

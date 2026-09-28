@@ -10,8 +10,16 @@ use std::time::Duration;
 
 use fwos_fwd_setup::identity::Principal;
 
+#[cfg(not(test))]
 const SOCK: &str = "/var/lib/fwos/netd.sock";
+#[cfg(not(test))]
 const UPDATE_SOCK: &str = "/var/lib/fwos/update.sock";
+// Unit tests exercise the real clients against sockets that never exist, so
+// they cannot apply, reboot, or roll back a host that runs FWOS.
+#[cfg(test)]
+const SOCK: &str = "/nonexistent/fwos-unit-test/netd.sock";
+#[cfg(test)]
+const UPDATE_SOCK: &str = "/nonexistent/fwos-unit-test/update.sock";
 const DESIRED: &str = "/var/lib/fwos/desired.toml";
 const UPDATE_TIMEOUT: Duration = Duration::from_secs(1200);
 

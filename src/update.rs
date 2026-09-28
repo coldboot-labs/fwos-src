@@ -1,9 +1,12 @@
 use std::env;
+use std::ffi::CString;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::IpAddr;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{chown, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{self, Command, Stdio};
 use std::sync::{Mutex, MutexGuard};
@@ -11,7 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use fwos_fwd_setup::durable;
-use fwos_fwd_setup::host_image;
+use fwos_fwd_setup::{fwd_resolvers, host_image};
 use fwos_fwd_setup::host_update::{NetworkRestoration, NETWORK_RESTORATION, RESTORE_PRE_UPDATE};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -25,6 +28,8 @@ const UPDATE_RECORD: &str = "/var/lib/fwos/host-update.json";
 const UPDATE_OUTCOME: &str = "/var/lib/fwos/host-update-outcome.json";
 const NETD_SOCK: &str = "/var/lib/fwos/netd.sock";
 const REGISTRIES_DROPIN: &str = "/etc/containers/registries.conf.d/fwos-update.conf";
+const FWD_NETNS: &str = "/run/netns/fwd";
+const WORKER_RESOLVER_DIR: &str = "/run/systemd/resolve";
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(180);
 /// Runs `fwos-update health` on every boot and exits once it has decided.
 const HEALTH_UNIT: &str = "fwos-health.service";
@@ -40,6 +45,13 @@ struct Request {
 
 fn main() {
     match env::args().nth(1).as_deref() {
+        Some("worker") => {
+            let program: Vec<String> = env::args().skip(2).collect();
+            if let Err(err) = run_worker(&program) {
+                eprintln!("fwos-update worker: {err}");
+            }
+            process::exit(1);
+        }
         Some("health") => {
             if let Err(err) = run_health() {
                 eprintln!("fwos-update: {err}");
@@ -677,9 +689,7 @@ fn bootstrap_completed() -> bool {
 
 fn bootc_switch(image: &str) -> Result<(), String> {
     allow_insecure_local_registry(image)?;
-    // Stage only. Never pass --apply: reboot is a later operator step.
-    let output = Command::new("bootc")
-        .args(["switch", "--quiet", image])
+    let output = switch_command(image)
         .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
         .stdin(Stdio::null())
         .output()
@@ -692,6 +702,103 @@ fn bootc_switch(image: &str) -> Result<(), String> {
             String::from_utf8_lossy(&output.stdout).trim(),
             String::from_utf8_lossy(&output.stderr).trim()
         ))
+    }
+}
+
+/// `bootc switch` and its download children run in a temporary worker with
+/// `fwd` networking (ADR-0060); this controller stays in the Host netns.
+/// Stage only. Never pass --apply: reboot is a later operator step.
+fn switch_command(image: &str) -> Command {
+    let mut command = Command::new(worker_program());
+    command.args(["worker", "bootc", "switch", "--quiet", image]);
+    command
+}
+
+fn worker_program() -> std::path::PathBuf {
+    env::current_exe().unwrap_or_else(|_| "/usr/bin/fwos-update".into())
+}
+
+/// The worker: leave the Host netns for `fwd` and resolve names with the
+/// resolvers `fwd` learned from its WANs, then become `program`. It keeps the
+/// Host filesystem and deployment state, and it configures no interface,
+/// route, or firewall policy.
+fn run_worker(program: &[String]) -> Result<(), String> {
+    let (name, args) = program
+        .split_first()
+        .ok_or("worker needs a program to run")?;
+    enter_fwd_networking()?;
+    let err = Command::new(name).args(args).exec();
+    Err(format!("exec {name}: {err}"))
+}
+
+fn enter_fwd_networking() -> Result<(), String> {
+    let fwd = fs::File::open(FWD_NETNS).map_err(|e| format!("open {FWD_NETNS}: {e}"))?;
+    // A private mount namespace keeps the resolver mounts below to this worker.
+    // bootc sees it is already unshared and remounts /sysroot in it as usual.
+    check(unsafe { libc::unshare(libc::CLONE_NEWNS) }, "unshare mount namespace")?;
+    mount(None, "/", None, libc::MS_REC | libc::MS_SLAVE, None)?;
+    check(
+        unsafe { libc::setns(fwd.as_raw_fd(), libc::CLONE_NEWNET) },
+        "join the fwd network namespace",
+    )?;
+    let learned = fs::read_to_string(fwd_resolvers::PATH).unwrap_or_default();
+    use_resolvers(&fwd_resolvers::resolv_conf(&learned))
+}
+
+/// systemd-resolved answers NSS lookups from the Host netns. Covering its
+/// runtime directory hides that socket from the worker, so lookups use
+/// /etc/resolv.conf, which now names the `fwd` resolvers.
+fn use_resolvers(body: &str) -> Result<(), String> {
+    fs::create_dir_all(WORKER_RESOLVER_DIR)
+        .map_err(|e| format!("create {WORKER_RESOLVER_DIR}: {e}"))?;
+    mount(
+        Some("tmpfs"),
+        WORKER_RESOLVER_DIR,
+        Some("tmpfs"),
+        libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+        Some("mode=0755"),
+    )?;
+    // Fedora's /etc/resolv.conf links to the stub file in this directory.
+    for name in ["resolv.conf", "stub-resolv.conf"] {
+        let path = format!("{WORKER_RESOLVER_DIR}/{name}");
+        fs::write(&path, body).map_err(|e| format!("write {path}: {e}"))?;
+    }
+    let source = format!("{WORKER_RESOLVER_DIR}/resolv.conf");
+    mount(Some(&source), "/etc/resolv.conf", None, libc::MS_BIND, None)
+}
+
+fn mount(
+    source: Option<&str>,
+    target: &str,
+    fstype: Option<&str>,
+    flags: libc::c_ulong,
+    data: Option<&str>,
+) -> Result<(), String> {
+    let cstr = |s: &str| CString::new(s).map_err(|_| format!("mount argument {s:?}"));
+    let source = source.map(cstr).transpose()?;
+    let target_c = cstr(target)?;
+    let fstype = fstype.map(cstr).transpose()?;
+    let data = data.map(cstr).transpose()?;
+    let ptr = |s: &Option<CString>| s.as_ref().map_or(std::ptr::null(), |s| s.as_ptr());
+    check(
+        unsafe {
+            libc::mount(
+                ptr(&source),
+                target_c.as_ptr(),
+                ptr(&fstype),
+                flags,
+                ptr(&data).cast(),
+            )
+        },
+        &format!("mount {target}"),
+    )
+}
+
+fn check(rc: libc::c_int, what: &str) -> Result<(), String> {
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(format!("{what}: {}", std::io::Error::last_os_error()))
     }
 }
 
@@ -714,7 +821,8 @@ fn local_registry_host(image: &str) -> Option<String> {
     }
     let name = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host);
     let name = name.trim_start_matches('[').trim_end_matches(']');
-    if name == "localhost" || name.parse::<IpAddr>().is_ok() {
+    // RFC 6761 reserves `.test` names for testing; they never reach a public registry.
+    if name == "localhost" || name.parse::<IpAddr>().is_ok() || name.ends_with(".test") {
         Some(host.to_string())
     } else {
         None
@@ -1128,6 +1236,30 @@ mod tests {
             Some("localhost:5000")
         );
         assert_eq!(local_registry_host("quay.io/fwos:next"), None);
+    }
+
+    #[test]
+    fn registry_names_in_the_reserved_test_domain_are_local() {
+        assert_eq!(
+            local_registry_host("registry.fwos.test:5000/fwos:next").as_deref(),
+            Some("registry.fwos.test:5000")
+        );
+        assert_eq!(
+            local_registry_host("[2001:db8:ff::1]:5000/fwos:next").as_deref(),
+            Some("[2001:db8:ff::1]:5000")
+        );
+        assert_eq!(local_registry_host("registry.test.example/fwos:next"), None);
+        assert_eq!(local_registry_host("contest:5000/fwos:next"), None);
+    }
+
+    #[test]
+    fn switch_downloads_in_a_fwd_worker() {
+        let switch = switch_command("registry.fwos.test:5000/fwos:next");
+        let args: Vec<_> = switch.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(
+            args,
+            ["worker", "bootc", "switch", "--quiet", "registry.fwos.test:5000/fwos:next"]
+        );
     }
 
     #[test]

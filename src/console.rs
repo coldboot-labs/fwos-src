@@ -396,13 +396,13 @@ fn admin_handle_with_principal(
                 out.flush().map_err(|e| e.to_string())?;
                 return Ok(AdminAct::Continue);
             }
-            write!(out, "{}", describe_image_rollback(rollback_client()))
+            write!(out, "{}", describe_image_rollback(update_op("rollback")))
                 .map_err(|e| e.to_string())?;
             out.flush().map_err(|e| e.to_string())?;
             Ok(AdminAct::Continue)
         }
         "reboot" => {
-            write_cmd(out, reboot_client())?;
+            write_cmd(out, update_op("reboot"))?;
             Ok(AdminAct::Continue)
         }
         _ => {
@@ -703,13 +703,7 @@ fn print_admin_status(out: &mut impl Write) -> Result<(), String> {
     {
         writeln!(out, "NICs:").map_err(|e| e.to_string())?;
         for iface in ifaces {
-            let name = iface.get("name").and_then(|x| x.as_str()).unwrap_or("?");
-            let role = iface.get("role").and_then(|x| x.as_str()).unwrap_or("");
-            if role.is_empty() {
-                writeln!(out, "  {name}").map_err(|e| e.to_string())?;
-            } else {
-                writeln!(out, "  {name}  {role}").map_err(|e| e.to_string())?;
-            }
+            writeln!(out, "{}", interface_line(iface)).map_err(|e| e.to_string())?;
         }
     }
     if let Some(exp) = shown
@@ -739,12 +733,32 @@ fn print_admin_status(out: &mut impl Write) -> Result<(), String> {
         if netd_running() { "running" } else { "down" }
     )
     .map_err(|e| e.to_string())?;
-    if let Ok(raw) = update_status() {
+    if let Ok(raw) = update_op("status") {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
             write_host_image_status(out, &v)?;
         }
     }
     out.flush().map_err(|e| e.to_string())
+}
+
+/// One Accepted Desired state interface in recovery status: its name, role,
+/// and VLAN tag and parent when it is a VLAN.
+fn interface_line(iface: &toml::Value) -> String {
+    let field = |key: &str| iface.get(key).and_then(|x| x.as_str()).unwrap_or("");
+    let mut line = format!(
+        "  {}",
+        iface.get("name").and_then(|x| x.as_str()).unwrap_or("?")
+    );
+    if !field("role").is_empty() {
+        line.push_str(&format!("  {}", field("role")));
+    }
+    if let Some(vlan) = iface.get("vlan").and_then(|x| x.as_integer()) {
+        line.push_str(&format!("  vlan {vlan}"));
+        if !field("parent").is_empty() {
+            line.push_str(&format!(" on {}", field("parent")));
+        }
+    }
+    line
 }
 
 fn netns_exists(name: &str) -> bool {
@@ -768,18 +782,9 @@ fn restore_previous_client(applying: Option<&Principal>) -> Result<String, Strin
     socket_roundtrip_for(NETD_SOCK, body.as_bytes(), Duration::from_secs(120))
 }
 
-fn update_status() -> Result<String, String> {
-    let body = serde_json::json!({"op": "status"}).to_string();
-    socket_roundtrip(UPDATE_SOCK, body.as_bytes())
-}
-
-fn reboot_client() -> Result<String, String> {
-    let body = serde_json::json!({"op": "reboot"}).to_string();
-    socket_roundtrip(UPDATE_SOCK, body.as_bytes())
-}
-
-fn rollback_client() -> Result<String, String> {
-    let body = serde_json::json!({"op": "rollback"}).to_string();
+/// A Host update program operation: `status`, `reboot`, or `rollback`.
+fn update_op(op: &str) -> Result<String, String> {
+    let body = serde_json::json!({"op": op}).to_string();
     socket_roundtrip(UPDATE_SOCK, body.as_bytes())
 }
 
@@ -1308,6 +1313,7 @@ mod tests {
             "update",
             "apply {}",
             "show",
+            "rollback",
         ] {
             let mut out = Vec::new();
             handle(&mut out, retired).unwrap();
@@ -1326,9 +1332,14 @@ mod tests {
         let mut out = Vec::new();
         print_admin_help(&mut out).unwrap();
         let s = String::from_utf8(out).unwrap();
-        let commands: Vec<&str> = s
-            .lines()
-            .filter(|l| !l.starts_with(' '))
+        let (commands, prose): (Vec<&str>, Vec<&str>) =
+            s.lines().filter(|l| !l.starts_with(' ')).partition(|l| {
+                l.split_whitespace()
+                    .next()
+                    .is_some_and(|w| w.chars().all(|c| c.is_ascii_lowercase() || c == '-'))
+            });
+        let commands: Vec<&str> = commands
+            .iter()
             .filter_map(|l| l.split_whitespace().next())
             .collect();
         assert_eq!(
@@ -1339,12 +1350,37 @@ mod tests {
                 "rollback-image",
                 "reboot",
                 "help",
-                "logout",
-                "Configure"
+                "logout"
             ],
             "{s}"
         );
-        assert!(s.contains("in the UI"), "{s}");
+        assert_eq!(
+            prose,
+            ["Configure the appliance and update its Host image in the UI."],
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn interface_status_line_shows_role_and_vlan_from_desired_state() {
+        let iface = |raw: &str| raw.parse::<toml::Table>().unwrap().into();
+        assert_eq!(
+            interface_line(&iface(
+                r#"name = "enp1s0"
+role = "wan""#
+            )),
+            "  enp1s0  wan"
+        );
+        assert_eq!(
+            interface_line(&iface(
+                r#"name = "enp1s0.42"
+role = "lan"
+parent = "enp1s0"
+vlan = 42"#
+            )),
+            "  enp1s0.42  lan  vlan 42 on enp1s0"
+        );
+        assert_eq!(interface_line(&iface(r#"name = "enp2s0""#)), "  enp2s0");
     }
 
     #[test]

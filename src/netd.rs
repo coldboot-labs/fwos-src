@@ -3802,6 +3802,70 @@ fn wheel_gid() -> Option<u32> {
 mod tests {
     use super::*;
     use fwos_fwd_setup::desired::{Qdisc, StaticRoute};
+    use std::sync::{Mutex, MutexGuard};
+
+    /// Serializes tests that read or set the process-wide recovery flag.
+    static RECOVERY_FLAG: Mutex<()> = Mutex::new(());
+
+    fn recovery_flag() -> MutexGuard<'static, ()> {
+        RECOVERY_FLAG.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Marks recovery as required until dropped, as after a failed restoration.
+    struct RecoveryRequired;
+
+    impl RecoveryRequired {
+        fn set() -> Self {
+            RECOVERY_REQUIRED.store(true, Ordering::SeqCst);
+            Self
+        }
+    }
+
+    impl Drop for RecoveryRequired {
+        fn drop(&mut self) {
+            RECOVERY_REQUIRED.store(false, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn every_apply_path_is_refused_while_recovery_is_pending() {
+        let _flag = recovery_flag();
+        let _recovery = RecoveryRequired::set();
+        let desired = serde_json::to_value(wan_lan()).unwrap();
+        let alice = Principal {
+            source: "local".into(),
+            subject: "alice-subject".into(),
+            username: "alice".into(),
+        };
+        // Every UI change reaches netd as `apply_desired`: a reviewed or
+        // imported draft (with its version), a section apply or Save and
+        // apply (with the administrator), and the Apply confirmation
+        // setting. None may run around recovery.
+        for (actor, draft_version) in [
+            (Some(alice.clone()), Some("draft-v1".to_string())),
+            (Some(alice.clone()), None),
+            (None, None),
+        ] {
+            let reply = apply_desired_request(
+                &desired,
+                Some(1),
+                actor,
+                draft_version,
+                ApplyIntent::Ordinary,
+            );
+            assert_eq!(reply["ok"], false, "{reply}");
+            assert_eq!(reply["outcome"], "busy", "{reply}");
+        }
+        // Nor may a pending revision be confirmed into Accepted state.
+        let reply = confirm_apply(&json!({
+            "revision": 2, "confirmation_id": "op-1", "confirming": alice,
+        }));
+        assert_eq!(reply["outcome"], "rejected", "{reply}");
+        assert!(
+            reply["error"].as_str().unwrap().contains("recovery"),
+            "{reply}"
+        );
+    }
 
     #[test]
     fn network_restoration_is_a_netd_operation_and_requires_bootstrap() {
@@ -3990,6 +4054,7 @@ mod tests {
 
     #[test]
     fn steady_state_exposure_dnats_a_global_lan_address() {
+        let _flag = recovery_flag();
         let mut state = wan_lan();
         state.interfaces[0].addresses = vec!["203.0.113.10/24".into()];
         state.lan_prefix = Some("203.0.113.0/24".into());
@@ -4096,6 +4161,7 @@ mod tests {
 
     #[test]
     fn nat44_masquerade_never_translates_ipv6() {
+        let _flag = recovery_flag();
         let mut state = dual_stack_pd();
         state.interfaces[1].addresses.push("2001:db8:ff::1/64".into());
         let rules = nft_rules(&state);
@@ -4115,6 +4181,7 @@ mod tests {
 
     #[test]
     fn wan_input_keeps_neighbor_discovery_and_dhcpv6_replies_before_drop() {
+        let _flag = recovery_flag();
         let rules = nft_rules(&dual_stack_pd());
         let accept_nd = rules
             .find("iifname \"enp2s0\" icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-advert, packet-too-big, destination-unreachable, time-exceeded, parameter-problem } accept")
@@ -4728,6 +4795,7 @@ mod tests {
 
     #[test]
     fn nft_does_not_forward_mgmt_to_wan_or_lan() {
+        let _flag = recovery_flag();
         let state = wan_lan_mgmt();
         let rules = nft_rules(&state);
         let iif_drop = rules

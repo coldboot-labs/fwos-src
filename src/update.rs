@@ -94,8 +94,8 @@ fn run() -> Result<(), String> {
         let (stream, _) = listener
             .accept()
             .map_err(|e| format!("accept {SOCK}: {e}"))?;
-        // A legacy synchronous stage can take minutes; status and reboot must
-        // still answer while it runs.
+        // `bootc` calls can take a while; status must still answer while
+        // another request runs.
         thread::spawn(move || {
             if let Err(err) = handle_client(stream) {
                 eprintln!("fwos-update: {err}");
@@ -330,7 +330,6 @@ fn handle_request(req: Request) -> String {
             json!({"ok": true, "rebooting": true}).to_string()
         }
         "rollback" => rollback_request(),
-        "stage" => stage_request(&req.image),
         "start_stage" => start_stage_request(&req.image),
         other => json!({"ok": false, "error": format!("unknown op {other}")}).to_string(),
     }
@@ -519,21 +518,7 @@ fn claim_staging(image: &str) -> Result<(), String> {
     begin_staging(&mut lock_operation(), image, bootc_images())
 }
 
-/// Legacy synchronous stage: the reply waits for the staged deployment.
-fn stage_request(image: &str) -> String {
-    if let Err(err) = claim_staging(image) {
-        return json!({"ok": false, "error": err}).to_string();
-    }
-    let result = stage(image);
-    let reply = match &result {
-        Ok(()) => None,
-        Err(err) => Some(json!({"ok": false, "error": err}).to_string()),
-    };
-    finish_staging(&mut lock_operation(), image, result);
-    reply.unwrap_or_else(|| current_status().to_string())
-}
-
-/// UI stage: accept the request, then pull and stage in the background.
+/// Accept a stage request, then pull and stage in the background.
 fn start_stage_request(image: &str) -> String {
     if let Err(err) = claim_staging(image) {
         return json!({"ok": false, "error": err}).to_string();
@@ -1433,6 +1418,17 @@ mod tests {
         let l = s.to_ascii_lowercase();
         assert!(l.contains("admin") || l.contains("refus"));
         assert!(!s.contains("\"ok\":true") && !s.contains("\"ok\": true"));
+    }
+
+    #[test]
+    fn retired_synchronous_stage_op_is_unknown() {
+        // Only the retired serial `update` command staged synchronously; the
+        // UI stages through `start_stage`.
+        let s = handle_request(Request {
+            op: "stage".into(),
+            image: "10.0.2.2:5000/fwos:next".into(),
+        });
+        assert!(s.contains("unknown op stage"), "{s}");
     }
 
     #[test]

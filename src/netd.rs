@@ -448,23 +448,22 @@ fn handle_client(mut stream: UnixStream) -> Result<(), String> {
     if buf.is_empty() {
         return Ok(());
     }
-    let reply = match serde_json::from_slice::<Value>(&buf) {
-        Ok(v) if v.get("op").and_then(Value::as_str).is_some() => handle_cmd(&v),
-        // Older console and socket clients send bare complete Desired JSON.
-        // Their base is the current Accepted revision at receipt, on this
-        // single-threaded socket loop; they use the same validation and apply.
-        Ok(v) if Path::new(BOOTSTRAPPED).exists() => {
-            apply_desired_request(&v, None, None, None, ApplyIntent::Ordinary).to_string()
-        }
-        Ok(_) => json!({"ok": false, "error": "complete Bootstrap before applying Desired state"})
-            .to_string(),
-        Err(err) => json!({"ok": false, "error": err.to_string()}).to_string(),
-    };
+    let reply = socket_reply(&buf);
     stream
         .write_all(reply.as_bytes())
         .and_then(|_| stream.write_all(b"\n"))
         .map_err(|e| format!("write socket: {e}"))?;
     Ok(())
+}
+
+fn socket_reply(buf: &[u8]) -> String {
+    match serde_json::from_slice::<Value>(buf) {
+        Ok(v) if v.get("op").and_then(Value::as_str).is_some() => handle_cmd(&v),
+        // Bare complete Desired JSON was the retired console `apply` adapter;
+        // clients apply through `apply_desired` with a base revision.
+        Ok(_) => json!({"ok": false, "error": "request names no op"}).to_string(),
+        Err(err) => json!({"ok": false, "error": err.to_string()}).to_string(),
+    }
 }
 
 fn handle_cmd(v: &Value) -> String {
@@ -3887,6 +3886,23 @@ mod tests {
             dev: Some("lo".into()),
         });
         assert!(validate(&state).unwrap_err().contains("configured on-link"));
+    }
+
+    #[test]
+    fn bare_complete_desired_json_is_not_an_apply_request() {
+        // The retired console `apply {json}` sent Desired state without an op.
+        let reply: Value = serde_json::from_str(&socket_reply(
+            br#"{"revision":1,"hostname":"fwos-box","interfaces":[],"ui_exposure":[]}"#,
+        ))
+        .unwrap();
+        assert_eq!(reply["ok"], false, "{reply}");
+        assert!(reply.get("outcome").is_none(), "nothing was attempted: {reply}");
+        assert!(
+            reply["error"].as_str().unwrap().contains("names no op"),
+            "{reply}"
+        );
+        let reply: Value = serde_json::from_str(&socket_reply(b"not json")).unwrap();
+        assert_eq!(reply["ok"], false, "{reply}");
     }
 
     #[test]

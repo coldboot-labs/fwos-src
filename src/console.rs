@@ -1,13 +1,31 @@
+//! The Appliance console Host program on VGA and serial: the Bootstrap
+//! console before ownership, then the authenticated v1 recovery menu. It is
+//! neither the full Appliance CLI (deferred to v2) nor a Host shell; routine
+//! configuration and Host update belong to the UI.
+
+use std::env;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::process;
+use std::time::Duration;
 
 use fwos_fwd_setup::desired::DesiredState;
-use fwos_fwd_setup::identity::{self, Authentication, AuthenticationResult};
+use fwos_fwd_setup::identity::{self, Authentication, AuthenticationResult, Principal};
 
+#[cfg(not(test))]
+const NETD_SOCK: &str = "/var/lib/fwos/netd.sock";
+#[cfg(not(test))]
+const UPDATE_SOCK: &str = "/var/lib/fwos/update.sock";
+// Unit tests exercise the real clients against sockets that never exist, so
+// they cannot restore, reboot, or roll back a host that runs FWOS.
+#[cfg(test)]
+const NETD_SOCK: &str = "/nonexistent/fwos-unit-test/netd.sock";
+#[cfg(test)]
+const UPDATE_SOCK: &str = "/nonexistent/fwos-unit-test/update.sock";
 const CGNAT: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 0);
 const BOOTSTRAPPED: &str = "/var/lib/fwos/bootstrapped";
 const DESIRED: &str = "/var/lib/fwos/desired.toml";
@@ -15,8 +33,30 @@ const APPLY_OPERATION: &str = "/var/lib/fwos/apply-operation.json";
 const APPLY_PREVIOUS: &str = "/var/lib/fwos/apply-previous.toml";
 const PREVIOUS_ACCEPTED: &str = "/var/lib/fwos/previous-accepted.toml";
 const HOSTNAME_FILE: &str = "/var/lib/fwos/hostname";
+/// Shown when the authenticated recovery mode starts and atop its status.
+const RECOVERY_BANNER: &str = "FWOS Appliance console: authenticated recovery";
 
-pub fn run() -> Result<(), String> {
+fn main() {
+    let result = no_arguments(env::args().skip(1)).and_then(|()| run());
+    if let Err(err) = result {
+        eprintln!("fwos-console: {err}");
+        process::exit(1);
+    }
+}
+
+/// The console is the tty's program, not a command-line client: it has no
+/// subcommands to apply, stage, or roll back from a shell.
+fn no_arguments(mut args: impl Iterator<Item = String>) -> Result<(), String> {
+    match args.next() {
+        None => Ok(()),
+        Some(arg) => Err(format!(
+            "unexpected argument {arg}: the Appliance console takes no arguments; \
+             configure the appliance and update its Host image in the UI"
+        )),
+    }
+}
+
+fn run() -> Result<(), String> {
     if bootstrapped() {
         admin_run()
     } else {
@@ -124,14 +164,6 @@ fn handle(out: &mut impl Write, line: &str) -> Result<(), String> {
             ephemeral_slaac(nic)?;
             print_status(out)
         }
-        Some("apply") => {
-            Err("Bootstrap console sets ephemeral addressing, not Desired state".into())
-        }
-        Some("update") => {
-            let image = parts.next().unwrap_or("");
-            write_cmd(out, super::update_client(image))?;
-            Ok(())
-        }
         Some(_) => {
             writeln!(out, "unknown command").map_err(|e| e.to_string())?;
             out.flush().map_err(|e| e.to_string())?;
@@ -143,7 +175,7 @@ fn handle(out: &mut impl Write, line: &str) -> Result<(), String> {
 fn print_help(out: &mut impl Write) -> Result<(), String> {
     writeln!(
         out,
-        "static <nic> <cidr>  ephemeral IPv4/IPv6\ndhcp <nic>            ephemeral DHCPv4\nslaac <nic>           ephemeral IPv6 RA\nupdate <image>\nstatus"
+        "static <nic> <cidr>  ephemeral IPv4/IPv6\ndhcp <nic>            ephemeral DHCPv4\nslaac <nic>           ephemeral IPv6 RA\nstatus"
     )
     .map_err(|e| e.to_string())?;
     out.flush().map_err(|e| e.to_string())
@@ -194,7 +226,7 @@ fn admin_run() -> Result<(), String> {
     let fd = io::stdin().as_raw_fd();
     let mut acc = Vec::new();
     clear_tty(&mut stdout)?;
-    writeln!(stdout, "FWOS Appliance CLI").map_err(|e| e.to_string())?;
+    writeln!(stdout, "{RECOVERY_BANNER}").map_err(|e| e.to_string())?;
     stdout.flush().map_err(|e| e.to_string())?;
     loop {
         write!(stdout, "admin: ").map_err(|e| e.to_string())?;
@@ -299,7 +331,7 @@ fn admin_session(
             writeln!(out, "session authorization expired").map_err(|e| e.to_string())?;
             return Ok(());
         }
-        write!(out, "fwos> ").map_err(|e| e.to_string())?;
+        write!(out, "recovery> ").map_err(|e| e.to_string())?;
         out.flush().map_err(|e| e.to_string())?;
         let line = match read_line_poll(fd, acc, -1)? {
             Input::Eof => return Ok(()),
@@ -355,29 +387,7 @@ fn admin_handle_with_principal(
                 out.flush().map_err(|e| e.to_string())?;
                 return Ok(AdminAct::Continue);
             }
-            write_cmd(out, super::restore_previous_client(principal))?;
-            Ok(AdminAct::Continue)
-        }
-        // Existing full-CLI callers remain available until the console
-        // retirement slice, but are no longer advertised in the v1 menu.
-        "show" => {
-            write_cmd(out, super::show_desired())?;
-            Ok(AdminAct::Continue)
-        }
-        "apply" => {
-            if rest.is_empty() {
-                writeln!(out, "usage: apply <json|toml|path>").map_err(|e| e.to_string())?;
-                out.flush().map_err(|e| e.to_string())?;
-                return Ok(AdminAct::Continue);
-            }
-            write_cmd(
-                out,
-                super::apply_source(rest).and_then(|raw| super::apply_desired(&raw)),
-            )?;
-            Ok(AdminAct::Continue)
-        }
-        "update" => {
-            write_cmd(out, super::update_client(rest))?;
+            write_cmd(out, restore_previous_client(principal))?;
             Ok(AdminAct::Continue)
         }
         "rollback-image" => {
@@ -386,18 +396,13 @@ fn admin_handle_with_principal(
                 out.flush().map_err(|e| e.to_string())?;
                 return Ok(AdminAct::Continue);
             }
-            write!(out, "{}", describe_image_rollback(super::rollback_client()))
+            write!(out, "{}", describe_image_rollback(rollback_client()))
                 .map_err(|e| e.to_string())?;
             out.flush().map_err(|e| e.to_string())?;
             Ok(AdminAct::Continue)
         }
         "reboot" => {
-            write_cmd(out, super::reboot_client())?;
-            Ok(AdminAct::Continue)
-        }
-        // Legacy JSON adapter for the same Host update program operation.
-        "rollback" => {
-            write_cmd(out, super::rollback_client())?;
+            write_cmd(out, reboot_client())?;
             Ok(AdminAct::Continue)
         }
         _ => {
@@ -432,6 +437,7 @@ rollback-image    boot the previous Host image at the next reboot; the Accepted 
 reboot            reboot, activating a staged Host update or a queued Host image rollback
 help
 logout
+Configure the appliance and update its Host image in the UI.
 "
     )
     .map_err(|e| e.to_string())?;
@@ -567,7 +573,7 @@ fn last_host_image_change(last: &serde_json::Value) -> Option<String> {
 }
 
 fn print_admin_status(out: &mut impl Write) -> Result<(), String> {
-    writeln!(out, "FWOS Appliance CLI").map_err(|e| e.to_string())?;
+    writeln!(out, "{RECOVERY_BANNER}").map_err(|e| e.to_string())?;
     let operation = fs::read_to_string(APPLY_OPERATION)
         .ok()
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
@@ -582,7 +588,7 @@ fn print_admin_status(out: &mut impl Write) -> Result<(), String> {
         .and_then(|phase| phase.as_str())
         == Some("pending_confirmation");
     let netd_recovery_required = matches!(
-        super::netd_json(&serde_json::json!({"op": "get_desired"})),
+        netd_json(&serde_json::json!({"op": "get_desired"})),
         Ok(reply) if reply["outcome"] == "recovery_required"
     );
     let indeterminate = accepted_phase && netd_recovery_required;
@@ -733,7 +739,7 @@ fn print_admin_status(out: &mut impl Write) -> Result<(), String> {
         if netd_running() { "running" } else { "down" }
     )
     .map_err(|e| e.to_string())?;
-    if let Ok(raw) = super::update_status() {
+    if let Ok(raw) = update_status() {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
             write_host_image_status(out, &v)?;
         }
@@ -746,7 +752,56 @@ fn netns_exists(name: &str) -> bool {
 }
 
 fn netd_running() -> bool {
-    UnixStream::connect("/var/lib/fwos/netd.sock").is_ok()
+    UnixStream::connect(NETD_SOCK).is_ok()
+}
+
+fn netd_json(body: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let raw = serde_json::to_vec(body).map_err(|e| format!("encode netd cmd: {e}"))?;
+    let reply = socket_roundtrip(NETD_SOCK, &raw)?;
+    serde_json::from_str(&reply).map_err(|e| format!("parse netd reply: {e}"))
+}
+
+fn restore_previous_client(applying: Option<&Principal>) -> Result<String, String> {
+    let body = serde_json::json!({"op": "restore_previous", "applying": applying}).to_string();
+    // Manual recovery uses the same bounded Host activation and rollback as
+    // a normal Desired state apply; keep the socket open for its outcome.
+    socket_roundtrip_for(NETD_SOCK, body.as_bytes(), Duration::from_secs(120))
+}
+
+fn update_status() -> Result<String, String> {
+    let body = serde_json::json!({"op": "status"}).to_string();
+    socket_roundtrip(UPDATE_SOCK, body.as_bytes())
+}
+
+fn reboot_client() -> Result<String, String> {
+    let body = serde_json::json!({"op": "reboot"}).to_string();
+    socket_roundtrip(UPDATE_SOCK, body.as_bytes())
+}
+
+fn rollback_client() -> Result<String, String> {
+    let body = serde_json::json!({"op": "rollback"}).to_string();
+    socket_roundtrip(UPDATE_SOCK, body.as_bytes())
+}
+
+fn socket_roundtrip(sock: &str, body: &[u8]) -> Result<String, String> {
+    socket_roundtrip_for(sock, body, Duration::from_secs(60))
+}
+
+fn socket_roundtrip_for(sock: &str, body: &[u8], timeout: Duration) -> Result<String, String> {
+    let mut stream = UnixStream::connect(sock).map_err(|e| format!("connect {sock}: {e}"))?;
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+    stream
+        .write_all(body)
+        .map_err(|e| format!("write socket: {e}"))?;
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .map_err(|e| format!("shutdown socket: {e}"))?;
+    let mut reply = String::new();
+    stream
+        .read_to_string(&mut reply)
+        .map_err(|e| format!("read socket: {e}"))?;
+    Ok(reply)
 }
 
 enum Input {
@@ -819,7 +874,7 @@ struct NicList {
 }
 
 fn list_from_netd() -> NicList {
-    match super::netd_json(&serde_json::json!({"op": "list"})) {
+    match netd_json(&serde_json::json!({"op": "list"})) {
         Ok(v) if v.get("ok").and_then(|x| x.as_bool()) != Some(false) => parse_nic_list(&v),
         _ => NicList {
             nics: Vec::new(),
@@ -915,7 +970,7 @@ fn netd_opt(mode: &str, nic: &str, cidr: Option<&str>) -> Result<(), String> {
     if let Some(cidr) = cidr {
         body["cidr"] = serde_json::json!(cidr);
     }
-    let reply = super::netd_json(&body)?;
+    let reply = netd_json(&body)?;
     if reply.get("ok").and_then(|x| x.as_bool()) == Some(true) {
         Ok(())
     } else {
@@ -964,7 +1019,8 @@ mod tests {
         let mut out = Vec::new();
         print_admin_status(&mut out).unwrap();
         let s = String::from_utf8(out).unwrap();
-        assert!(s.contains("FWOS Appliance CLI"));
+        assert!(s.contains(RECOVERY_BANNER), "{s}");
+        assert!(!s.contains("CLI"), "{s}");
         assert!(!s.contains("FWOS Bootstrap console"));
         assert!(!s.contains("ephemeral"));
         assert!(!s.contains("Reach the UI"));
@@ -1015,7 +1071,7 @@ mod tests {
             "{s}"
         );
         assert!(line("reboot").contains("Host image rollback"));
-        // The legacy JSON adapter is callable but not the menu entry.
+        // The retired JSON adapter is not a menu entry.
         assert!(!s.lines().any(|l| l.trim() == "rollback"), "{s}");
     }
 
@@ -1200,69 +1256,95 @@ mod tests {
     }
 
     #[test]
-    fn admin_rollback_is_a_host_update_socket_client() {
+    fn console_takes_no_arguments() {
+        let args = |list: &[&str]| list.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        assert!(no_arguments(args(&[]).into_iter()).is_ok());
+        for retired in [
+            &["apply", "/var/lib/fwos/desired.toml"][..],
+            &["update", "reg/fwos:next"],
+            &["reboot"],
+            &["rollback"],
+            &["console"],
+        ] {
+            let err = no_arguments(args(retired).into_iter()).unwrap_err();
+            assert!(err.contains("takes no arguments"), "{err}");
+            assert!(err.contains("UI"), "{err}");
+        }
+    }
+
+    #[test]
+    fn recovery_menu_refuses_retired_full_cli_commands_without_calling_netd_or_host_update() {
+        for retired in [
+            "show",
+            r#"apply {"wireguard":[]}"#,
+            "apply /var/lib/fwos/desired.toml",
+            "apply",
+            "update 10.0.2.2:5000/fwos:next",
+            "update",
+            "rollback",
+            "stage 10.0.2.2:5000/fwos:next",
+            "confirm",
+        ] {
+            let mut out = Vec::new();
+            assert_eq!(
+                admin_handle(&mut out, retired).unwrap(),
+                AdminAct::Continue,
+                "{retired}"
+            );
+            let s = String::from_utf8(out).unwrap();
+            assert!(s.contains("unknown command"), "{retired}: {s}");
+            assert!(!s.contains(".sock"), "{retired} reached a socket: {s}");
+            assert!(
+                !s.contains("desired.toml"),
+                "{retired} read Desired state: {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn bootstrap_console_refuses_host_update_and_desired_state_commands() {
+        for retired in [
+            "update 10.0.2.2:5000/fwos:next",
+            "update",
+            "apply {}",
+            "show",
+        ] {
+            let mut out = Vec::new();
+            handle(&mut out, retired).unwrap();
+            let s = String::from_utf8(out).unwrap();
+            assert!(s.contains("unknown command"), "{retired}: {s}");
+            assert!(!s.contains(".sock"), "{retired} reached a socket: {s}");
+        }
         let mut out = Vec::new();
+        print_help(&mut out).unwrap();
+        let help = String::from_utf8(out).unwrap();
+        assert!(!help.contains("update"), "{help}");
+    }
+
+    #[test]
+    fn recovery_help_lists_only_recovery_commands_and_points_to_the_ui() {
+        let mut out = Vec::new();
+        print_admin_help(&mut out).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        let commands: Vec<&str> = s
+            .lines()
+            .filter(|l| !l.starts_with(' '))
+            .filter_map(|l| l.split_whitespace().next())
+            .collect();
         assert_eq!(
-            admin_handle(&mut out, "rollback").unwrap(),
-            AdminAct::Continue
+            commands,
+            [
+                "status",
+                "restore-previous",
+                "rollback-image",
+                "reboot",
+                "help",
+                "logout",
+                "Configure"
+            ],
+            "{s}"
         );
-        let s = String::from_utf8(out).unwrap();
-        assert!(!s.contains("unknown command"));
-        assert!(s.contains("update.sock"));
-    }
-
-    #[test]
-    fn admin_update_without_image_prints_usage() {
-        let mut out = Vec::new();
-        assert_eq!(
-            admin_handle(&mut out, "update").unwrap(),
-            AdminAct::Continue
-        );
-        let s = String::from_utf8(out).unwrap();
-        assert!(s.contains("usage: update <image>"));
-        assert!(!s.contains("update.sock"));
-    }
-
-    #[test]
-    fn admin_apply_is_a_netd_client() {
-        let mut out = Vec::new();
-        assert_eq!(
-            admin_handle(&mut out, r#"apply {"wireguard":[]}"#).unwrap(),
-            AdminAct::Continue
-        );
-        let s = String::from_utf8(out).unwrap();
-        assert!(!s.contains("unknown command"));
-        assert!(s.contains("netd.sock"));
-    }
-
-    #[test]
-    fn admin_show_round_trips_toml_on_var() {
-        let mut out = Vec::new();
-        assert_eq!(admin_handle(&mut out, "show").unwrap(), AdminAct::Continue);
-        let s = String::from_utf8(out).unwrap();
-        assert!(!s.contains("unknown command"));
-        assert!(s.contains("/var/lib/fwos/desired.toml"));
-    }
-
-    #[test]
-    fn admin_update_is_a_host_update_socket_client() {
-        let mut out = Vec::new();
-        assert_eq!(
-            admin_handle(&mut out, "update 10.0.2.2:5000/fwos:next").unwrap(),
-            AdminAct::Continue
-        );
-        let s = String::from_utf8(out).unwrap();
-        assert!(!s.contains("unknown command"));
-        assert!(s.contains("update.sock"));
-    }
-
-    #[test]
-    fn bootstrap_update_hits_the_host_update_socket() {
-        let mut out = Vec::new();
-        handle(&mut out, "update 10.0.2.2:5000/fwos:next").unwrap();
-        let s = String::from_utf8(out).unwrap();
-        assert!(!s.contains("unknown command"));
-        assert!(s.contains("update.sock"));
+        assert!(s.contains("in the UI"), "{s}");
     }
 
     #[test]
